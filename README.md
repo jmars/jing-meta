@@ -17,6 +17,7 @@ judgment. No cloud, no external services.
 | `search` | Cross-domain search over indexes (config-driven) | `jing-search` |
 | `memory` | The SQLite memory graph + offline semantic lookup | `jing-memory` |
 | `archiver` | Moves old observations out of the live memory graph into searchable archives | `jing-archiver` |
+| `memory-stats` | Read-only knowledge-graph stats and discovery (`graph_stats`, `entity_summary`) | `jing-memory-stats` |
 | `dreamer` | Knowledge-graph maintenance (Soufflé + semantic rerank + local validator) | `jing-dreamer` |
 | `jing_meta` | Shared core: config, storage paths, model registry, embed helper | `jing-meta` |
 
@@ -27,7 +28,7 @@ jing_meta/        shared config + embed + CLI
 indexer/          Python DAFSA frontend (ctypes) + build/search
   dafsa/          C DAFSA core (dafsa.c/h) + libdafsa.so
 search/           config-driven cross-domain search over indexes
-memory/           SQLite memory graph + semantic index + archiver
+memory/           SQLite memory graph + semantic index + archiver + stats server
 dreamer/         Soufflé ruleset + semantic rerank + local validator
 ```
 

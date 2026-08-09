@@ -29,6 +29,26 @@ at the bottom.
 | 19 dreamer stages | ✅ Done | `9bdef50` |
 | 20 sidecar format | ✅ Done | `5f9b59e` |
 | 21 memory archiver | ✅ Done | (new — `memory/archiver.py` + `jing-archiver`) |
+| 22 memory stats server | ✅ Done | (new — `memory/stats_server.py` + `jing-memory-stats`) |
+
+## Memory stats server (roadmap #22)
+
+The read-only `memory-stats-mcp` server is ported into jing-meta as a first-class
+component at `memory/stats_server.py`, exposed via the `jing-memory-stats` console
+script. It is a SQLite-only, read-only companion to `memory/server.py` — the JSONL
+fallback and `~/.vibe` path confinement from the standalone server are dropped
+(jing-meta has no JSONL store; the DB path comes from `jing_meta.config.memory_db()`).
+
+It exposes two tools:
+- **`graph_stats`** — high-level overview: entity/relation/observation counts,
+  entity-type counts, relation-type counts, recent entities, and temporal data
+  (oldest/newest entities, 24h activity).
+- **`entity_summary(name)`** — type, created/updated timestamps, observations
+  (content truncated to 120 chars), and outgoing + incoming relations.
+
+Both tools open a fresh `file:...?mode=ro` SQLite connection per call and return a
+plain `str` report. If the DB is missing/unreadable they return a clear not-found
+message rather than a fabricated empty result.
 
 ## Memory archiver (roadmap #21)
 
