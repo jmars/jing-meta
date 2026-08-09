@@ -3,6 +3,32 @@
 _Architectural review and prioritized improvement roadmap._
 _Source: advisor review of the full repo (~9,500 LOC), 2026-08-09._
 
+## Status — all roadmap items complete (2026-08-09)
+
+All 20 roadmap items (Tiers 1–3) and the resolved "Other findings" are implemented
+and committed. Each item below carries its completion commit. This roadmap is
+maintained as the historical record of the improvement program; it is not an open
+todo list. Remaining known gaps are only the "Other findings" still listed as open
+at the bottom.
+
+| Item | Status | Commit |
+|------|--------|--------|
+| Tier 1: 1–7 | ✅ Done | `d847796` (Tier 1 architecture-roadmap improvements) |
+| 8 SQLite N+1 | ✅ Done | `964c9fe` |
+| 9 CI/tooling | ✅ Done | `4baf8be` |
+| 10 structured logging | ✅ Done | `4080553` |
+| 11 config validation | ✅ Done | `14a24eb` |
+| 12 consolidate extractors | ✅ Done | `088faf6` |
+| 13 validator batching | ✅ Done | `964c9fe` |
+| 14 pipeline testability | ✅ Done | `964c9fe` |
+| 15 AND/OR FST | ✅ Done | `a7a405b` |
+| Other findings | ✅ Done | `b95c10a` + `97c1852` |
+| 16 shared MCP base | ✅ Done | `0940aca` |
+| 17 concurrency docs | ✅ Done | `b72c057` |
+| 18 PDWG checksum | ✅ Done | `aa4c3cf` |
+| 19 dreamer stages | ✅ Done | `9bdef50` |
+| 20 sidecar format | ✅ Done | `5f9b59e` |
+
 ## Headline findings (read these first)
 
 1. **The "single embedding loader" claim is false.** There are **three** independent
