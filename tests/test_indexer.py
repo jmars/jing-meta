@@ -5,6 +5,7 @@ Requires the C DAFSA core (libdafsa.so) and pytest. Run from the repo root:
 """
 
 import json
+import zlib
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,7 @@ except (RuntimeError, AttributeError, OSError) as e:
     pytest.skip(f"libdafsa.so not available: {e}", allow_module_level=True)
 
 from indexer import build, update, open_index
-from indexer import _read_sidecar, _write_sidecar
+from indexer import SidecarCorruptError, _read_sidecar, _write_sidecar
 
 
 def _write_txt(directory: Path, name: str, content: str) -> Path:
@@ -209,16 +210,67 @@ def test_sidecar_roundtrip(tmp_path):
     pairs = [(0, b"alpha"), (1, b"banana"), (0, b"apple")]
 
     _write_sidecar(slots, 7, pairs)
+    path = slots / "7.keys"
+    data = path.read_bytes()
+    assert data[:4] == b"SIDE", "v1 sidecar must start with magic b'SIDE'"
     assert _read_sidecar(slots, 7) == pairs
+
+    # Format layout: 12-byte header + 8*N record headers + words + 4-byte CRC.
+    n = len(pairs)
+    assert len(data) == 12 + 8 * n + sum(len(w) for _, w in pairs) + 4
+    assert zlib.crc32(data[:-4]) == int.from_bytes(data[-4:], "little")
 
     # missing file -> []
     assert _read_sidecar(slots, 999) == []
 
-    # truncated final record stops cleanly (word_len overruns EOF)
-    data = (slots / "7.keys").read_bytes()
-    (slots / "8.keys").write_bytes(data[:-3])
-    full = _read_sidecar(slots, 8)
-    assert full == pairs[:-1], "partial trailing record must be truncated"
+    # Legacy-sniff: a manually written legacy LE stream (no magic) parses fine.
+    legacy = bytearray()
+    for ei, w in pairs:
+        legacy += ei.to_bytes(4, "little") + len(w).to_bytes(4, "little") + w
+    (slots / "8.keys").write_bytes(bytes(legacy))
+    assert _read_sidecar(slots, 8) == pairs
+
+    # Legacy + trailing garbage byte -> SidecarCorruptError
+    (slots / "9.keys").write_bytes(bytes(legacy) + b"\x00")
+    with pytest.raises(SidecarCorruptError):
+        _read_sidecar(slots, 9)
+
+    # Truncated new-format (cut into CRC) -> SidecarCorruptError
+    (slots / "10.keys").write_bytes(data[:-5])
+    with pytest.raises(SidecarCorruptError):
+        _read_sidecar(slots, 10)
+
+    # CRC bit-flip (XOR last byte) -> SidecarCorruptError
+    flipped = bytearray(data)
+    flipped[-1] ^= 0xFF
+    (slots / "11.keys").write_bytes(bytes(flipped))
+    with pytest.raises(SidecarCorruptError):
+        _read_sidecar(slots, 11)
+
+    # n_records mismatch (header says 5, body has 3) -> SidecarCorruptError
+    bad = bytearray(b"SIDE")
+    bad += (1).to_bytes(4, "little") + (5).to_bytes(4, "little")
+    bad += bytes(legacy) + (0).to_bytes(4, "little")
+    (slots / "12.keys").write_bytes(bytes(bad))
+    with pytest.raises(SidecarCorruptError):
+        _read_sidecar(slots, 12)
+
+    # Unknown version (byte = 99) -> SidecarCorruptError
+    ver = bytearray(data)
+    ver[4] = 99
+    (slots / "13.keys").write_bytes(bytes(ver))
+    with pytest.raises(SidecarCorruptError):
+        _read_sidecar(slots, 13)
+
+    # Just magic (4 bytes b"SIDE") -> SidecarCorruptError
+    (slots / "14.keys").write_bytes(b"SIDE")
+    with pytest.raises(SidecarCorruptError):
+        _read_sidecar(slots, 14)
+
+    # Valid n_records=0 file (16 bytes) -> []
+    empty = b"SIDE" + (1).to_bytes(4, "little") + (0).to_bytes(4, "little")
+    (slots / "15.keys").write_bytes(empty + zlib.crc32(empty).to_bytes(4, "little"))
+    assert _read_sidecar(slots, 15) == []
 
 
 # --- 8. manifest backward-compat ----------------------------------------------

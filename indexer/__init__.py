@@ -14,6 +14,7 @@ import glob
 import json
 import os
 import re
+import zlib
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable
@@ -150,46 +151,112 @@ class FileEntry:
 # Atomic I/O and sidecar helpers
 # ---------------------------------------------------------------------------
 
+# Sidecar format (v1): a versioned, CRC32-checksummed record stream.
+#     offset  size  field
+#     0       4     magic     b"SIDE"
+#     4       4     version   u32LE = 1
+#     8       4     n_records u32LE
+#     12      8*N   records   (entry_idx u32LE | word_len u32LE | word raw bytes)
+#     12+8*N  4     crc32     u32LE over bytes 0 .. (12+8*N)-1
+# CRC32 = stdlib zlib.crc32 (IEEE 802.3: init 0xFFFFFFFF, final XOR 0xFFFFFFFF),
+# byte-compatible with the C crc32_compute used by PDWG v4.
+#
+# Legacy sniff: files NOT starting with b"SIDE" are treated as the old
+# unversioned/unchecksummed LE stream, parsed with the same loop below.
+
+
+class SidecarCorruptError(Exception):
+    """Sidecar file is corrupt or has been tampered with."""
+
+
 def _composite_key(word: bytes, file_idx: int, entry_idx: int) -> bytes:
     """{word}\0{file_idx:u32BE}{entry_idx:u32BE} — matches build's key bytes."""
     return word + b"\0" + file_idx.to_bytes(4, "big") + entry_idx.to_bytes(4, "big")
 
 
 def _read_sidecar(slots_dir: Path, file_idx: int) -> list[tuple[int, bytes]]:
-    """Parse <slots>/<file_idx>.keys LE records: u32 entry_idx; u32 word_len; word.
+    """Parse <slots>/<file_idx>.keys and return (entry_idx, word) pairs.
 
-    Returns [] if the slot file is missing (tombstone). Tolerates/truncates a
-    partial trailing record by stopping cleanly.
+    Reads the versioned v1 format (magic b"SIDE", version=1, CRC32 checksummed),
+    falling back to the legacy unversioned LE stream when the file does not start
+    with b"SIDE". Returns [] if the slot file is missing (tombstone).
+
+    Raises SidecarCorruptError if the file is truncated, tampered with, or has
+    an unknown version.
     """
     path = slots_dir / f"{file_idx}.keys"
     if not path.exists():
         return []
     data = path.read_bytes()
-    pairs: list[tuple[int, bytes]] = []
-    i = 0
-    n = len(data)
-    while i < n:
-        if i + 8 > n:  # not enough bytes for the header
-            break
+
+    # Legacy path: no magic header — old unversioned LE record stream.
+    if data[:4] != b"SIDE":
+        pairs: list[tuple[int, bytes]] = []
+        i = 0
+        n = len(data)
+        while i < n:
+            if i + 8 > n:  # not enough bytes for the header
+                break
+            entry_idx = int.from_bytes(data[i:i + 4], "little")
+            word_len = int.from_bytes(data[i + 4:i + 8], "little")
+            i += 8
+            if i + word_len > n:  # partial final record
+                break
+            pairs.append((entry_idx, data[i:i + word_len]))
+            i += word_len
+        # Intentional behavior change: a trailing partial record is corruption
+        # now (old silent-truncation tolerance removed).
+        if i != n:
+            raise SidecarCorruptError("trailing garbage in legacy sidecar")
+        return pairs
+
+    # New-format path: magic b"SIDE", version=1, CRC32 over header+records.
+    if len(data) < 16:
+        raise SidecarCorruptError("too short for header+CRC")
+    version = int.from_bytes(data[4:8], "little")
+    if version != 1:
+        raise SidecarCorruptError(f"unknown version {version}")
+    n_records = int.from_bytes(data[8:12], "little")
+    MAX_RECORDS = 10_000_000
+    if n_records > MAX_RECORDS:
+        raise SidecarCorruptError("record count too large")
+    expected = 12 + 8 * n_records + 4
+    if len(data) < expected:
+        raise SidecarCorruptError("truncated record")
+
+    pairs = []
+    i = 12
+    for _ in range(n_records):
+        if i + 8 > len(data):
+            raise SidecarCorruptError("truncated record")
         entry_idx = int.from_bytes(data[i:i + 4], "little")
         word_len = int.from_bytes(data[i + 4:i + 8], "little")
         i += 8
-        if i + word_len > n:  # partial final record
-            break
+        if i + word_len > len(data):
+            raise SidecarCorruptError("truncated record")
         pairs.append((entry_idx, data[i:i + word_len]))
         i += word_len
+    if len(pairs) != n_records:
+        raise SidecarCorruptError("record count mismatch")
+    if zlib.crc32(data[:-4]) != int.from_bytes(data[-4:], "little"):
+        raise SidecarCorruptError("CRC mismatch")
     return pairs
 
 
 def _write_sidecar(slots_dir: Path, file_idx: int, pairs: list[tuple[int, bytes]]) -> None:
-    """Serialize LE records (entry_idx; word_len; word) to <file_idx>.keys."""
+    """Serialize v1 sidecar (magic b"SIDE", version=1, CRC32) to <file_idx>.keys."""
     slots_dir.mkdir(parents=True, exist_ok=True)
-    out = bytearray()
+    header = bytearray(b"SIDE")
+    header += (1).to_bytes(4, "little")
+    header += len(pairs).to_bytes(4, "little")
+    records = bytearray()
     for entry_idx, word in pairs:
-        out += entry_idx.to_bytes(4, "little")
-        out += len(word).to_bytes(4, "little")
-        out += word
-    _atomic_write(slots_dir / f"{file_idx}.keys", bytes(out))
+        records += entry_idx.to_bytes(4, "little")
+        records += len(word).to_bytes(4, "little")
+        records += word
+    body = bytes(header) + bytes(records)
+    body += zlib.crc32(body).to_bytes(4, "little")
+    _atomic_write(slots_dir / f"{file_idx}.keys", body)
 
 
 def _dedup_pairs(extracted: list[str]) -> list[tuple[int, bytes]]:
@@ -329,7 +396,16 @@ def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
                     unchanged += 1
                     continue
                 # CHANGED: drop old keys, extract and re-add.
-                for ei, w in _read_sidecar(slots_dir, slot):
+                try:
+                    old_pairs = _read_sidecar(slots_dir, slot)
+                except SidecarCorruptError as e:
+                    logger.warning(
+                        "update: corrupt sidecar for slot %d (%s); skipping key deletion — stale keys may remain",
+                        slot,
+                        e,
+                    )
+                    continue
+                for ei, w in old_pairs:
                     if not d.delete(_composite_key(w, slot, ei)):
                         logger.warning("update: missing key for %s (orphan), healing", rel)
                 meta, extracted = fn(filepath, rel)
@@ -369,7 +445,16 @@ def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
         # Tombstone pass: live slots whose file is gone from disk.
         for i, fe in enumerate(files):
             if not fe.get("tombstoned") and fe["filename"] not in disk_rel:
-                for ei, w in _read_sidecar(slots_dir, i):
+                try:
+                    old_pairs = _read_sidecar(slots_dir, i)
+                except SidecarCorruptError as e:
+                    logger.warning(
+                        "update: corrupt sidecar for slot %d (%s); skipping key deletion — stale keys may remain",
+                        i,
+                        e,
+                    )
+                    continue
+                for ei, w in old_pairs:
                     if not d.delete(_composite_key(w, i, ei)):
                         logger.warning("update: missing key for slot %d (orphan), healing", i)
                 files[i] = {
