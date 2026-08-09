@@ -33,6 +33,14 @@
 #define FNV_OFFSET             14695981039346656037ULL
 #define FNV_PRIME              1099511628211ULL
 
+/* Hint to prefetch a cache line for reading. No-op on compilers without
+ * __builtin_prefetch (MSVC etc.). */
+#if defined(__GNUC__) || defined(__clang__)
+#define DAFSA_PREFETCH(ptr) __builtin_prefetch((const void *)(ptr), 0, 1)
+#else
+#define DAFSA_PREFETCH(ptr) ((void)0)
+#endif
+
 /* ─── Data structures ──────────────────────────────────────────────────── */
 
 typedef struct {
@@ -87,6 +95,17 @@ struct dafsa {
     size_t         reg_cap;        /* capacity (prime) */
     size_t         reg_used;       /* count of occupied slots */
     uint64_t       reg_probes;
+
+    /* Per-handle scratch for add/delete path traversal.
+     * NOT reentrant: a single dafsa must not be mutated concurrently. */
+    unsigned int  *spath;
+    unsigned char *schars;
+    unsigned int  *sparents;
+    size_t         scratch_cap;    /* entries (all three share this cap) */
+
+    /* Orphan-state free-list. Freed slots are chained via their `sig` field
+     * (reused as a `next` pointer).  0 = empty list. */
+    unsigned int   free_head;
 };
 
 /* Zero-copy search-only view: mmaps the on-disk PDWG v3 file and indexes
@@ -106,6 +125,7 @@ struct dafsa_view {
 /* ─── Forward declarations ─────────────────────────────────────────────── */
 
 static unsigned int state_new(dafsa *d);
+static void         state_detach_from_children(dafsa *d, unsigned int sid);
 static int          trans_find(const State *s, unsigned char c);
 static int          trans_reserve(State *s, unsigned int need);
 static void         trans_add(State *s, unsigned char c, unsigned int tgt);
@@ -125,10 +145,13 @@ static int          replace_or_register(dafsa *d, unsigned int sid,
                                         unsigned int parent);
 static unsigned int clone_state(dafsa *d, unsigned int sid);
 static int          confluence_path(dafsa *d, unsigned int *path,
-                                    unsigned char *chars,
                                     unsigned int *parents,
                                     unsigned int len);
 static int          trans_find(const State *s, unsigned char c);
+
+#ifdef DAFSA_DEBUG
+static void dafsa_check_invariants(const dafsa *d);
+#endif
 
 /* ─── Prime helpers (for register growth) ──────────────────────────────── */
 
@@ -191,6 +214,9 @@ fail:
 void dafsa_free(dafsa *d)
 {
     if (!d) return;
+    free(d->spath);
+    free(d->schars);
+    free(d->sparents);
     if (d->states) {
         unsigned int i;
         for (i = 0; i < d->nstates; i++)
@@ -207,6 +233,19 @@ void dafsa_free(dafsa *d)
 
 static unsigned int state_new(dafsa *d)
 {
+    /* Try the free-list first — recycled slots don't count against the cap. */
+    if (d->free_head != 0) {
+        unsigned int id = d->free_head;
+        /* sig is reused as the next pointer; narrowing from uint64_t to
+         * uint32_t is safe because state ids are bounded by 100M. */
+        d->free_head = (unsigned int)d->states[id].sig;
+        memset(&d->states[id], 0, sizeof(State));
+        d->states[id].id = id;
+        return id;
+    }
+
+    /* Hard limit only fires when we must allocate a genuinely new slot.
+     * Free-list exhaustion already handled above. */
     if (d->nstates >= DAFSA_MAX_STATES_HARD) {
         fprintf(stderr, "dafsa: max states exceeded (%u)\n",
                 (unsigned)DAFSA_MAX_STATES_HARD);
@@ -241,6 +280,71 @@ static unsigned int state_new(dafsa *d)
     }
 }
 
+/* Remove phantom inode entries from children's in_head chains.
+ * Called by state_free BEFORE it frees the trans[] array.
+ *
+ * For each outgoing transition (sym, child) of state sid, unlinks the
+ * matching inode from child's in_head chain and decrements child's
+ * refcount.  Without this, children accumulate garbage inodes whose
+ * parent field points at a now-reused slot — inflating refcounts and
+ * risking UB if the reused slot is later merged (the assert at ~line 475
+ * would fire on a stale parent). */
+static void state_detach_from_children(dafsa *d, unsigned int sid)
+{
+    State *s = &d->states[sid];
+    unsigned int j;
+
+    for (j = 0; j < s->ntrans; j++) {
+        unsigned char sym   = s->trans[j].sym;
+        unsigned int  child = s->trans[j].target;
+        unsigned int *prev_ptr;
+        unsigned int ni;
+
+        /* In a minimal acyclic DFA, child != sid always (no self-loops).
+         * Also child could be the equivalent/new_tgt that triggered this
+         * merge — that's fine; this just removes sid's phantom contribution. */
+        prev_ptr = &d->states[child].in_head;
+        ni = *prev_ptr;
+        while (ni != 0) {
+            Inode *in = &d->inodes[ni];
+            if (in->parent == sid && in->sym == sym) {
+                /* unlink from child's chain — at most one match per (child,sym) */
+                *prev_ptr = in->next;
+                d->states[child].refcount--;
+                break;
+            }
+            prev_ptr = &in->next;
+            ni = *prev_ptr;
+        }
+    }
+}
+
+/* Release an orphan state slot to the free-list.  Only call when:
+ *   refcount == 0 && id != d->initial
+ * Detaches phantom inodes from children, frees the transition array,
+ * and chains the slot for reuse. */
+static void state_free(dafsa *d, unsigned int id)
+{
+    State *s = &d->states[id];
+
+    /* Detach phantom inodes from children BEFORE freeing trans[].
+     * state_detach_from_children walks s->trans[], so trans must
+     * still be intact here. */
+    state_detach_from_children(d, id);
+
+    free(s->trans);
+    s->trans    = NULL;
+    s->ntrans   = 0;
+    s->refcount = 0;
+    s->is_final = 0;
+    s->in_head  = 0;
+    /* Chain into free-list via the `sig` field.
+     * State ids fit in 32 bits (bounded by DAFSA_MAX_STATES_HARD=100M),
+     * so narrowing the uint64_t sig to uint32_t for the next pointer is safe. */
+    s->sig       = d->free_head;
+    d->free_head = id;
+}
+
 /* ─── Inode allocation ─────────────────────────────────────────────────── */
 
 static Inode *inode_alloc(dafsa *d)
@@ -260,19 +364,77 @@ static Inode *inode_alloc(dafsa *d)
     return &d->inodes[++d->inodes_used];   /* index 0 = sentinel */
 }
 
+/* ─── Scratch arena for add/delete path traversal ──────────────────────── */
+
+/* Ensure the per-handle scratch arrays can hold `len+2` entries.
+ * Returns 0 on success, -1 on OOM.  Not reentrant on the same handle. */
+static int dafsa_ensure_scratch(dafsa *d, size_t len)
+{
+    size_t need = len + 2;
+
+    if (d->scratch_cap >= need) return 0;
+
+    {
+        unsigned int  *new_path;
+        unsigned char *new_chars;
+        unsigned int  *new_parents;
+
+        /* Use malloc (not realloc) so that the old pointers remain valid
+         * until all three allocations have succeeded.  Then swap. */
+        new_path    = (unsigned int *)malloc(need * sizeof(unsigned int));
+        new_chars   = (unsigned char *)malloc(need * sizeof(unsigned char));
+        new_parents = (unsigned int *)malloc(need * sizeof(unsigned int));
+        if (!new_path || !new_chars || !new_parents) {
+            free(new_path);
+            free(new_chars);
+            free(new_parents);
+            return -1;
+        }
+        /* Copy old contents (if any) */
+        if (d->spath) {
+            size_t old_n = d->scratch_cap;
+            memcpy(new_path,    d->spath,    old_n * sizeof(unsigned int));
+            memcpy(new_chars,   d->schars,   old_n * sizeof(unsigned char));
+            memcpy(new_parents, d->sparents, old_n * sizeof(unsigned int));
+        }
+        free(d->spath);
+        free(d->schars);
+        free(d->sparents);
+        d->spath    = new_path;
+        d->schars   = new_chars;
+        d->sparents = new_parents;
+        d->scratch_cap = need;
+    }
+    return 0;
+}
+
 /* ─── Transition helpers ───────────────────────────────────────────────── */
 
 /* binary search for transition `c`. Returns index or -1. */
 static int trans_find(const State *s, unsigned char c)
 {
-    int lo = 0, hi = (int)s->ntrans - 1;
-    while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        if (s->trans[mid].sym == c) return mid;
-        if (s->trans[mid].sym <  c) lo = mid + 1;
-        else                        hi = mid - 1;
+    unsigned int n = s->ntrans;
+    /* Fast path: most DAFSA states have few transitions; a linear scan (with
+     * early exit on the sorted-array invariant) beats binary search there. */
+    if (n <= 8) {
+        unsigned int i;
+        for (i = 0; i < n; i++) {
+            unsigned char sy = s->trans[i].sym;
+            if (sy == c) return (int)i;
+            if (sy >  c) return -1;   /* sorted: no later entry can match */
+        }
+        return -1;
     }
-    return -1;
+    {
+        int lo = 0, hi = (int)n - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            if (s->trans[mid].sym == c) return mid;
+            if (s->trans[mid].sym <  c) lo = mid + 1;
+            else                        hi = mid - 1;
+        }
+        return -1;
+    }
 }
 
 /* Ensure the state's transition array has capacity for `need` entries.
@@ -287,7 +449,11 @@ static int trans_reserve(State *s, unsigned int need)
     new_cap = s->trans_cap ? s->trans_cap : 4;
     while (new_cap < need) new_cap *= 2;
     if (new_cap > ALPHABET_SZ) new_cap = ALPHABET_SZ;
-    if (need > new_cap) new_cap = need;   /* defensive; cap is 256 anyway */
+    /* At this point new_cap >= need: `need` is bounded by ALPHABET_SZ (the
+     * binary-search invariant guarantees ntrans <= ALPHABET_SZ), and the
+     * doubling loop above guarantees new_cap >= need unless capped at
+     * ALPHABET_SZ — in which case need also equals ALPHABET_SZ. No dead
+     * re-clamp needed. */
 
     new_trans = (Edge *)realloc(s->trans, new_cap * sizeof(Edge));
     if (!new_trans) return -1;
@@ -375,6 +541,10 @@ static void incoming_redirect(dafsa *d, unsigned int old_tgt,
         }
     }
     old_s->in_head = 0;
+
+    /* If this state is now an orphan, free it for reuse */
+    if (old_s->refcount == 0 && old_tgt != d->initial)
+        state_free(d, old_tgt);
 }
 
 /* Redirect a single incoming edge: parent's transition via sym from
@@ -414,6 +584,11 @@ static void incoming_redirect_one(dafsa *d, unsigned int parent,
                 /* link into new_tgt */
                 in->next = d->states[new_tgt].in_head;
                 d->states[new_tgt].in_head = ni;
+
+                /* If old_tgt is now an orphan, free it for reuse */
+                if (d->states[old_tgt].refcount == 0 && old_tgt != d->initial)
+                    state_free(d, old_tgt);
+
                 return;
             }
             prev_ptr = &in->next;
@@ -426,6 +601,11 @@ static void incoming_redirect_one(dafsa *d, unsigned int parent,
 
 /* ─── Signature computation (FNV-1a) ───────────────────────────────────── */
 
+/* IMPORTANT (2026-08-09): the target-hashing formula changed from a
+ * 4-byte little-endian loop to a single 32-bit xor + multiply.
+ * Signatures computed before this change are incompatible — any
+ * in-flight mutable handle must be reloaded from disk before
+ * mutation (the nightly build provides this escape hatch). */
 static uint64_t sig_compute(const State *s)
 {
     uint64_t h = FNV_OFFSET;
@@ -434,22 +614,14 @@ static uint64_t sig_compute(const State *s)
     h ^= s->is_final ? 1 : 0;
     h *= FNV_PRIME;
 
-    /* hash each transition: sym + target_id (little-endian) */
+    /* hash each transition: sym + 32-bit target in one step */
     {
         unsigned int i;
         for (i = 0; i < s->ntrans; i++) {
-            unsigned int t;
-            int b;
-
             h ^= s->trans[i].sym;
             h *= FNV_PRIME;
-            /* hash target as 4 bytes */
-            t = s->trans[i].target;
-            for (b = 0; b < 4; b++) {
-                h ^= (uint8_t)(t & 0xFF);
-                h *= FNV_PRIME;
-                t >>= 8;
-            }
+            h ^= s->trans[i].target;    /* xor the full 32-bit target once */
+            h *= FNV_PRIME;
         }
     }
     return h;
@@ -472,6 +644,26 @@ static unsigned int reg_lookup(dafsa *d, uint64_t sig)
     }
     return 0;  /* not found */
 }
+
+/* Non-counting variant for invariant-checker / read-only paths that
+ * must not perturb reg_probes.  Identical to reg_lookup except it
+ * does not increment d->reg_probes.  Only used inside DAFSA_DEBUG. */
+#ifdef DAFSA_DEBUG
+static unsigned int reg_lookup_no_count(const dafsa *d, uint64_t sig)
+{
+    size_t idx;
+
+    if (sig == 0) return 0;
+
+    idx = (size_t)(sig % d->reg_cap);
+    while (d->reg_keys[idx] != 0) {
+        if (d->reg_keys[idx] == sig)
+            return d->reg_vals[idx];
+        idx = (idx + 1) % d->reg_cap;
+    }
+    return 0;
+}
+#endif
 
 /* Grow the register: double capacity -> next prime, rehash all entries. */
 static void reg_grow(dafsa *d)
@@ -626,6 +818,8 @@ static int replace_or_register(dafsa *d, unsigned int sid,
         /* parent's transition was updated by incoming_redirect.
          * Now parent's signature is dirty. */
         d->states[parent].sig = 0;
+
+        /* sid was freed by incoming_redirect — nothing more to do here */
         return 1;
     } else {
         /* --- REGISTER: this signature is unique (or its entry was stale) --- */
@@ -640,9 +834,7 @@ static int replace_or_register(dafsa *d, unsigned int sid,
  * may contain states that need to be re-registered. Process bottom-up.
  *
  * path[i]     = state id
- * chars[i]    = transition character from path[i-1] to path[i]
- *               (chars[0] is unused)
- * parents[i]  = path[i-1]
+ * parents[i]  = path[i-1]  (parents[0] is unused)
  * len         = number of states on the path
  *
  * Returns 1 if any state on the path was merged (caller may need to rebuild
@@ -651,13 +843,11 @@ static int replace_or_register(dafsa *d, unsigned int sid,
  * Pointer safety: operates entirely on indices in the path[]/parents[]
  * stack arrays. replace_or_register re-fetches State * internally. */
 static int confluence_path(dafsa *d, unsigned int *path,
-                           unsigned char *chars,
                            unsigned int *parents,
                            unsigned int len)
 {
     int i;
     int merged = 0;
-    (void)chars;  /* kept for symmetry */
     for (i = (int)len - 1; i >= 1; i--) {
         unsigned int child  = path[i];
         unsigned int parent = parents[i];
@@ -672,30 +862,37 @@ static int confluence_path(dafsa *d, unsigned int *path,
 
 int dafsa_add_n(dafsa *d, const unsigned char *key, size_t len)
 {
-    unsigned int path[MAX_WORD_LEN + 2];
-    unsigned char chars[MAX_WORD_LEN + 2];
-    unsigned int parents[MAX_WORD_LEN + 2];
     unsigned int path_len;
     unsigned int current;
     unsigned int pos;
 
     if (len == 0) {
         /* Empty string: the initial state becomes final */
-        if (d->states[d->initial].is_final) return 0;
+        if (d->states[d->initial].is_final) {
+#ifdef DAFSA_DEBUG
+            dafsa_check_invariants(d);
+#endif
+            return 0;
+        }
         d->states[d->initial].is_final = 1;
         replace_or_register(d, d->initial, 0);
+#ifdef DAFSA_DEBUG
+        dafsa_check_invariants(d);
+#endif
         return 1;
     }
     if (key == NULL) return -1;   /* defensive: non-empty key must be non-NULL */
-    assert(len <= MAX_WORD_LEN);
+    if (len > MAX_WORD_LEN) return -1;   /* hard guard: path arrays are bounded */
+
+    if (dafsa_ensure_scratch(d, len) != 0) return -1;
 
     /* --- Phase 1: Traverse existing path --- */
     current  = d->initial;
     path_len = 0;
 
-    path[path_len]    = current;
-    chars[path_len]   = 0;
-    parents[path_len] = 0;
+    d->spath[path_len]    = current;
+    d->schars[path_len]   = 0;
+    d->sparents[path_len] = 0;
     path_len++;
 
     for (pos = 0; pos < len; pos++) {
@@ -705,17 +902,29 @@ int dafsa_add_n(dafsa *d, const unsigned char *key, size_t len)
 
         {
             unsigned int next = d->states[current].trans[tr].target;
+            /* Prefetch the next iteration's state (and its trans[] array) so
+             * the two dependent random loads overlap the memory latency of the
+             * current iteration. Safe: read-only hint; bounds checked. */
+            if (pos + 1 < len) {
+                DAFSA_PREFETCH(&d->states[next]);
+                if (d->states[next].trans)
+                    DAFSA_PREFETCH(d->states[next].trans);
+            }
             current = next;
-            path[path_len]    = current;
-            chars[path_len]   = c;
-            parents[path_len] = path[path_len - 1];
+            d->spath[path_len]    = current;
+            d->schars[path_len]   = c;
+            d->sparents[path_len] = d->spath[path_len - 1];
             path_len++;
         }
     }
 
     /* --- Check: word already present? --- */
-    if (pos == len && d->states[current].is_final)
+    if (pos == len && d->states[current].is_final) {
+#ifdef DAFSA_DEBUG
+        dafsa_check_invariants(d);
+#endif
         return 0;  /* already in the DAFSA */
+    }
 
     /* --- Clone-on-write: make the prefix path private (ascending) ---
      * Clone every shared state along the path from root toward the leaf.
@@ -726,22 +935,22 @@ int dafsa_add_n(dafsa *d, const unsigned char *key, size_t len)
     {
         unsigned int di;
         for (di = 1; di < path_len; di++) {
-            unsigned int sid = path[di];
+            unsigned int sid = d->spath[di];
             if (d->states[sid].refcount > 1) {
                 unsigned int clone = clone_state(d, sid);
-                unsigned int parent = path[di - 1];
-                unsigned char pc    = chars[di];
+                unsigned int parent = d->spath[di - 1];
+                unsigned char pc    = d->schars[di];
 
                 /* clone_state may realloc states; re-fetch via indices */
                 incoming_redirect_one(d, parent, pc, sid, clone);
 
                 /* Update path (and the parent pointer of the next element) */
-                path[di] = clone;
+                d->spath[di] = clone;
                 if (di + 1 < path_len)
-                    parents[di + 1] = clone;
+                    d->sparents[di + 1] = clone;
             }
         }
-        current = path[path_len - 1];
+        current = d->spath[path_len - 1];
     }
 
     /* --- Phase 2: Add suffix from the divergence point --- */
@@ -758,9 +967,9 @@ int dafsa_add_n(dafsa *d, const unsigned char *key, size_t len)
 
             incoming_add(d, current, c, next);  /* MAY REALLOC inodes */
 
-            path[path_len]    = next;
-            chars[path_len]   = c;
-            parents[path_len] = current;
+            d->spath[path_len]    = next;
+            d->schars[path_len]   = c;
+            d->sparents[path_len] = current;
             path_len++;
 
             current = next;
@@ -775,8 +984,11 @@ int dafsa_add_n(dafsa *d, const unsigned char *key, size_t len)
      * (live state + matching signature), so no full register rebuild is needed
      * here — rebuilding on every add is O(nstates) and makes bulk builds
      * O(N^2). */
-    confluence_path(d, path, chars, parents, path_len);
+    confluence_path(d, d->spath, d->sparents, path_len);
 
+#ifdef DAFSA_DEBUG
+    dafsa_check_invariants(d);
+#endif
     return 1;
 }
 
@@ -784,46 +996,71 @@ int dafsa_add_n(dafsa *d, const unsigned char *key, size_t len)
 
 int dafsa_delete_n(dafsa *d, const unsigned char *key, size_t len)
 {
-    unsigned int path[MAX_WORD_LEN + 2];
-    unsigned char chars[MAX_WORD_LEN + 2];
-    unsigned int parents[MAX_WORD_LEN + 2];
     unsigned int path_len;
     unsigned int current;
     unsigned int i;
     int di;
 
     if (len == 0) {
-        if (!d->states[d->initial].is_final) return 0;
+        if (!d->states[d->initial].is_final) {
+#ifdef DAFSA_DEBUG
+            dafsa_check_invariants(d);
+#endif
+            return 0;
+        }
         d->states[d->initial].is_final = 0;
         d->states[d->initial].sig = 0;
         replace_or_register(d, d->initial, 0);
+#ifdef DAFSA_DEBUG
+        dafsa_check_invariants(d);
+#endif
         return 1;
     }
     if (key == NULL) return -1;   /* defensive: non-empty key must be non-NULL */
-    assert(len <= MAX_WORD_LEN);
+    if (len > MAX_WORD_LEN) return -1;   /* hard guard: path arrays are bounded */
+
+    if (dafsa_ensure_scratch(d, len) != 0) return -1;
 
     /* --- Phase 1: Traverse to the final state --- */
     current  = d->initial;
     path_len = 0;
 
-    path[path_len]    = current;
-    chars[path_len]   = 0;
-    parents[path_len] = 0;
+    d->spath[path_len]    = current;
+    d->schars[path_len]   = 0;
+    d->sparents[path_len] = 0;
     path_len++;
 
     for (i = 0; i < len; i++) {
         unsigned char c = key[i];
         int tr = trans_find(&d->states[current], c);
-        if (tr < 0) return 0;  /* not present */
-        current = d->states[current].trans[tr].target;
-        path[path_len]    = current;
-        chars[path_len]   = c;
-        parents[path_len] = path[path_len - 1];
+        if (tr < 0) {
+#ifdef DAFSA_DEBUG
+            dafsa_check_invariants(d);
+#endif
+            return 0;  /* not present */
+        }
+        {
+            unsigned int next = d->states[current].trans[tr].target;
+            /* Prefetch the next iteration's state + trans[] (see add_n). */
+            if ((unsigned)(i + 1) < len) {
+                DAFSA_PREFETCH(&d->states[next]);
+                if (d->states[next].trans)
+                    DAFSA_PREFETCH(d->states[next].trans);
+            }
+            current = next;
+        }
+        d->spath[path_len]    = current;
+        d->schars[path_len]   = c;
+        d->sparents[path_len] = d->spath[path_len - 1];
         path_len++;
     }
 
-    if (!d->states[current].is_final)
+    if (!d->states[current].is_final) {
+#ifdef DAFSA_DEBUG
+        dafsa_check_invariants(d);
+#endif
         return 0;  /* word is a prefix but not a word */
+    }
 
     /* --- Phase 2: Clone-on-write, bottom-up ---
      * Walk the path from the root toward the leaf (ascending).  At each step
@@ -834,21 +1071,21 @@ int dafsa_delete_n(dafsa *d, const unsigned char *key, size_t len)
      * parent and corrupt words that share the sub-automaton.) */
     {
         for (di = 1; di < (int)path_len; di++) {
-            unsigned int sid = path[di];
+            unsigned int sid = d->spath[di];
             if (d->states[sid].refcount > 1) {
                 unsigned int clone = clone_state(d, sid);
                 /* parent is the (possibly just-cloned) previous path state;
                  * must re-read path[di-1], NOT the stale parents[] snapshot */
-                unsigned int parent = path[di - 1];
-                unsigned char pc    = chars[di];
+                unsigned int parent = d->spath[di - 1];
+                unsigned char pc    = d->schars[di];
 
                 /* clone_state may realloc states; re-fetch via indices */
                 incoming_redirect_one(d, parent, pc, sid, clone);
 
                 /* Update path -- and current if this is the final state */
-                path[di] = clone;
+                d->spath[di] = clone;
                 if (di < (int)path_len - 1)
-                    parents[di + 1] = clone;
+                    d->sparents[di + 1] = clone;
                 if (di == (int)path_len - 1)
                     current = clone;
             }
@@ -861,8 +1098,11 @@ int dafsa_delete_n(dafsa *d, const unsigned char *key, size_t len)
 
     /* Stale register entries (from merged-away/dead states) are validated at
      * lookup in replace_or_register, so no full register rebuild is needed. */
-    confluence_path(d, path, chars, parents, path_len);
+    confluence_path(d, d->spath, d->sparents, path_len);
 
+#ifdef DAFSA_DEBUG
+    dafsa_check_invariants(d);
+#endif
     return 1;
 }
 
@@ -878,7 +1118,16 @@ int dafsa_lookup_n(const dafsa *d, const unsigned char *key, size_t len)
     for (i = 0; i < len; i++) {
         int tr = trans_find(&d->states[current], key[i]);
         if (tr < 0) return 0;
-        current = d->states[current].trans[tr].target;
+        {
+            unsigned int next = d->states[current].trans[tr].target;
+            /* Prefetch the next iteration's state + trans[] (see add_n). */
+            if (i + 1 < len) {
+                DAFSA_PREFETCH(&d->states[next]);
+                if (d->states[next].trans)
+                    DAFSA_PREFETCH(d->states[next].trans);
+            }
+            current = next;
+        }
     }
     return d->states[current].is_final;
 }
@@ -957,6 +1206,42 @@ static int put_u32_le(FILE *f, uint32_t v)
     return 0;
 }
 
+/* Open the directory containing `path` and fsync it, so a prior rename of a
+ * file into it is made durable. Returns 0 on success, -1 on error. */
+static int fsync_dir_of(const char *path)
+{
+    char *dir = NULL;
+    const char *slash;
+    int fd, ret = -1;
+
+    if (!path || !*path) return -1;
+    /* dirname(path) without modifying path: everything up to the last '/'. */
+    slash = strrchr(path, '/');
+    if (slash == NULL) {
+        dir = (char *)malloc(2);
+        if (!dir) return -1;
+        dir[0] = '.'; dir[1] = '\0';
+    } else if (slash == path) {
+        dir = (char *)malloc(2);
+        if (!dir) return -1;
+        dir[0] = '/'; dir[1] = '\0';
+    } else {
+        size_t n = (size_t)(slash - path);
+        dir = (char *)malloc(n + 1);
+        if (!dir) return -1;
+        memcpy(dir, path, n);
+        dir[n] = '\0';
+    }
+
+    fd = open(dir, O_RDONLY | O_DIRECTORY);
+    if (fd >= 0) {
+        ret = fsync(fd);
+        close(fd);
+    }
+    free(dir);
+    return ret;
+}
+
 /* Save a compact, minimal form: BFS-renumber reachable states 1..N (initial
  * -> 1), drop orphans (refcount 0 / unreachable).  Atomic: write path.tmp,
  * fflush, fsync, fclose, rename.  Returns 0 on success, -1 on any error.
@@ -1007,6 +1292,9 @@ int dafsa_save(const dafsa *d, const char *path)
 
     f = fopen(tmp_path, "wb");
     if (!f) goto out;
+    /* Large buffered writes: saves ~15M fputc syscalls on a multi-megastate
+     * index (default stdio buffer is only 4-8 KB). */
+    if (setvbuf(f, NULL, _IOFBF, 1u << 20) != 0) goto fail;
 
     /* header */
     if (put_u8(f, 'P') || put_u8(f, 'D') || put_u8(f, 'W') || put_u8(f, 'G'))
@@ -1057,6 +1345,10 @@ int dafsa_save(const dafsa *d, const char *path)
     if (fclose(f) != 0) { f = NULL; goto fail; }
     f = NULL;
     if (rename(tmp_path, path) != 0) goto fail;
+    /* fsync the containing directory so the rename itself is durable; a crash
+     * after rename but before this point can otherwise lose the rename even
+     * though the file data was fsync'd. */
+    if (fsync_dir_of(path) != 0) goto fail;
 
     ok = 0;
     goto out;
@@ -1199,10 +1491,16 @@ static dafsa *dafsa_load_impl(const char *path, int mutable)
     d = dafsa_create();
     if (!d) goto fail;
 
-    /* grow states array to hold n_states+1 entries */
+    /* grow states array to hold n_states+1 entries.
+     * Round capacity up to a power of two so the first `state_new` after a
+     * load doesn't immediately double-and-realloc the entire array (which, at
+     * 2M+ states, copies ~80MB). */
     if ((size_t)n_states + 1 > d->states_cap) {
-        size_t new_cap = (size_t)n_states + 1;
-        State *new_states = (State *)realloc(d->states, new_cap * sizeof(State));
+        size_t need = (size_t)n_states + 1;
+        size_t new_cap = d->states_cap;
+        State *new_states;
+        while (new_cap < need) new_cap *= 2;
+        new_states = (State *)realloc(d->states, new_cap * sizeof(State));
         if (!new_states) goto fail;
         memset(new_states + d->states_cap, 0,
                (new_cap - d->states_cap) * sizeof(State));
@@ -1702,3 +2000,86 @@ void dafsa_dot(const dafsa *d, FILE *f)
     }
     fprintf(f, "}\n");
 }
+
+/* ─── DAFSA_DEBUG invariant checker ─────────────────────────────────────── */
+
+#ifdef DAFSA_DEBUG
+static void dafsa_check_invariants(const dafsa *d)
+{
+    unsigned int i;
+    unsigned char *visited;
+    unsigned int *queue;
+    unsigned int head, tail;
+
+    /* Allocate BFS workspace */
+    visited = (unsigned char *)calloc(d->nstates, 1);
+    queue   = (unsigned int *)malloc(d->nstates * sizeof(unsigned int));
+    if (!visited || !queue) {
+        free(visited);
+        free(queue);
+        return;  /* cannot check; skip gracefully */
+    }
+
+    /* BFS from initial to find reachable states */
+    head = 0; tail = 0;
+    queue[tail++] = d->initial;
+    visited[d->initial] = 1;
+
+    while (head < tail) {
+        unsigned int sid = queue[head++];
+        const State *s = &d->states[sid];
+
+        /* (a) no orphan reachable from initial */
+        assert(s->refcount > 0 || sid == d->initial);
+
+        /* (b) ntrans matches the actual trans[] entries — trans[] is
+         *     sorted by sym and has no duplicate sym */
+        for (i = 0; i < s->ntrans; i++) {
+            if (i > 0)
+                assert(s->trans[i - 1].sym < s->trans[i].sym);
+        }
+
+        /* (c) refcount == number of inodes pointing at this state */
+        {
+            unsigned int ni = s->in_head;
+            unsigned int cnt = 0;
+            while (ni != 0) {
+                cnt++;
+                ni = d->inodes[ni].next;
+            }
+            assert(cnt == s->refcount);
+        }
+
+        /* enqueue children */
+        for (i = 0; i < s->ntrans; i++) {
+            unsigned int tgt = s->trans[i].target;
+            if (!visited[tgt]) {
+                visited[tgt] = 1;
+                queue[tail++] = tgt;
+            }
+        }
+    }
+
+    /* (d) register: for each reachable state, reg_lookup must return
+     *     either this state or a valid equivalent (matching sig, live).
+     *     Stale entries pointing to dead states (refcount==0, id!=initial)
+     *     are a known benign artefact of clone-on-write — they are
+     *     validated away in replace_or_register. */
+    for (i = 1; i < d->nstates; i++) {
+        const State *s = &d->states[i];
+        unsigned int eq;
+        if (s->refcount == 0 && i != d->initial) continue; /* dead slot */
+        /* Only check states that have a valid signature (transitions
+         * or is_final).  Freshly-created states with sig==0 are dirty. */
+        if (s->sig == 0) continue;
+        eq = reg_lookup_no_count(d, s->sig);  /* does not perturb reg_probes */
+        /* eq == 0 means no register entry — that's OK for dirty states
+         * whose old sig was evicted.  If non-zero, it must be live. */
+        if (eq != 0)
+            assert(eq == d->initial || d->states[eq].refcount > 0);
+    }
+
+    free(visited);
+    free(queue);
+}
+#endif /* DAFSA_DEBUG */

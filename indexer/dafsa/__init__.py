@@ -15,6 +15,10 @@ from pathlib import Path
 
 _LIB_PATH = Path(__file__).parent / "libdafsa.so"
 
+# Matches MAX_WORD_LEN in dafsa.c. Keys longer than this are rejected by the C
+# core (returns -1); guard here too so we never build an oversized buffer.
+_MAX_WORD_LEN = 4096
+
 # Enumerate callback: returns count (or -1 on error); stop by returning 0.
 _ENUM_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t, ctypes.c_void_p)
 
@@ -83,17 +87,22 @@ class Dafsa:
             self._h = 0
 
     def add(self, key: bytes) -> bool:
+        if len(key) > _MAX_WORD_LEN:
+            return False
         buf = ctypes.create_string_buffer(key)
         return bool(_lib.dafsa_add_n(self._h, buf, len(key)))
 
     def lookup(self, key: bytes) -> bool:
+        if len(key) > _MAX_WORD_LEN:
+            return False
         buf = ctypes.create_string_buffer(key)
         return bool(_lib.dafsa_lookup_n(self._h, buf, len(key)))
 
     def delete(self, key: bytes) -> bool:
+        if len(key) > _MAX_WORD_LEN:
+            return False
         buf = ctypes.create_string_buffer(key)
         return bool(_lib.dafsa_delete_n(self._h, buf, len(key)))
-
     def save(self, path: str) -> None:
         if _lib.dafsa_save(self._h, str(path).encode()) != 0:
             raise OSError(f"dafsa_save failed for {path}")
