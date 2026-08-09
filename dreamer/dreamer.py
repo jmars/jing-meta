@@ -981,13 +981,15 @@ def replay_run(
     from_stage: str | None = None,
     target_db: Path | None = None,
     apply: bool = False,
+    store: "RunStore | None" = None,
 ) -> int:
     """Replay a persisted run from the given stage.
 
     Loads the saved stages and snapshot from ``<memory_dir>/dreamer/<run_id>/``,
     then re-runs stages starting from *from_stage* (default: first incomplete stage).
     If *target_db* is provided, mutations are applied there; otherwise the
-    manifest's ``source_db`` is used.
+    manifest's ``source_db`` is used. A custom *store* may be injected (e.g. for
+    tests pointing at a temp run dir); it defaults to the config-run store.
     """
     from .contracts import Mode, Stage
     from .runstore import RunStore
@@ -995,7 +997,8 @@ def replay_run(
 
     from jing_meta import config as _config
 
-    store = RunStore(_config.memory_dir() / "dreamer")
+    if store is None:
+        store = RunStore(_config.memory_dir() / "dreamer")
     manifest, prior_stages = store.load_run(run_id)
 
     # Determine from_stage

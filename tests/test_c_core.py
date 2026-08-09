@@ -21,6 +21,7 @@ SOURCES = [
     "dafsa_core.c",
     "dafsa_persist.c",
     "dafsa_view.c",
+    "dafsa_crc32.c",
 ]
 
 BANNER = "=== All tests passed. ==="

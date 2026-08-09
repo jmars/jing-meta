@@ -211,10 +211,11 @@ class TestRunStore:
         from dreamer.contracts import Mode
 
         store = RunStore(tmp_path)
+        db_path = _tmp_db(tmp_path, "collision.db")
 
         # Create a run with a name that would collide
         rid = store.new_run_id()
-        store.create_run(rid, Mode.LLM, Path("/tmp/fake.db"))
+        store.create_run(rid, Mode.LLM, db_path)
 
         # Force a collision: create a dir with the next candidate
         (tmp_path / f"{rid}-2").mkdir()
@@ -578,7 +579,9 @@ class TestValidateStage:
             },
         )
 
-        # Stub call_llm to return a plan per chunk
+        # Stub call_llm to return a plan per chunk. validate() imports these
+        # from .dreamer *inside the function body*, so patch the dreamer module
+        # (dreamer.dreamer), not dreamer.stages.
         call_count = [0]
 
         def stub_call_llm(prompt, **kw):
@@ -592,10 +595,10 @@ class TestValidateStage:
                 "summary": "linked",
             }, {"model": "stub"}
 
-        monkeypatch.setattr("dreamer.stages.call_llm", stub_call_llm)
+        monkeypatch.setattr("dreamer.dreamer.call_llm", stub_call_llm)
 
         # Stub validate_plan to avoid checking real mutations
-        monkeypatch.setattr("dreamer.stages.validate_plan", lambda plan: [])
+        monkeypatch.setattr("dreamer.dreamer.validate_plan", lambda plan: [])
 
         result = validate(ctx, prior)
         assert call_count[0] >= 1
@@ -776,8 +779,8 @@ class TestReplay:
                 stage=stage, run_id=rid, mode=Mode.LLM, created_at="t", payload=payload,
             ))
 
-        # Replay apply dry-run
-        result = replay_run(rid, from_stage="apply")
+        # Replay apply dry-run (inject the tmp store so the run is found)
+        result = replay_run(rid, from_stage="apply", store=store)
         assert result == 0
 
 

@@ -35,7 +35,7 @@ _MAX_WORD_LEN = 4096
 # version probe catches the mismatch before any calls are made.
 _ABI_VERSION = 1
 
-# Enumerate callback: returns count (or -1 on error); stop by returning 0.
+# Enumerate callback: return 0 to continue, non-zero to stop early.
 _ENUM_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t, ctypes.c_void_p)
 
 
@@ -234,7 +234,7 @@ class Dafsa:
 
         def cb(payload, payload_len, _user):
             results.append(ctypes.string_at(payload, payload_len))
-            return 1  # continue
+            return 0  # 0 = continue enumerating (non-zero would stop early)
 
         cb_fn = _ENUM_CB(cb)
         buf = ctypes.create_string_buffer(prefix)
