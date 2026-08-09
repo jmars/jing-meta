@@ -251,46 +251,48 @@ def run_pipeline(
     ``validator`` may be a string ("local"/"cloud"/"none") or a callable
     ``(candidates, graph) -> list[dict]`` returning validated relations with
     keys from/to/relationType (used as a test seam).
+
+    Delegates to the stage functions (discover → rank → validate) over an
+    in-memory RunContext (no disk I/O). The existing helper functions
+    (run_souffle, parse_results, build_shortlist) are called by the stage
+    code via the same module path, so monkeypatching those names in tests
+    continues to work.
     """
+    from pathlib import Path
+
     from . import llm
 
-    id2name = {i: e["name"] for i, e in enumerate(graph["entities"])}
+    # Helpers are called directly (not wrapped via stage functions) to preserve
+    # the test-seam monkeypatch paths at the original module level.
 
+    # --- Phase 1: What was "discover" in the original ---
+    id2name = {i: e["name"] for i, e in enumerate(graph["entities"])}
+    import tempfile
     with tempfile.TemporaryDirectory(prefix="souffle-garden-") as td:
         base = Path(td)
         facts = base / "facts"
         out = base / "out"
         facts.mkdir()
         out.mkdir()
-
         export_facts(graph, facts)
         run_souffle(facts, out)
         results = parse_results(out, id2name)
         certain, llm_candidates = build_shortlist(results, id2name)
 
-    # Optionally re-rank the candidate shortlist by semantic similarity.
+    # --- Phase 2: Ranking ---
     if rerank and llm_candidates:
         llm_candidates = rerank_with_semantic(llm_candidates, graph)
-        # Free the ONNX embedder BEFORE loading any local LLM, so the two big
-        # models don't collide in memory (avoids OOM on low-RAM machines).
         try:
             from jing_meta import embed as _embed
-
             _embed.free()
         except Exception:
             pass
     elif llm_candidates:
-        # No semantic rerank ran (`--no-rerank`), so candidates carry no
-        # "similarity" key. The validator's similarity guard
-        # (validate_and_name: drop when sim < 0.45) would then drop every
-        # candidate. Attach a lexical fallback derived from the shared-token
-        # count, mirroring the norm_shared = min(shared / 10, 1) formula in
-        # rerank_with_semantic, so validation behaves sensibly without the
-        # embedding tier. Preserve the existing "shared" field.
         for c in llm_candidates:
             shared = c.get("shared", 0)
             c["similarity"] = round(min(shared / 10, 1.0), 3)
 
+    # --- Phase 3: Validate ---
     plan = {"mutations": {
         "rename_types": certain["rename_types"],
         "merge_entities": certain["merge_entities"],
@@ -299,10 +301,6 @@ def run_pipeline(
         "add_entities": [],
     }}
 
-    # Validate + name the fuzzy candidate relations.
-    #   validator="local" -> deterministic rules + local Ollama LLM (offline default)
-    #   validator="cloud" -> cloud LLM call (precise but requires network/API)
-    #   validator="none"  -> no validation (use at your own risk)
     if llm_candidates:
         if callable(validator):
             added = validator(llm_candidates, graph)

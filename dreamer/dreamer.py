@@ -530,7 +530,7 @@ def validate_plan(plan: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def apply_mutations(graph: dict, plan: dict) -> dict:
+def apply_mutations(graph: dict, plan: dict, *, run_date: str | None = None) -> dict:
     """Apply the mutation plan to *graph*.
 
     Mutation order:
@@ -542,13 +542,17 @@ def apply_mutations(graph: dict, plan: dict) -> dict:
 
     This function operates defensively — malformed or missing fields from LLM
     output are silently skipped rather than crashing.
+
+    ``run_date`` is threaded into archive tags as the ``YYYY-MM-DD`` part. If
+    None (the default), the current date is used.
     """
     mutations = plan.get("mutations", {})
     if not isinstance(mutations, dict):
         mutations = {}
     entities = {e["name"]: e for e in graph["entities"]}
     changes: list[str] = []
-    run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if run_date is None:
+        run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # 1. Archive stale observations (defensive — skip malformed entries)
     for a in mutations.get("archive_observations", []) or []:
@@ -674,6 +678,96 @@ def apply_mutations(graph: dict, plan: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Shared stage runner
+# ---------------------------------------------------------------------------
+
+
+def _run_stages(
+    ctx,
+    from_stage,
+    discover_fn,
+    rank_fn,
+    validate_fn,
+    apply_fn,
+) -> int:
+    """Run stages from *from_stage* through apply, loading priors from store if available.
+
+    Returns 0 on success, 1 on LLM failure.
+    """
+    store = ctx.store
+    run_id = ctx.run_id
+
+    from_idx = STAGE_ORDER.index(from_stage)
+    prior: StageResult | None = None  # type: ignore[name-defined]
+    validate_result: StageResult | None = None
+
+    for stage in STAGE_ORDER:
+        if STAGE_ORDER.index(stage) < from_idx:
+            # Try loading from disk if this is a replay
+            if store is not None:
+                loaded = store.load_stage(run_id, stage)
+                if loaded is not None:
+                    prior = loaded
+                    continue
+            # If we can't load it but we're past it, skip
+            if stage != from_stage:
+                continue
+
+        if stage == Stage.DISCOVER:
+            prior = discover_fn(ctx, prior)
+        elif stage == Stage.RANK:
+            prior = rank_fn(ctx, prior)
+        elif stage == Stage.VALIDATE:
+            prior = validate_fn(ctx, prior)
+            validate_result = prior
+            if prior is None:
+                return 1  # LLM failure
+        elif stage == Stage.APPLY:
+            prior = apply_fn(ctx, prior)
+
+    # Print summary
+    val_result = None
+    if store is not None:
+        val_result = store.load_stage(run_id, Stage.VALIDATE)
+    if val_result is None:
+        val_result = validate_result
+
+    if val_result is not None:
+        plan_dict = val_result.payload.get("plan", {})
+        stats = plan_dict.get("_stats", {})
+        muts = plan_dict.get("mutations", {})
+        total = sum(len(v or []) for v in muts.values())
+        if stats.get("candidates_found") is not None:
+            print(f"  candidates found: {stats.get('candidates_found')}")
+            print(f"  shown to LLM: {stats.get('llm_candidates_shown')}")
+            print(f"  deterministic: {stats.get('certain_renames')} renames, "
+                  f"{stats.get('certain_merges')} merges")
+            print(f"  LLM-validated relations: {len(muts.get('add_relations', []))}")
+        print(f"  TOTAL mutations: {total}")
+        for key, val in muts.items():
+            if val:
+                print(f"    {key}: {len(val) if isinstance(val, list) else '?'}")
+
+        if ctx.apply:
+            if total > 0:
+                app_result = store.load_stage(run_id, Stage.APPLY) if store else prior
+                if app_result is not None:
+                    ap = app_result.payload
+                    print(f"\nSaved: {ap.get('n_entities_after')} entities, "
+                          f"{ap.get('n_relations_after')} relations")
+            else:
+                print("No mutations to apply — store unchanged.")
+        else:
+            print("\nDry run — no changes applied. Use --apply to commit.")
+
+    return 0
+
+
+# Add STAGE_ORDER import at module level used by _run_stages
+from .contracts import Stage, STAGE_ORDER, StageResult  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
 # Soufflé mode — deterministic Datalog tiers + LLM validation
 # ---------------------------------------------------------------------------
 
@@ -688,6 +782,8 @@ def run_souffle_mode(
     max_entities: int | None = None,
     rerank: bool = True,
     validator: str = "local",
+    run_id: str | None = None,
+    from_stage: str | None = None,
 ) -> int:
     """Run maintenance via the Soufflé Datalog pipeline.
 
@@ -695,68 +791,85 @@ def run_souffle_mode(
     detection, candidate relations) in sub-second, exactly. The LLM only
     validates/names a capped candidate shortlist. Falls back to the LLM
     discovery mode if Soufflé isn't available.
+
+    When ``run_id`` is provided the run is persisted under
+    ``<memory_dir>/dreamer/<run_id>/`` and can be replayed later. ``from_stage``
+    skips stages before the named one.
     """
+    from .contracts import Mode, Stage
+    from .runstore import RunStore
+    from .stages import apply as apply_stage, discover, rank, validate
+
     try:
-        from .souffle_pipeline import run_pipeline, SouffleError
+        from .souffle_pipeline import SouffleError
     except ImportError as e:
         logger.warning("souffle pipeline unavailable (%s); falling back to LLM mode.", e)
         return run(memory_db, apply=apply, api_url=api_url, api_key=api_key,
-                   model=model, max_entities=max_entities)
+                   model=model, max_entities=max_entities,
+                   run_id=run_id, from_stage=from_stage)
 
-    graph = load_graph_sqlite(memory_db)
-    print(f"Loaded (SQLite): {len(graph['entities'])} entities, {len(graph['relations'])} relations")
-    if not graph["entities"] and not graph["relations"]:
-        print("Graph is empty — nothing to do.")
-        return 0
+    # --- Resolve from_stage ---
+    from_stage_enum: Stage | None = None
+    if from_stage is not None:
+        try:
+            from_stage_enum = Stage(from_stage)
+        except ValueError:
+            logger.error("invalid --from-stage value: %r", from_stage)
+            return 1
+    if from_stage is not None and run_id is None:
+        logger.error("--from-stage requires --run-id")
+        return 1
 
+    # --- Resolve max_entities default ---
     if max_entities is None:
         max_entities = int(os.environ.get("GRAPH_GARDENER_MAX_ENTITIES", "800"))
-    if max_entities and max_entities > 0 and len(graph["entities"]) > max_entities:
-        graph = _cap_graph(graph, max_entities)
-        print(f"Capped to {len(graph['entities'])} most-recently-updated entities")
 
-    print("Running Soufflé Datalog pipeline...")
-    try:
-        plan = run_pipeline(
-            graph,
-            api_url=api_url, api_key=api_key, model=model,
-            validate_relations=True,
-            rerank=rerank,
+    # --- Setup RunContext ---
+    from jing_meta import config as _config
+
+    if run_id is not None:
+        store = RunStore(_config.memory_dir() / "dreamer")
+        if from_stage_enum is None:
+            # New run — create from scratch
+            ctx = store.create_run(run_id, Mode.SOUFFLE, memory_db, max_entities=max_entities)
+        else:
+            # Replay — load existing run
+            manifest, _prior_stages = store.load_run(run_id)
+            ctx = RunStore.reconstitute_ctx(
+                store, manifest,
+                apply=apply, api_url=api_url, api_key=api_key,
+                model=model, rerank=rerank, validator=validator,
+                max_entities=max_entities,
+            )
+        ctx.apply = apply
+        ctx.api_url = api_url
+        ctx.api_key = api_key
+        ctx.model = model
+        ctx.rerank = rerank
+        ctx.validator = validator
+    else:
+        # In-memory-only (original behavior) — no persistence
+        from datetime import timezone as _tz, datetime as _dt
+        rid = _dt.now(_tz.utc).strftime("%Y%m%dT%H%M%SZ")
+        from .contracts import RunContext as RC
+        ctx = RC(
+            run_id=rid, mode=Mode.SOUFFLE,
+            source_db=memory_db, snapshot_db=memory_db,
+            run_dir=Path("."), store=None, apply=apply,
+            max_entities=max_entities, api_url=api_url,
+            api_key=api_key, model=model, rerank=rerank,
             validator=validator,
+            run_date=_dt.now(_tz.utc).strftime("%Y-%m-%d"),
         )
+
+    try:
+        return _run_stages(ctx, from_stage_enum or Stage.DISCOVER,
+                           discover, rank, validate, apply_stage)
     except (SouffleError, FileNotFoundError) as e:
         logger.warning("souffle pipeline failed (%s); falling back to LLM mode.", e)
         return run(memory_db, apply=apply, api_url=api_url, api_key=api_key,
-                   model=model, max_entities=max_entities)
-
-    stats = plan.pop("_stats", {})
-    muts = plan["mutations"]
-    total = sum(len(v or []) for v in muts.values())
-    print(f"  candidates found: {stats.get('candidates_found')}")
-    print(f"  shown to LLM: {stats.get('llm_candidates_shown')}")
-    print(f"  deterministic: {stats.get('certain_renames')} renames, "
-          f"{stats.get('certain_merges')} merges")
-    print(f"  LLM-validated relations: {len(muts['add_relations'])}")
-    print(f"  TOTAL mutations: {total}")
-
-    if apply:
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        backup_path = memory_db.with_suffix(".db.bak." + timestamp)
-        shutil.copy2(memory_db, backup_path)
-        print(f"Backup saved to: {backup_path}")
-
-        if total > 0:
-            graph = apply_mutations(graph, plan)
-            save_graph_sqlite(graph, memory_db)
-            print(f"\nSaved: {len(graph['entities'])} entities, {len(graph['relations'])} relations")
-        else:
-            print("No mutations to apply — store unchanged.")
-    else:
-        print("\nDry run — no changes applied. Use --apply to commit.")
-        if total > 0:
-            print(f"\nFull plan:\n{json.dumps(plan, indent=2)}")
-
-    return 0
+                   model=model, max_entities=max_entities,
+                   run_id=run_id, from_stage=from_stage)
 
 
 # ---------------------------------------------------------------------------
@@ -772,6 +885,8 @@ def run(
     api_key: str | None = None,
     model: str | None = None,
     max_entities: int | None = None,
+    run_id: str | None = None,
+    from_stage: str | None = None,
 ) -> int:
     """Run graph maintenance on the memory-mcp SQLite store.
 
@@ -783,108 +898,148 @@ def run(
     ``max_entities`` caps how many (most-recently-updated) entities are looked
     at this run. Defaults to the ``GRAPH_GARDENER_MAX_ENTITIES`` env var, else
     800. Set to 0/None to process the whole graph.
+
+    When ``run_id`` is provided the run is persisted under
+    ``<memory_dir>/dreamer/<run_id>/`` and can be replayed later. ``from_stage``
+    skips stages before the named one.
     """
-    try:
-        graph = load_graph_sqlite(memory_db)
-        print(f"Loaded (SQLite): {len(graph['entities'])} entities, {len(graph['relations'])} relations")
+    from .contracts import Mode, Stage
+    from .runstore import RunStore
+    from .stages import apply as apply_stage, discover, rank, validate
 
-        if not graph["entities"] and not graph["relations"]:
-            print("Graph is empty — nothing to do.")
-            return 0
+    # --- Resolve from_stage ---
+    from_stage_enum: Stage | None = None
+    if from_stage is not None:
+        try:
+            from_stage_enum = Stage(from_stage)
+        except ValueError:
+            logger.error("invalid --from-stage value: %r", from_stage)
+            return 1
+    if from_stage is not None and run_id is None:
+        logger.error("--from-stage requires --run-id")
+        return 1
 
-        # ---- Cap the number of entities processed this run ----
-        if max_entities is None:
-            max_entities = int(
-                os.environ.get("GRAPH_GARDENER_MAX_ENTITIES", "800")
+    # --- Resolve max_entities default ---
+    if max_entities is None:
+        max_entities = int(os.environ.get("GRAPH_GARDENER_MAX_ENTITIES", "800"))
+
+    # --- Setup RunContext ---
+    from jing_meta import config as _config
+
+    if run_id is not None:
+        store = RunStore(_config.memory_dir() / "dreamer")
+        if from_stage_enum is None:
+            # New run — create from scratch
+            ctx = store.create_run(run_id, Mode.LLM, memory_db, max_entities=max_entities)
+        else:
+            # Replay — load existing run
+            manifest, _prior_stages = store.load_run(run_id)
+            ctx = RunStore.reconstitute_ctx(
+                store, manifest,
+                apply=apply, api_url=api_url, api_key=api_key,
+                model=model,
+                max_entities=max_entities,
             )
-        if max_entities and max_entities > 0 and len(graph["entities"]) > max_entities:
-            graph = _cap_graph(graph, max_entities)
-            print(
-                f"Capped to {len(graph['entities'])} most-recently-updated entities "
-                f"({len(graph['relations'])} relations)"
-            )
-
-        resolved_model = model or os.environ.get("GRAPH_GARDENER_MODEL", "deepseek-chat")
-        print(f"Sending to {resolved_model}...")
-
-        # ---- Chunk the entities and run one LLM pass per chunk ----
-        chunks = _chunk_graph(graph, chunk_size=100)
-        print(f"Processing {len(chunks)} chunk(s)...")
-
-        merged: dict = {"mutations": {
-            "archive_observations": [], "rename_types": [], "merge_entities": [],
-            "add_entities": [], "add_relations": [],
-        }}
-        summaries: list[str] = []
-        total_mutations = 0
-        for ci, chunk in enumerate(chunks, 1):
-            candidates = suggest_relations(chunk)
-            prompt = build_prompt(chunk, candidates=candidates)
-            print(
-                f"  chunk {ci}/{len(chunks)}: {len(chunk['entities'])} entities, "
-                f"{len(chunk['relations'])} relations, "
-                f"{len(candidates)} candidate relations, prompt {len(prompt)} chars"
-            )
-            if len(prompt) > 80_000:
-                logger.warning("chunk prompt is %d chars — may exceed LLM context window", len(prompt))
-
-            plan, metadata = call_llm(
-                prompt, api_url=api_url, api_key=api_key, model=model
-            )
-            if plan is None:
-                logger.error("LLM call failed on chunk %d. Aborting — no changes made.", ci)
-                return 1
-
-            if metadata:
-                print(
-                    f"    {metadata.get('model', '?')} | in {metadata.get('tokens_in', '?')} | "
-                    f"out {metadata.get('tokens_out', '?')}"
-                )
-
-            # Merge this chunk's mutations into the aggregate plan
-            chunk_muts = plan.get("mutations", {})
-            if isinstance(chunk_muts, dict):
-                for key in merged["mutations"]:
-                    merged["mutations"][key].extend(chunk_muts.get(key, []) or [])
-            if plan.get("summary"):
-                summaries.append(str(plan["summary"]))
-
-        plan = merged
-        total_mutations = sum(
-            len(plan["mutations"].get(k, []) or []) for k in plan["mutations"]
+        ctx.apply = apply
+        ctx.api_url = api_url
+        ctx.api_key = api_key
+        ctx.model = model
+    else:
+        # In-memory-only (original behavior) — no persistence
+        from datetime import timezone as _tz, datetime as _dt
+        rid = _dt.now(_tz.utc).strftime("%Y%m%dT%H%M%SZ")
+        from .contracts import RunContext as RC
+        ctx = RC(
+            run_id=rid, mode=Mode.LLM,
+            source_db=memory_db, snapshot_db=memory_db,
+            run_dir=Path("."), store=None, apply=apply,
+            max_entities=max_entities, api_url=api_url,
+            api_key=api_key, model=model,
+            run_date=_dt.now(_tz.utc).strftime("%Y-%m-%d"),
         )
 
-        # Validate the merged plan
-        warnings = validate_plan(plan)
-        for w in warnings:
-            logger.warning("%s", w)
+    # Resolve model early for display
+    resolved_model = model or os.environ.get("GRAPH_GARDENER_MODEL", "deepseek-chat")
+    print(f"Sending to {resolved_model}...")
 
-        print(f"\nPlan: {' '.join(summaries) if summaries else '(no summaries)'}")
-        print(f"Mutations: {total_mutations} total")
-        for key, val in plan["mutations"].items():
-            if val:
-                print(f"  {key}: {len(val) if isinstance(val, list) else '?'}")
-
-        if apply:
-            # Always create backup with microseconds to prevent collisions
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-            backup_path = memory_db.with_suffix(".db.bak." + timestamp)
-            shutil.copy2(memory_db, backup_path)
-            print(f"Backup saved to: {backup_path}")
-
-            if total_mutations > 0 or warnings:
-                graph = apply_mutations(graph, plan)
-                save_graph_sqlite(graph, memory_db)
-                print(f"\nSaved: {len(graph['entities'])} entities, {len(graph['relations'])} relations")
-            else:
-                print("No mutations to apply — store unchanged.")
-        else:
-            print("\nDry run — no changes applied. Use --apply to commit.")
-            if total_mutations > 0:
-                print(f"\nFull plan:\n{json.dumps(plan, indent=2)}")
-
-        return 0
-
+    try:
+        return _run_stages(ctx, from_stage_enum or Stage.DISCOVER,
+                           discover, rank, validate, apply_stage)
     except Exception:  # noqa: BLE001 — top-level safety net for run()
         logger.exception("Unhandled error in run()")
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# Replay
+# ---------------------------------------------------------------------------
+
+
+def replay_run(
+    run_id: str,
+    *,
+    from_stage: str | None = None,
+    target_db: Path | None = None,
+    apply: bool = False,
+) -> int:
+    """Replay a persisted run from the given stage.
+
+    Loads the saved stages and snapshot from ``<memory_dir>/dreamer/<run_id>/``,
+    then re-runs stages starting from *from_stage* (default: first incomplete stage).
+    If *target_db* is provided, mutations are applied there; otherwise the
+    manifest's ``source_db`` is used.
+    """
+    from .contracts import Mode, Stage
+    from .runstore import RunStore
+    from .stages import apply as apply_stage, discover, rank, validate
+
+    from jing_meta import config as _config
+
+    store = RunStore(_config.memory_dir() / "dreamer")
+    manifest, prior_stages = store.load_run(run_id)
+
+    # Determine from_stage
+    if from_stage is not None:
+        try:
+            from_stage_enum = Stage(from_stage)
+        except ValueError:
+            logger.error("invalid --from-stage value: %r", from_stage)
+            return 1
+    else:
+        # Default: first incomplete stage
+        from_stage_enum = Stage.DISCOVER
+        for stage in STAGE_ORDER:
+            if stage not in prior_stages:
+                from_stage_enum = stage
+                break
+
+    # Determine target DB
+    if target_db is not None:
+        source_db = target_db
+    else:
+        source_db = Path(manifest.source_db)
+
+    # Re-run from the snapshot
+    ctx = RunStore.reconstitute_ctx(
+        store, manifest,
+        apply=apply,
+        max_entities=manifest.max_entities,
+    )
+    ctx.source_db = source_db
+    ctx.apply = apply
+
+    print(f"Replaying run {run_id} from stage {from_stage_enum.value}...")
+
+    stage_fns = {
+        Stage.DISCOVER: discover,
+        Stage.RANK: rank,
+        Stage.VALIDATE: validate,
+        Stage.APPLY: apply_stage,
+    }
+
+    try:
+        return _run_stages(ctx, from_stage_enum,
+                           discover, rank, validate, apply_stage)
+    except Exception:
+        logger.exception("Unhandled error in replay_run()")
         return 1

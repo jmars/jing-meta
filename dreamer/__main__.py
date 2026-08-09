@@ -7,7 +7,7 @@ from pathlib import Path
 
 from jing_meta import config as _config
 from jing_meta.log import get_logger, setup_logging
-from .dreamer import run, run_souffle_mode
+from .dreamer import replay_run, run, run_souffle_mode
 
 logger = get_logger(__name__)
 
@@ -58,6 +58,25 @@ def _cli() -> argparse.ArgumentParser:
         default=None,
         help="LLM model name (default: GRAPH_GARDENER_MODEL env var)",
     )
+
+    # Replay / stage flags
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Persist run under <memory_dir>/dreamer/<run-id>/ for later replay; "
+             "or replay an existing run with --from-stage",
+    )
+    parser.add_argument(
+        "--from-stage",
+        default=None,
+        choices=["discover", "rank", "validate", "apply"],
+        help="Replay a persisted run starting from the named stage (requires --run-id)",
+    )
+    parser.add_argument(
+        "--replay",
+        action="store_true",
+        help="Shorthand for --run-id <id> --from-stage <stage> (requires both)",
+    )
     return parser
 
 
@@ -67,6 +86,19 @@ def main() -> None:
     args = parser.parse_args()
 
     memory_db = Path(os.path.expanduser(str(args.memory_db)))
+
+    # --from-stage without --run-id is an error
+    if args.from_stage and not args.run_id:
+        logger.error("--from-stage requires --run-id")
+        sys.exit(1)
+
+    # --replay mode (loads stored run)
+    if args.replay and args.run_id:
+        sys.exit(replay_run(
+            args.run_id,
+            from_stage=args.from_stage,
+            apply=args.apply,
+        ))
 
     check_path = memory_db
     if not check_path.is_file():
@@ -86,6 +118,8 @@ def main() -> None:
             model=args.model,
             rerank=not args.no_rerank,
             validator=args.validator,
+            run_id=args.run_id,
+            from_stage=args.from_stage,
         ))
     sys.exit(run(
         memory_db,
@@ -93,6 +127,8 @@ def main() -> None:
         api_url=args.api_url,
         api_key=None,
         model=args.model,
+        run_id=args.run_id,
+        from_stage=args.from_stage,
     ))
 
 
