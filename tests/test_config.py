@@ -26,7 +26,7 @@ def test_invalid_type_raises():
 
 
 def test_valid_extractor_notification():
-    """'notification' is a legitimate search-side extractor (notifications domain)."""
+    """'notification' is a valid config extractor for non-DAFSA domains."""
     dc = DomainConfig(name="d", dir=".", extractor="notification")
     assert dc.extractor == "notification"
 
@@ -130,7 +130,7 @@ def test_invalid_extractor_in_toml_raises(tmp_path):
 
 
 def test_notification_extractor_in_toml_loads(tmp_path):
-    """A notifications domain with extractor='notification' must load (example config)."""
+    """A notifications domain with extractor='notification' must load from TOML."""
     p = tmp_path / "config.toml"
     p.write_text("[domains.notifications]\ndir = '/tmp/x'\nextractor = 'notification'\n")
     cfg = load_config(p)

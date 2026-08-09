@@ -14,11 +14,11 @@ except ModuleNotFoundError:
 
 # Valid values for fields with enumerated options
 _VALID_TYPES = frozenset({"files", "dirs"})
-# The config `extractor` is the SEARCH-side extractor registry
-# (search/extractors.py: jsonl, txt, transcript, notification), NOT the DAFSA
-# indexer's subset (indexer.EXTRACTORS).  "notification" is a legitimate value
-# (used by the notifications domain and the shipped config.example.toml); the
-# indexer/search extractor divergence is consolidated separately (roadmap #12).
+# The config `extractor` field is a superset of the DAFSA indexer's EXTRACTORS
+# registry (indexer/__init__.py).  "notification" is valid at the config level
+# for domains that don't use a DAFSA index (e.g. the notifications domain, read
+# via server-side bespoke functions).  Domains with extractors not in
+# indexer.EXTRACTORS are gracefully skipped by rebuild/update with a log warning.
 _VALID_EXTRACTORS = frozenset({"jsonl", "txt", "transcript", "notification"})
 # renderer uses the same set (effective_renderer falls back to extractor)
 

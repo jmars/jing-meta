@@ -313,3 +313,36 @@ def test_resolve_file_idx_tombstone(tmp_path):
     assert resolve_file_idx(out, 0) == "a.txt"
     assert resolve_file_idx(out, 1) is None  # tombstoned
     assert resolve_file_idx(out, 5) is None  # out of range
+
+
+# --- 13. graceful skip for non-DAFSA extractors --------------------------------
+def test_build_index_skips_unsupported_extractor(tmp_path):
+    """build_index gracefully skips domains whose extractor is not in indexer.EXTRACTORS."""
+    from search.indexer import build_index
+    from search.config import DomainConfig
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "foo.jsonl").write_text('{"content": "hello"}\n', encoding="utf-8")
+
+    cfg = DomainConfig(name="test", dir=str(data_dir), extractor="notification")
+    ok, msg = build_index(cfg)
+    assert ok is True
+    assert "skipped" in msg
+    assert "notification" in msg
+
+
+def test_update_index_skips_unsupported_extractor(tmp_path):
+    """update_index gracefully skips domains whose extractor is not in indexer.EXTRACTORS."""
+    from search.indexer import update_index
+    from search.config import DomainConfig
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "foo.jsonl").write_text('{"content": "hello"}\n', encoding="utf-8")
+
+    cfg = DomainConfig(name="test", dir=str(data_dir), extractor="notification")
+    ok, msg = update_index(cfg)
+    assert ok is True
+    assert "skipped" in msg
+    assert "notification" in msg

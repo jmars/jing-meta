@@ -457,17 +457,6 @@ def _resolve_file(cfg: DomainConfig, id: str) -> Path | None:
 
 
 # ---------------------------------------------------------------------------
-# Domain -> extractor pattern name used for FST
-# ---------------------------------------------------------------------------
-
-_DOMAIN_EXTRACTOR_MAP = {
-    "sessions": "jsonl",
-    "transcripts": "transcript",
-    "notifications": "notification",
-}
-
-
-# ---------------------------------------------------------------------------
 # MCP tools
 # ---------------------------------------------------------------------------
 

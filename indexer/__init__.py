@@ -108,6 +108,12 @@ EXTRACTORS = {
     "transcript": extract_transcript,
 }
 
+# Canonical registry of DAFSA-capable extractors.  The search config's
+# _VALID_EXTRACTORS is a superset that additionally allows "notification"
+# for domains that don't use a DAFSA index (e.g. the notifications domain
+# read via server-side bespoke functions).  search/indexer.py gracefully
+# skips domains whose extractor is not in this set.
+
 
 # ---------------------------------------------------------------------------
 # Collect files (recursive, sorted, skip symlinked dirs)

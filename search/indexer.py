@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from .config import DomainConfig
+from indexer import EXTRACTORS as DAFSA_EXTRACTORS
 
 
 def _iter_domain_files(cfg: DomainConfig) -> list[Path]:
@@ -56,6 +57,16 @@ def _load_manifest(index_dir: Path) -> Optional[list[dict]]:
 
 def build_index(cfg: DomainConfig, index_dir: Optional[str] = None) -> tuple[bool, str]:
     """Build a DAFSA index for a domain (in-process, Python indexer)."""
+    if cfg.extractor not in DAFSA_EXTRACTORS:
+        from jing_meta.log import get_logger
+        logger = get_logger(__name__)
+        logger.warning(
+            "Skipping DAFSA index build for domain %r: extractor %r is not in "
+            "indexer.EXTRACTORS (%s)",
+            cfg.name, cfg.extractor, ", ".join(sorted(DAFSA_EXTRACTORS)),
+        )
+        return True, f"skipped (extractor {cfg.extractor!r} not supported by DAFSA indexer)"
+
     from indexer import build as dafsa_build
 
     out_dir = Path(index_dir).expanduser().resolve() if index_dir else cfg.effective_index_dir
@@ -76,6 +87,16 @@ def build_index(cfg: DomainConfig, index_dir: Optional[str] = None) -> tuple[boo
 
 def update_index(cfg: DomainConfig, index_dir: Optional[str] = None) -> tuple[bool, str]:
     """Incrementally update a DAFSA index for a domain (in-process, Python)."""
+    if cfg.extractor not in DAFSA_EXTRACTORS:
+        from jing_meta.log import get_logger
+        logger = get_logger(__name__)
+        logger.warning(
+            "Skipping DAFSA index update for domain %r: extractor %r is not in "
+            "indexer.EXTRACTORS (%s)",
+            cfg.name, cfg.extractor, ", ".join(sorted(DAFSA_EXTRACTORS)),
+        )
+        return True, f"skipped (extractor {cfg.extractor!r} not supported by DAFSA indexer)"
+
     from indexer import update as dafsa_update
 
     out_dir = Path(index_dir).expanduser().resolve() if index_dir else cfg.effective_index_dir
