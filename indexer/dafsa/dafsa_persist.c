@@ -5,6 +5,11 @@
 /* On-disk format (ROADMAP 1.3): all integers little-endian, explicit byte
  * writes (State/Edge have padding; never fwrite raw structs).
  *
+ * Version 4 (2026-02-19): appends a trailing 4-byte CRC32 (IEEE 802.3 /
+ * CRC-32) computed over ALL bytes from offset 0 up to (but not including)
+ * the CRC field itself.  Readers verify it for v4 files.  v3 files
+ * (unchecksummed) remain readable.
+ *
  * Version 3 (2026-08-09): widens state-table ntrans from u8 to u16 LE,
  * fixing truncation for states with exactly 256 out-edges.
  *
@@ -12,13 +17,15 @@
  * varint-encodes CSR target ids, shrinking large indexes ~40-58% vs v1.
  * Search semantics are unchanged. v1 is no longer read.
  *
- *   HEADER:  magic[4]="PDWG"; u32 version=3; u32 n_states; u32 n_trans;
+ *   HEADER:  magic[4]="PDWG"; u32 version=4; u32 n_states; u32 n_trans;
  *            u32 initial_id=1; u32 n_final; u32 reserved=0
  *   STATE TABLE: (n_states+1) x u16 LE ntrans (0..65535; entry 0 = 0).
  *            Transition offsets are implied (cumulative), not stored.
  *   FINAL BITMAP: ceil((n_states+1)/8) bytes; bit i set iff reachable state i is final
  *   CSR TRANSITIONS: n_trans x (u8 sym; LEB128 u32 target_id), grouped by state
  *            in state-table order, sorted by sym asc.  Sink 0 -> 0, else new id.
+ *   TRAILING CRC32 (v4 only): 4 bytes LE, over every byte above (offset 0 up
+ *            to but excluding the CRC itself).
  */
 
 int put_u8(FILE *f, uint8_t v);
@@ -107,6 +114,7 @@ int dafsa_save(const dafsa *d, const char *path)
     uint32_t n_reach = 0, n_trans = 0, n_final = 0;
     uint32_t head, tail, i, j;
     size_t path_len;
+    uint8_t *crc_buf = NULL;
     int ok = -1;
 
     if (!d || !path) return -1;
@@ -141,7 +149,7 @@ int dafsa_save(const dafsa *d, const char *path)
     if (!tmp_path) goto out;
     snprintf(tmp_path, path_len + 5, "%s.tmp", path);
 
-    f = fopen(tmp_path, "wb");
+    f = fopen(tmp_path, "w+b");
     if (!f) goto out;
     /* Large buffered writes: saves ~15M fputc syscalls on a multi-megastate
      * index (default stdio buffer is only 4-8 KB). */
@@ -150,7 +158,7 @@ int dafsa_save(const dafsa *d, const char *path)
     /* header */
     if (put_u8(f, 'P') || put_u8(f, 'D') || put_u8(f, 'W') || put_u8(f, 'G'))
         goto fail;
-    if (put_u32_le(f, 3)) goto fail;            /* version */
+    if (put_u32_le(f, DAFSA_PDWG_VERSION)) goto fail;   /* version */
     if (put_u32_le(f, n_reach)) goto fail;      /* n_states */
     if (put_u32_le(f, n_trans)) goto fail;      /* n_trans */
     if (put_u32_le(f, 1)) goto fail;            /* initial_id */
@@ -193,6 +201,31 @@ int dafsa_save(const dafsa *d, const char *path)
 
     if (ferror(f)) goto fail;
 
+    /* v4: append a trailing CRC32 over every byte written so far (offset 0 up
+     * to but excluding the CRC field).  Flush so ftell reflects real size,
+     * rewind, read the whole stream back in one buffer, checksum it, then
+     * seek back to EOF and write the CRC LE. */
+    {
+        uint32_t crc;
+        long size;
+        if (fflush(f) != 0) goto fail;
+        size = ftell(f);
+        if (size < 0) goto fail;
+        if (size > 0) {
+            crc_buf = (uint8_t *)malloc((size_t)size);
+            if (!crc_buf) goto fail;
+            if (fseek(f, 0, SEEK_SET) != 0) goto fail;
+            if (fread(crc_buf, 1, (size_t)size, f) != (size_t)size) goto fail;
+            crc = crc32_compute(crc_buf, (size_t)size);
+        } else {
+            crc = crc32_compute(NULL, 0);   /* empty stream: 0x00000000 */
+        }
+        free(crc_buf);
+        crc_buf = NULL;
+        if (fseek(f, 0, SEEK_END) != 0) goto fail;
+        if (put_u32_le(f, crc)) goto fail;
+    }
+
     /* atomic commit */
     if (fflush(f) != 0) goto fail;
     if (fsync(fileno(f)) != 0) goto fail;
@@ -214,6 +247,7 @@ fail:
 
 out:
     free(tmp_path);
+    free(crc_buf);
     free(old_to_new);
     free(queue);
     free(visited);
@@ -335,7 +369,7 @@ dafsa *dafsa_load_impl(const char *path, int mutable)
         mb_u32(&p, end, &n_final) || mb_u32(&p, end, &reserved))
         goto fail;
     (void)reserved;
-    if (version != 3) goto fail;
+    if (version != 3 && version != 4) goto fail;
     if (initial_id != 1) goto fail;
     if (n_states == 0) goto fail;                       /* initial must exist */
     if (n_states > DAFSA_MAX_STATES_HARD) goto fail;    /* hard cap: reject corrupt files */
@@ -424,7 +458,21 @@ dafsa *dafsa_load_impl(const char *path, int mutable)
             }
         }
     }
-    if (p != end) goto fail;  /* reject trailing bytes after CSR */
+    if (version == 4) {
+        /* v4: verify trailing CRC32.  Covered region is [map, p) (p == CSR
+         * end).  Stored CRC sits in the final 4 bytes, little-endian. */
+        uint32_t stored, calc;
+        if (fsize < 32) goto fail;            /* header 28 + CRC 4 */
+        if (p + 4 != end) goto fail;          /* no trailing garbage after CRC */
+        stored = (uint32_t)map[fsize - 4]
+               | ((uint32_t)map[fsize - 3] << 8)
+               | ((uint32_t)map[fsize - 2] << 16)
+               | ((uint32_t)map[fsize - 1] << 24);
+        calc = crc32_compute(map, (size_t)(p - map));
+        if (calc != stored) goto fail;
+    } else {
+        if (p != end) goto fail;  /* v3: reject trailing bytes after CSR */
+    }
 
     /* Rebuild incoming edges + register ONLY for a mutable handle.  Search
      * (lookup / prefix_enum) does not need either; skipping them is the whole

@@ -45,7 +45,7 @@ dafsa_view *dafsa_view_open(const char *path)
         mb_u32(&p, end, &n_final) || mb_u32(&p, end, &reserved))
         goto fail;
     (void)reserved;
-    if (version != 3) goto fail;
+    if (version != 3 && version != 4) goto fail;
     if (initial_id != 1) goto fail;
     if (n_states == 0) goto fail;
 
@@ -102,7 +102,21 @@ dafsa_view *dafsa_view_open(const char *path)
         }
         state_off[n_states + 1] = (uint64_t)(q - p);
         if (nt_sum != n_trans) goto fail;  /* header n_trans mismatch */
-        if (q != end) goto fail;           /* CSR must end exactly at EOF */
+        if (version == 4) {
+            /* v4: verify trailing CRC32.  Covered region is [map, q) (q == CSR
+             * end).  Stored CRC sits in the final 4 bytes, little-endian. */
+            uint32_t stored, calc;
+            if (fsize < 32) goto fail;            /* header 28 + CRC 4 */
+            if (q + 4 != end) goto fail;          /* no trailing garbage after CRC */
+            stored = (uint32_t)map[fsize - 4]
+                   | ((uint32_t)map[fsize - 3] << 8)
+                   | ((uint32_t)map[fsize - 2] << 16)
+                   | ((uint32_t)map[fsize - 1] << 24);
+            calc = crc32_compute(map, (size_t)(q - map));
+            if (calc != stored) goto fail;
+        } else {
+            if (q != end) goto fail;      /* v3: CSR must end exactly at EOF */
+        }
     }
 
     v = calloc(1, sizeof(*v));

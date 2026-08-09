@@ -801,7 +801,8 @@ int main(void)
     printf("\n[M4 Test 16] Corrupted CSR: target > n_states → view_open NULL\n");
     {
         /*
-         * Build a minimal v3 PDWG file by hand:
+         * Build a minimal v3 PDWG file by hand (v3 is unchecksummed and still
+         * accepted by readers).  It has a corrupt CSR target:
          *   n_states=1  n_trans=1  n_final=0
          *   state table [0,0, 1,0]  bitmap 0x00  CSR: sym 'a', target=UINT32_MAX
          * 28-byte header + 4B state table + 1B bitmap + 6B CSR = 39 bytes.
@@ -890,7 +891,7 @@ int main(void)
             assert(f != NULL);
             assert(fread(hdr, 1, 8, f) == 8);
             assert(hdr[0] == 'P' && hdr[1] == 'D' && hdr[2] == 'W' && hdr[3] == 'G');
-            assert(hdr[4] == 0x03);  /* version LE = 3 */
+            assert(hdr[4] == 0x04);  /* version LE = 4 */
             fclose(f);
         }
 
@@ -975,6 +976,66 @@ int main(void)
         dafsa_free(fan);
     }
     printf("  PASS: 256-fanout state saved/loaded/viewed without truncation\n");
+
+    /* ── Test 19: Corrupted checksum → both readers reject ── */
+    printf("\n[M4 Test 19] Corrupted trailing CRC32 → view_open/load NULL\n");
+    {
+        const char *path = "/tmp/m4_crc.pdwg";
+        const char *keys[] = { "alpha", "bravo", "charlie", "delta" };
+        dafsa *crc_d = dafsa_create();
+        FILE *f;
+        long sz;
+        unsigned char *buf;
+        size_t i;
+
+        assert(crc_d != NULL);
+        for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++)
+            assert(dafsa_add_n(crc_d, (const unsigned char *)keys[i],
+                               strlen(keys[i])) == 1);
+        assert(dafsa_save(crc_d, path) == 0);
+        dafsa_free(crc_d);
+
+        /* sanity: the uncorrupted v4 file loads fine in both readers */
+        {
+            dafsa_view *v_ok = dafsa_view_open(path);
+            dafsa *d_ok = dafsa_load(path);
+            assert(v_ok != NULL);
+            assert(d_ok != NULL);
+            assert(dafsa_view_lookup_n(v_ok, (const unsigned char *)"alpha", 5) == 1);
+            assert(dafsa_lookup_n(d_ok, (const unsigned char *)"alpha", 5) == 1);
+            dafsa_view_close(v_ok);
+            dafsa_free(d_ok);
+        }
+
+        /* read the file, flip one bit in the LAST byte (the CRC), write back */
+        f = fopen(path, "rb");
+        assert(f != NULL);
+        fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
+        assert(sz > 4);
+        buf = (unsigned char *)malloc((size_t)sz);
+        assert(buf != NULL);
+        assert(fread(buf, 1, (size_t)sz, f) == (size_t)sz);
+        fclose(f);
+
+        buf[sz - 1] ^= 0x01;   /* corrupt the stored CRC */
+
+        f = fopen(path, "wb");
+        assert(f != NULL);
+        assert(fwrite(buf, 1, (size_t)sz, f) == (size_t)sz);
+        fclose(f);
+        free(buf);
+
+        /* both readers must now reject the tampered file */
+        {
+            dafsa_view *v_bad = dafsa_view_open(path);
+            dafsa *d_bad = dafsa_load(path);
+            assert(v_bad == NULL);
+            assert(d_bad == NULL);
+        }
+
+        remove(path);
+    }
+    printf("  PASS: corrupted checksum rejected by view and load\n");
 
     /* ── Summary ── */
     printf("\n=== All tests passed. ===\n");

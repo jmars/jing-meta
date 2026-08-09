@@ -26,6 +26,7 @@
 #define ALPHABET_SZ            256
 #define FNV_OFFSET             14695981039346656037ULL
 #define FNV_PRIME              1099511628211ULL
+#define DAFSA_PDWG_VERSION     4   /* v4: adds trailing CRC32 */
 #define DAFSA_INLINE_N          4
 
 /* Hint to prefetch a cache line for reading. No-op on compilers without
@@ -180,6 +181,9 @@ int           mb_u32(const uint8_t **p, const uint8_t *end, uint32_t *out);
 int           mb_uvarint(const uint8_t **p, const uint8_t *end, uint32_t *out);
 int           mb_skipvarint(const uint8_t **p, const uint8_t *end);
 dafsa        *dafsa_load_impl(const char *path, int mutable);
+
+/* dafsa_crc32.c */
+uint32_t      crc32_compute(const uint8_t *data, size_t len);
 
 /* dafsa_view.c */
 int           enum_dfs(const dafsa *d, unsigned int state, unsigned char *buf,
