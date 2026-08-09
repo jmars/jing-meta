@@ -806,6 +806,11 @@ def traverse(start_node: str, depth: int = 1) -> list[TextContent]:
 def recent(hours: int = 24) -> list[TextContent]:
     """Return entities, relations, and observations created or updated in the last N hours.
 
+    Time-scoped on observations: only observations whose own ``created_at`` falls
+    within the window are returned for a recently-updated entity — not the entity's
+    full observation history. This keeps the result proportional to recent activity
+    rather than to entity size.
+
     Args:
         hours: Look-back window in hours (default 24, max 720)
     """
@@ -815,15 +820,31 @@ def recent(hours: int = 24) -> list[TextContent]:
 
     # Use SQLite datetime() for format-agnostic comparison
     entities = []
-    for row in conn.execute(
+    rows = conn.execute(
         "SELECT id, name, entity_type, created_at, updated_at FROM entities "
         "WHERE datetime(updated_at) >= datetime(?) ORDER BY updated_at DESC",
         (cutoff_iso,),
-    ):
+    ).fetchall()
+
+    # Fetch, in a single query, only the observations created within the window
+    # for all recently-updated entities (time-scoped, not full history).
+    recent_obs_by_entity: dict[int, list[str]] = {}
+    if rows:
+        id_placeholders = ",".join("?" * len(rows))
+        obs_rows = conn.execute(
+            f"SELECT entity_id, content FROM observations "
+            f"WHERE entity_id IN ({id_placeholders}) "
+            f"AND datetime(created_at) >= datetime(?) ORDER BY entity_id, id",
+            [*(r["id"] for r in rows), cutoff_iso],
+        ).fetchall()
+        for o in obs_rows:
+            recent_obs_by_entity.setdefault(o["entity_id"], []).append(o["content"])
+
+    for row in rows:
         entities.append({
             "name": row["name"],
             "entityType": row["entity_type"],
-            "observations": _get_obs_by_entity_id(conn, row["id"]),
+            "observations": recent_obs_by_entity.get(row["id"], []),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         })
