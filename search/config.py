@@ -12,6 +12,21 @@ except ModuleNotFoundError:
     import tomli as tomllib  # type: ignore
 
 
+# Valid values for fields with enumerated options
+_VALID_TYPES = frozenset({"files", "dirs"})
+# The config `extractor` is the SEARCH-side extractor registry
+# (search/extractors.py: jsonl, txt, transcript, notification), NOT the DAFSA
+# indexer's subset (indexer.EXTRACTORS).  "notification" is a legitimate value
+# (used by the notifications domain and the shipped config.example.toml); the
+# indexer/search extractor divergence is consolidated separately (roadmap #12).
+_VALID_EXTRACTORS = frozenset({"jsonl", "txt", "transcript", "notification"})
+# renderer uses the same set (effective_renderer falls back to extractor)
+
+
+class ConfigError(ValueError):
+    """Configuration validation error. Raised at load time for bad domain config."""
+
+
 @dataclass
 class DomainConfig:
     """Configuration for a single searchable domain."""
@@ -37,6 +52,33 @@ class DomainConfig:
             self.dir = self.dir.expanduser().resolve()
         if self.fst_index_dir:
             self.fst_index_dir = str(Path(self.fst_index_dir).expanduser().resolve())
+
+        # --- validation (fail loud at config load, not at query/index time) ---
+        if self.type not in _VALID_TYPES:
+            raise ConfigError(
+                f"domain {self.name!r}: invalid type {self.type!r}; "
+                f"expected 'files' or 'dirs'"
+            )
+        if self.extractor not in _VALID_EXTRACTORS:
+            raise ConfigError(
+                f"domain {self.name!r}: invalid extractor {self.extractor!r}; "
+                f"expected 'jsonl', 'txt', 'transcript', or 'notification'"
+            )
+        if self.renderer and self.renderer not in _VALID_EXTRACTORS:
+            raise ConfigError(
+                f"domain {self.name!r}: invalid renderer {self.renderer!r}; "
+                f"expected 'jsonl', 'txt', 'transcript', 'notification', "
+                f"or '' (empty for extractor default)"
+            )
+        if not self.pattern.strip():
+            raise ConfigError(
+                f"domain {self.name!r}: pattern must not be empty or whitespace-only"
+            )
+        if self.fst_pattern and not self.fst_pattern.strip():
+            raise ConfigError(
+                f"domain {self.name!r}: fst_pattern must not be empty or whitespace-only "
+                f"when set (use empty string to fall back to pattern)"
+            )
 
     @property
     def effective_renderer(self) -> str:
@@ -105,20 +147,25 @@ def load_config(path: Optional[Path] = None) -> Config:
         if isinstance(filters_list, list):
             filters_list = [str(f) for f in filters_list]
 
-        domain_cfg = DomainConfig(
-            name=name,
-            dir=domain_dir,
-            pattern=str(d.get("pattern", "*")),
-            type=str(d.get("type", "files")),
-            extensions=ext_list,
-            extractor=str(d.get("extractor", "jsonl")),
-            renderer=str(d.get("renderer", "")),
-            label=str(d.get("label", "file")),
-            fst_binary=str(d.get("fst_binary", "fst-indexer")),
-            fst_pattern=str(d.get("fst_pattern", "")),
-            fst_index_dir=d.get("fst_index_dir"),
-            filters=filters_list,
-        )
+        try:
+            domain_cfg = DomainConfig(
+                name=name,
+                dir=domain_dir,
+                pattern=str(d.get("pattern", "*")),
+                type=str(d.get("type", "files")),
+                extensions=ext_list,
+                extractor=str(d.get("extractor", "jsonl")),
+                renderer=str(d.get("renderer", "")),
+                label=str(d.get("label", "file")),
+                fst_binary=str(d.get("fst_binary", "fst-indexer")),
+                fst_pattern=str(d.get("fst_pattern", "")),
+                fst_index_dir=d.get("fst_index_dir"),
+                filters=filters_list,
+            )
+        except ConfigError:
+            raise  # already has domain context from __post_init__
+        except Exception as e:
+            raise ConfigError(f"domain {name!r}: failed to build config: {e}") from e
         cfg.domains[name] = domain_cfg
 
     # Parse [history] section
