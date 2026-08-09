@@ -475,6 +475,7 @@ def search(
     role: str | None = None,
     speaker: str | None = None,
     cwd: str | None = None,
+    any_word: bool = True,
 ) -> str:
     """Search across domains with FST-backed full-text search.
 
@@ -499,6 +500,11 @@ def search(
         cwd:                  [sessions] Only include sessions whose working
                               directory is ``cwd`` or a subdirectory of it
                               (prefix match). Ignored for other domains.
+        any_word:             If True (default), match entries containing ANY
+                              query word (OR semantics). If False, entries
+                              must contain ALL words (AND semantics).
+                              Only applies to FST-backed search; ignored
+                              for regex searches.
     """
     cfg = _get_config()
 
@@ -521,10 +527,12 @@ def search(
 
     # --- Fast path: try FST for each domain ---
     all_fst_results: list[dict] = []
+    any_fst_attempted = False
     for d_name in domains_to_search:
         d_cfg = cfg.domains[d_name]
-        fst_results = _search_via_fst(d_cfg, query, max_results * 5)
-        if fst_results:
+        fst_results = _search_via_fst(d_cfg, query, max_results * 5, any_word)
+        if fst_results is not None:
+            any_fst_attempted = True
             for r in fst_results:
                 r["_domain"] = d_name
             all_fst_results.extend(fst_results)
@@ -545,6 +553,13 @@ def search(
             speaker,
             cwd,
         )
+
+    # FST was available for at least one domain but found nothing — treat the
+    # FST index as authoritative and do NOT fall through to the slow scan.
+    # (Previously an AND query with no all-words match would fall through to the
+    # regex line scan, silently changing semantics.)
+    if any_fst_attempted:
+        return "No results found."
 
     # --- Slow path: line-by-line scan ---
     flags = 0 if case_sensitive else re.IGNORECASE
@@ -1011,9 +1026,10 @@ def search_log(
 # ---------------------------------------------------------------------------
 
 
-def _search_via_fst(cfg: DomainConfig, query: str, max_results: int) -> list[dict] | None:
+def _search_via_fst(cfg: DomainConfig, query: str, max_results: int,
+                    any_word: bool = True) -> list[dict] | None:
     """Use the FST indexer for fast full-text search. Returns None if unavailable."""
-    return search_fst(cfg, query, max_results)
+    return search_fst(cfg, query, max_results, any_word=any_word)
 
 
 def _format_search_results(

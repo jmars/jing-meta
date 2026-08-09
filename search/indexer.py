@@ -122,6 +122,7 @@ def search_fst(
     query: str,
     max_results: int = 100,
     index_dir: Optional[str] = None,
+    any_word: bool = True,
 ) -> Optional[list[dict]]:
     """Search via the DAFSA index (in-process). Returns list of result dicts.
 
@@ -138,7 +139,7 @@ def search_fst(
 
     try:
         with dafsa_open(idx_dir) as idx:
-            hits = idx.search(query, any_word=True)
+            hits = idx.search(query, any_word=any_word)
             results = []
             for h in hits:
                 results.append({

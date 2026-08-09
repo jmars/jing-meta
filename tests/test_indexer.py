@@ -346,3 +346,30 @@ def test_update_index_skips_unsupported_extractor(tmp_path):
     assert ok is True
     assert "skipped" in msg
     assert "notification" in msg
+
+
+# --- 14. AND/OR search semantics -----------------------------------------------
+def test_search_and_or(tmp_path, corpus):
+    """FST search supports AND (any_word=False) and OR (any_word=True)."""
+    out = tmp_path / "out"
+    _build_index(corpus, out)
+
+    with open_index(out) as idx:
+        # OR: "alpha cherry" — a.txt has alpha, b.txt has cherry → both files
+        or_hits = idx.search("alpha cherry", any_word=True)
+        or_files = {idx.file_name(h.file_idx) for h in or_hits}
+        assert or_files == {"a.txt", "b.txt"}, f"OR should match both files, got {or_files}"
+
+        # AND: "alpha cherry" — no single file has both → empty
+        and_hits = idx.search("alpha cherry", any_word=False)
+        assert len(and_hits) == 0, f"AND should match no files, got {and_hits}"
+
+        # AND: "alpha banana" — only a.txt has both
+        and_hits2 = idx.search("alpha banana", any_word=False)
+        and_files2 = {idx.file_name(h.file_idx) for h in and_hits2}
+        assert and_files2 == {"a.txt"}, f"AND should match only a.txt, got {and_files2}"
+
+        # single-word search matches both files (defaults to AND, no difference for 1 word)
+        default_hits = idx.search("banana")
+        default_files = {idx.file_name(h.file_idx) for h in default_hits}
+        assert default_files == {"a.txt", "b.txt"}, f"single-word search should match both, got {default_files}"
