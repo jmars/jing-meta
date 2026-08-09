@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from memory import stats_server
 from jing_meta.schema import SCHEMA_DDL
+from memory import stats_server
 
 
 def _make_test_db(path: Path) -> None:
