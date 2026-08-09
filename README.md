@@ -16,6 +16,7 @@ judgment. No cloud, no external services.
 | `indexer` | DAFSA-based full-text indexer (Python frontend to the C DAFSA core) | `jing-indexer` |
 | `search` | Cross-domain search over indexes (config-driven) | `jing-search` |
 | `memory` | The SQLite memory graph + offline semantic lookup | `jing-memory` |
+| `archiver` | Moves old observations out of the live memory graph into searchable archives | `jing-archiver` |
 | `dreamer` | Knowledge-graph maintenance (Soufflé + semantic rerank + local validator) | `jing-dreamer` |
 | `jing_meta` | Shared core: config, storage paths, model registry, embed helper | `jing-meta` |
 
@@ -26,7 +27,7 @@ jing_meta/        shared config + embed + CLI
 indexer/          Python DAFSA frontend (ctypes) + build/search
   dafsa/          C DAFSA core (dafsa.c/h) + libdafsa.so
 search/           config-driven cross-domain search over indexes
-memory/           SQLite memory graph + semantic index
+memory/           SQLite memory graph + semantic index + archiver
 dreamer/         Soufflé ruleset + semantic rerank + local validator
 ```
 
@@ -53,6 +54,9 @@ jing-indexer query --index /tmp/idx --query "dafsa"
 
 # Garden the memory graph (offline; dry-run)
 jing-dreamer --memory-db ~/.jing/memory.db --souffle --validator local
+
+# Archive observations older than 90 days (dry-run; add --apply to move)
+jing-archiver --days 90
 
 # Verify all subsystems import
 jing-meta verify

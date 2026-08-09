@@ -28,6 +28,22 @@ at the bottom.
 | 18 PDWG checksum | ✅ Done | `aa4c3cf` |
 | 19 dreamer stages | ✅ Done | `9bdef50` |
 | 20 sidecar format | ✅ Done | `5f9b59e` |
+| 21 memory archiver | ✅ Done | (new — `memory/archiver.py` + `jing-archiver`) |
+
+## Memory archiver (roadmap #21)
+
+The memory archiver is now a first-class jing-meta component, not just the
+standalone Vibe-level script (`~/.local/bin/vibe-memory-archiver.py`). It lives at
+`memory/archiver.py` with a reusable `archive()` function and a `jing-archiver`
+console script (also dispatchable via `jing-meta archiver`).
+
+It moves observations older than `--days` (default 90) out of the live memory
+graph into JSONL archives under `jing_meta.config.archive_dir()` (default
+`~/.jing/archives/memory`), then rebuilds a DAFSA index over the archive
+in-process via `indexer.build()` — no external binary dependency. Safety
+guarantees preserved: archive-first-delete-second, observations-only (never
+entities/relations), dry-run by default (`--apply` to move), timestamped DB
+backup before deletion, reversible JSONL lines.
 
 ## Headline findings (read these first)
 

@@ -31,6 +31,7 @@ jing-indexer = "indexer.__main__:main"
 jing-search = "search.server:main"
 jing-memory = "memory.__main__:main"
 jing-dreamer = "dreamer.__main__:main"
+jing-archiver = "memory.archiver:main"
 jing-meta = "jing_meta.cli:main"
 
 [tool.hatch.build.targets.wheel]

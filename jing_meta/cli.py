@@ -13,7 +13,7 @@ def main() -> int:
     ))
     parser.add_argument(
         "command",
-        choices=["indexer", "search", "memory", "dreamer", "verify"],
+        choices=["indexer", "search", "memory", "dreamer", "archiver", "verify"],
         help="Subsystem to run (each also has its own CLI, e.g. jing-indexer)",
     )
     parser.add_argument("args", nargs=argparse.REMAINDER)
@@ -33,6 +33,9 @@ def main() -> int:
     elif args.command == "dreamer":
         from dreamer.__main__ import main as m
         return m(args.args)
+    elif args.command == "archiver":
+        from memory.archiver import main as m
+        return m(args.args)
     elif args.command == "verify":
         return _verify()
     else:
@@ -45,7 +48,7 @@ def _verify() -> int:
     import importlib
 
     ok = True
-    for mod in ["jing_meta.config", "indexer", "search", "memory", "dreamer"]:
+    for mod in ["jing_meta.config", "indexer", "search", "memory", "dreamer", "memory.archiver"]:
         try:
             importlib.import_module(mod)
             print(f"  ✓ {mod}")
