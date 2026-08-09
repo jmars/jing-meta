@@ -69,31 +69,31 @@ def build_index(cfg: DomainConfig, index_dir: Optional[str] = None) -> tuple[boo
 
     try:
         dafsa_build(cfg.dir.resolve(), fst_pattern, cfg.extractor, out_dir)
-        # For "dirs" domains the manifest filename is now "<dir>/<file>"; rewrite
-        # it to the parent directory name so the server can resolve
-        # {domain_dir}/{parent}/{message_file} when reading hits.
-        if cfg.type == "dirs":
-            _fix_dirs_manifest(out_dir)
         return True, f"Index built for '{cfg.name}' ({len(files)} files) at {out_dir}"
     except Exception as e:  # noqa: BLE001
         return False, f"Index build error for '{cfg.name}': {e}"
 
 
-def _fix_dirs_manifest(index_dir: Path) -> None:
-    """Rewrite a dirs-domain manifest so each filename is its parent directory name."""
-    manifest_path = Path(index_dir) / "manifest.json"
+def update_index(cfg: DomainConfig, index_dir: Optional[str] = None) -> tuple[bool, str]:
+    """Incrementally update a DAFSA index for a domain (in-process, Python)."""
+    from indexer import update as dafsa_update
+
+    out_dir = Path(index_dir).expanduser().resolve() if index_dir else cfg.effective_index_dir
+    # For "dirs" domains the content lives in per-dir files (e.g. messages.jsonl);
+    # fst_pattern overrides the dir-glob so we index those files.
+    fst_pattern = cfg.fst_pattern or cfg.pattern
+
     try:
-        data = json.loads(manifest_path.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, json.JSONDecodeError):
-        return
-    for fe in data.get("files", []):
-        parent = Path(str(fe.get("filename", ""))).parent.name
-        if parent and parent != ".":
-            fe["filename"] = parent
-    try:
-        manifest_path.write_text(json.dumps(data), encoding="utf-8")
-    except OSError:
-        pass
+        result = dafsa_update(cfg.dir.resolve(), fst_pattern, cfg.extractor, out_dir)
+        msg = (
+            f"Index updated for '{cfg.name}': "
+            f"unchanged={result['unchanged']}, updated={result['updated']}, "
+            f"added={result['added']}, removed={result['removed']} "
+            f"at {out_dir}"
+        )
+        return True, msg
+    except Exception as e:  # noqa: BLE001
+        return False, f"Index update error for '{cfg.name}': {e}"
 
 
 def search_fst(
@@ -136,4 +136,7 @@ def resolve_file_idx(index_dir: Path, file_idx: int) -> Optional[str]:
     files = _load_manifest(index_dir)
     if files is None or file_idx < 0 or file_idx >= len(files):
         return None
-    return files[file_idx].get("filename")
+    fe = files[file_idx]
+    if fe.get("tombstoned") or not fe.get("filename"):
+        return None
+    return fe["filename"]

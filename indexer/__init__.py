@@ -112,11 +112,12 @@ EXTRACTORS = {
 def collect_files(dir: Path, pattern: str) -> list[Path]:
     files: list[Path] = []
     for root, dirs, names in os.walk(dir):
-        # prune symlinked dirs
+        # prune symlinked dirs (os.walk yields root as str; wrap in Path)
+        root = Path(root)
         dirs[:] = [d for d in dirs if not (root / d).is_symlink()]
         for name in names:
             if glob.fnmatch.fnmatch(name, pattern):
-                files.append(Path(root) / name)
+                files.append(root / name)
     files.sort()
     return files
 
@@ -130,8 +131,103 @@ class FileEntry:
     title: str
     date: str
     source: str
+    mtime: int = 0
+    size: int = 0
+    tombstoned: bool = False
 
 
+# ---------------------------------------------------------------------------
+# Atomic I/O and sidecar helpers
+# ---------------------------------------------------------------------------
+def _atomic_write(path: Path, content: bytes) -> None:
+    """Write *content* to *path* atomically: tmp file + fsync + rename."""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp, "wb") as f:
+            f.write(content)
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_json(path: Path, data) -> None:
+    _atomic_write(path, json.dumps(data, indent=2).encode("utf-8"))
+
+
+def _composite_key(word: bytes, file_idx: int, entry_idx: int) -> bytes:
+    """{word}\0{file_idx:u32BE}{entry_idx:u32BE} — matches build's key bytes."""
+    return word + b"\0" + file_idx.to_bytes(4, "big") + entry_idx.to_bytes(4, "big")
+
+
+def _read_sidecar(slots_dir: Path, file_idx: int) -> list[tuple[int, bytes]]:
+    """Parse <slots>/<file_idx>.keys LE records: u32 entry_idx; u32 word_len; word.
+
+    Returns [] if the slot file is missing (tombstone). Tolerates/truncates a
+    partial trailing record by stopping cleanly.
+    """
+    path = slots_dir / f"{file_idx}.keys"
+    if not path.exists():
+        return []
+    data = path.read_bytes()
+    pairs: list[tuple[int, bytes]] = []
+    i = 0
+    n = len(data)
+    while i < n:
+        if i + 8 > n:  # not enough bytes for the header
+            break
+        entry_idx = int.from_bytes(data[i:i + 4], "little")
+        word_len = int.from_bytes(data[i + 4:i + 8], "little")
+        i += 8
+        if i + word_len > n:  # partial final record
+            break
+        pairs.append((entry_idx, data[i:i + word_len]))
+        i += word_len
+    return pairs
+
+
+def _write_sidecar(slots_dir: Path, file_idx: int, pairs: list[tuple[int, bytes]]) -> None:
+    """Serialize LE records (entry_idx; word_len; word) to <file_idx>.keys."""
+    slots_dir.mkdir(parents=True, exist_ok=True)
+    out = bytearray()
+    for entry_idx, word in pairs:
+        out += entry_idx.to_bytes(4, "little")
+        out += len(word).to_bytes(4, "little")
+        out += word
+    _atomic_write(slots_dir / f"{file_idx}.keys", bytes(out))
+
+
+def _dedup_pairs(extracted: list[str]) -> list[tuple[int, bytes]]:
+    """Flatten entries to deduped (entry_idx, word_bytes) pairs, in order."""
+    pairs: list[tuple[int, bytes]] = []
+    seen: set[tuple[int, bytes]] = set()
+    for entry_idx, text in enumerate(extracted):
+        for word in tokenize(text):
+            pair = (entry_idx, word.encode())
+            if pair not in seen:
+                seen.add(pair)
+                pairs.append(pair)
+    return pairs
+
+
+def _manifest_files(output: Path) -> list[dict]:
+    manifest_path = output / "manifest.json"
+    if not manifest_path.exists():
+        return []
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return data.get("files", [])
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
 def build(dir: Path, pattern: str, extractor: str, output: Path) -> None:
     """Build a DAFSA index over files in *dir* matching *pattern*."""
     fn = EXTRACTORS.get(extractor)
@@ -142,15 +238,22 @@ def build(dir: Path, pattern: str, extractor: str, output: Path) -> None:
     entries: list[FileEntry] = []
     keys: set[bytes] = set()
     total_entries = 0
+    file_pairs: list[list[tuple[int, bytes]]] = []
 
     for file_idx, filepath in enumerate(files):
-        meta, extracted = fn(filepath, filepath.name)
-        entries.append(FileEntry(*meta))
-        for entry_idx, text in enumerate(extracted):
-            total_entries += 1
-            for word in tokenize(text):
-                k = word.encode() + b"\0" + file_idx.to_bytes(4, "big") + entry_idx.to_bytes(4, "big")
-                keys.add(k)
+        stat = filepath.stat()
+        # Manifest filename = path relative to *dir* (matches update's match key
+        # and the search server's `cfg.dir / fname` resolution for nested files).
+        rel = str(filepath.relative_to(dir))
+        meta, extracted = fn(filepath, rel)
+        entries.append(
+            FileEntry(*meta, mtime=stat.st_mtime_ns, size=stat.st_size, tombstoned=False)
+        )
+        pairs = _dedup_pairs(extracted)
+        file_pairs.append(pairs)
+        total_entries += len(extracted)
+        for entry_idx, word in pairs:
+            keys.add(_composite_key(word, file_idx, entry_idx))
 
     # Build DAFSA in sorted key order (required for minimality).
     with Dafsa.create() as d:
@@ -161,11 +264,12 @@ def build(dir: Path, pattern: str, extractor: str, output: Path) -> None:
         fst_path = output / "index.fst"
         d.save(str(fst_path))
 
+    slots_dir = output / "slots"
+    for file_idx, pairs in enumerate(file_pairs):
+        _write_sidecar(slots_dir, file_idx, pairs)
+
     manifest_path = output / "manifest.json"
-    manifest_path.write_text(
-        json.dumps({"files": [asdict(e) for e in entries]}, indent=2),
-        encoding="utf-8",
-    )
+    _atomic_write_json(manifest_path, {"files": [asdict(e) for e in entries]})
 
     fs = fst_path.stat().st_size if fst_path.exists() else 0
     ms = manifest_path.stat().st_size if manifest_path.exists() else 0
@@ -174,6 +278,149 @@ def build(dir: Path, pattern: str, extractor: str, output: Path) -> None:
         f"{len(keys)} unique keys from {total_entries} entries across {len(files)} files",
         file=sys.stderr,
     )
+
+
+# ---------------------------------------------------------------------------
+# Incremental update
+# ---------------------------------------------------------------------------
+def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
+    """Incrementally update an existing index, or build it on first run.
+
+    Returns a summary dict with unchanged/updated/added/removed counts.
+    """
+    fn = EXTRACTORS.get(extractor)
+    if fn is None:
+        raise ValueError(f"unknown extractor {extractor!r}; choices: {list(EXTRACTORS)}")
+
+    output = Path(output)
+    fst_path = output / "index.fst"
+    manifest_path = output / "manifest.json"
+    slots_dir = output / "slots"
+
+    # First run — no index yet.
+    if not fst_path.exists():
+        build(dir, pattern, extractor, output)
+        return {
+            "command": "update",
+            "index_dir": str(output),
+            "unchanged": 0,
+            "updated": 0,
+            "added": 0,
+            "removed": 0,
+            "total_slots": len(_manifest_files(output)),
+            "first_run": True,
+        }
+
+    d = None
+    try:
+        d = Dafsa.load(str(fst_path), readonly=False)
+
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        files = data.get("files", [])
+        live = {
+            fe["filename"]: i
+            for i, fe in enumerate(files)
+            if not fe.get("tombstoned")
+        }
+
+        disk_files = collect_files(dir, pattern)
+        disk_rel = {str(filepath.relative_to(dir)) for filepath in disk_files}
+
+        unchanged = updated = added = removed = 0
+        pending_sidecars: dict[int, list[tuple[int, bytes]]] = {}
+        pending_tombstones: set[int] = set()
+
+        # Phase 1: accumulate changes (no writes yet).
+        for filepath in disk_files:
+            rel = str(filepath.relative_to(dir))
+            stat = filepath.stat()
+
+            if rel in live:
+                slot = live[rel]
+                prev = files[slot]
+                if prev.get("mtime") == stat.st_mtime_ns and prev.get("size") == stat.st_size:
+                    unchanged += 1
+                    continue
+                # CHANGED: drop old keys, extract and re-add.
+                for ei, w in _read_sidecar(slots_dir, slot):
+                    if not d.delete(_composite_key(w, slot, ei)):
+                        print(f"update: missing key for {rel} (orphan), healing", file=sys.stderr)
+                meta, extracted = fn(filepath, rel)
+                pairs = _dedup_pairs(extracted)
+                for ei, w in pairs:
+                    d.add(_composite_key(w, slot, ei))
+                files[slot] = {
+                    "filename": rel,
+                    "title": meta[1],
+                    "date": meta[2],
+                    "source": meta[3],
+                    "mtime": stat.st_mtime_ns,
+                    "size": stat.st_size,
+                    "tombstoned": False,
+                }
+                pending_sidecars[slot] = pairs
+                updated += 1
+            else:
+                # NEW: append at len(files) — stable file_idx, never renumber.
+                slot = len(files)
+                meta, extracted = fn(filepath, rel)
+                pairs = _dedup_pairs(extracted)
+                for ei, w in pairs:
+                    d.add(_composite_key(w, slot, ei))
+                files.append({
+                    "filename": rel,
+                    "title": meta[1],
+                    "date": meta[2],
+                    "source": meta[3],
+                    "mtime": stat.st_mtime_ns,
+                    "size": stat.st_size,
+                    "tombstoned": False,
+                })
+                pending_sidecars[slot] = pairs
+                added += 1
+
+        # Tombstone pass: live slots whose file is gone from disk.
+        for i, fe in enumerate(files):
+            if not fe.get("tombstoned") and fe["filename"] not in disk_rel:
+                for ei, w in _read_sidecar(slots_dir, i):
+                    if not d.delete(_composite_key(w, i, ei)):
+                        print(f"update: missing key for slot {i} (orphan), healing", file=sys.stderr)
+                files[i] = {
+                    "filename": "",
+                    "title": "",
+                    "date": "",
+                    "source": "",
+                    "mtime": 0,
+                    "size": 0,
+                    "tombstoned": True,
+                }
+                pending_tombstones.add(i)
+                removed += 1
+
+        # Phase 2: commit — DAFSA first, then sidecars, then manifest.
+        d.save(str(fst_path))
+        for slot, pairs in pending_sidecars.items():
+            _write_sidecar(slots_dir, slot, pairs)
+        for slot in pending_tombstones:
+            sp = slots_dir / f"{slot}.keys"
+            try:
+                sp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        _atomic_write_json(manifest_path, {"files": files})
+
+        return {
+            "command": "update",
+            "index_dir": str(output),
+            "unchanged": unchanged,
+            "updated": updated,
+            "added": added,
+            "removed": removed,
+            "total_slots": len(files),
+        }
+    finally:
+        if d is not None:
+            d.free()
 
 
 # ---------------------------------------------------------------------------

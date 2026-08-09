@@ -28,7 +28,7 @@ from mcp.server.fastmcp import FastMCP
 from .config import Config, DomainConfig, load_config
 from .renderers import render_list_entry, render_read_entry
 from .transcript import parse_transcript_file, read_transcript_text
-from .indexer import build_index, search_fst, resolve_file_idx, _iter_domain_files
+from .indexer import build_index, search_fst, resolve_file_idx, _iter_domain_files, update_index
 
 # ---------------------------------------------------------------------------
 # Config
@@ -1062,13 +1062,20 @@ def _format_search_results(
             except ValueError:
                 pass
 
-        # Resolve file path
+        # Resolve file path. `fname` is the manifest filename = path relative to
+        # the domain dir (e.g. "sess1/messages.jsonl" for sessions). For sessions
+        # we also derive the session-id (parent dir name) for cwd filtering and
+        # the MCP file_id returned to clients.
         if r_domain == "sessions":
-            sess_dir = d_cfg.dir / fname
+            sess_id = Path(fname).parent.name
+            if not sess_id:  # old basename-only index; needs rebuild
+                continue
+            sess_dir = d_cfg.dir / sess_id
             if cwd and not _session_matches_cwd(sess_dir, cwd):
                 continue
-            file_path = sess_dir / "messages.jsonl"
+            file_path = d_cfg.dir / fname
         else:
+            sess_id = None
             file_path = d_cfg.dir / fname
 
         if not file_path.exists():
@@ -1131,7 +1138,7 @@ def _format_search_results(
 
         all_matches.append(
             {
-                "file_id": fname,
+                "file_id": sess_id if r_domain == "sessions" else fname,
                 "source": r_domain,
                 "date": rdate_str,
                 "line": entry_idx if r_domain == "transcripts" else lineno,

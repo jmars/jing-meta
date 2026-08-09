@@ -5,11 +5,17 @@ import json
 import sys
 from pathlib import Path
 
-from . import build, open_index
+from . import build, update, open_index
 
 
 def _build(args) -> int:
     build(Path(args.dir), args.pattern, args.extractor, Path(args.output))
+    return 0
+
+
+def _update(args) -> int:
+    result = update(Path(args.dir), args.pattern, args.extractor, Path(args.index))
+    print(json.dumps(result, indent=2))
     return 0
 
 
@@ -39,6 +45,13 @@ def main(argv=None) -> int:
     b.add_argument("--extractor", choices=["jsonl", "txt", "transcript"], required=True)
     b.add_argument("--output", required=True)
     b.set_defaults(fn=_build)
+
+    u = sub.add_parser("update", help="incrementally update an index")
+    u.add_argument("--dir", required=True)
+    u.add_argument("--pattern", required=True)
+    u.add_argument("--extractor", choices=["jsonl", "txt", "transcript"], required=True)
+    u.add_argument("--index", required=True)
+    u.set_defaults(fn=_update)
 
     q = sub.add_parser("query", help="search an index")
     q.add_argument("--index", required=True)
