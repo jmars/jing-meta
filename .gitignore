@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# C DAFSA build artifact (build from indexer/dafsa/dafsa.c)
+indexer/dafsa/libdafsa.so
+
+# Data / state (never commit personal memory)
+*.db
+*.db-*
+*.npy
+.jing/

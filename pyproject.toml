@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jing-meta"
+version = "0.1.0"
+description = "Unified self-hosted knowledge system — DAFSA indexer, cross-domain search, memory graph, and auto-gardening, all offline."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Arch" }]
+license = { text = "MIT" }
+keywords = ["knowledge-graph", "dafsa", "search", "memory", "indexer"]
+dependencies = [
+    "numpy>=2.0",
+    "requests>=2.25,<3",
+    "mcp>=1.23,<2",
+    "fastembed>=0.8",
+    "onnxruntime>=1.28",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[project.scripts]
+jing-indexer = "indexer.__main__:main"
+jing-search = "search.server:main"
+jing-memory = "memory.__main__:main"
+jing-dreamer = "dreamer.__main__:main"
+jing-meta = "jing_meta.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["jing_meta", "indexer", "search", "memory", "dreamer"]
+
+[tool.uv]
+package = true

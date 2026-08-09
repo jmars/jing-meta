@@ -1,0 +1,155 @@
+"""Semantic lookup layer for the memory graph.
+
+Complements the lexical `search_nodes` / trigram `search_similar` with
+offline, embedding-based semantic retrieval.
+
+Design goals:
+- **Offline & private**: embeddings via fastembed + onnxruntime (bge-small),
+  no network.
+- **Fast query path**: entity vectors are precomputed and cached to a file
+  (`<db_dir>/entity_vectors.npy` + `entity_names.txt`). At query time we embed
+  only the *query* (one pass) and cosine-compare against the cached index. The
+  embedding model is loaded lazily and only if needed.
+- **Additive signal**: semantic results are returned as a *supplement* to
+  lexical results, never a replacement — exact matches stay first.
+"""
+
+import json
+import os
+import re
+import threading
+from pathlib import Path
+
+import numpy as np
+
+EMBED_MODEL = os.environ.get("SEMANTIC_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+_SIM_THRESHOLD = float(os.environ.get("SEMANTIC_LOOKUP_THRESHOLD", "0.50"))
+_TOP_N = int(os.environ.get("SEMANTIC_LOOKUP_TOP", "10"))
+
+_embedder = None
+_embed_lock = threading.Lock()
+
+
+def _get_embedder():
+    """Lazily init the ONNX embedder (model downloaded once, then local)."""
+    global _embedder
+    if _embedder is None:
+        from fastembed import TextEmbedding
+
+        _embedder = TextEmbedding(model_name=EMBED_MODEL)
+    return _embedder
+
+
+def _entity_text(e: dict) -> str:
+    """Text to embed for an entity: name + top observations."""
+    obs = e.get("observations", []) or []
+    return e.get("name", "") + ". " + " ".join(str(o) for o in obs[:4])
+
+
+# ---------------------------------------------------------------------------
+# Index build / cache
+# ---------------------------------------------------------------------------
+
+
+def _index_paths(db_path: str) -> tuple[Path, Path]:
+    db = Path(db_path)
+    return (
+        db.parent / f"{db.stem}.entity_vectors.npy",
+        db.parent / f"{db.stem}.entity_names.json",
+    )
+
+
+def build_index(conn, db_path: str) -> tuple[Path, Path]:
+    """Embed all entities and cache the vector index to disk.
+
+    Returns (vectors_path, names_path). Call this from a maintenance step
+    (e.g. after gardening), NOT on the hot query path.
+    """
+    rows = conn.execute("SELECT name, entity_type FROM entities").fetchall()
+    entities = [
+        {"name": r["name"], "entityType": r["entity_type"], "observations": []}
+        for r in rows
+    ]
+    # Attach observations for richer embeddings
+    for e in entities:
+        obs = conn.execute(
+            "SELECT content FROM observations WHERE entity_id = "
+            "(SELECT id FROM entities WHERE name = ?) LIMIT 4",
+            (e["name"],),
+        ).fetchall()
+        e["observations"] = [o["content"] for o in obs]
+
+    vecs = np.array(
+        [np.array(v, dtype="float32") for v in _get_embedder().embed(
+            [_entity_text(e) for e in entities], batch_size=64
+        )],
+        dtype="float32",
+    )
+    vpath, npath = _index_paths(db_path)
+    np.save(vpath, vecs)
+    npath.write_text(
+        json.dumps([e["name"] for e in entities], ensure_ascii=False), encoding="utf-8"
+    )
+    return vpath, npath
+
+
+def _load_index(db_path: str) -> tuple[np.ndarray, list[str]] | None:
+    vpath, npath = _index_paths(db_path)
+    if not vpath.exists() or not npath.exists():
+        return None
+    vecs = np.load(vpath)
+    names = json.loads(npath.read_text(encoding="utf-8"))
+    return vecs, names
+
+
+# ---------------------------------------------------------------------------
+# Query-time semantic search
+# ---------------------------------------------------------------------------
+
+
+def semantic_search(query: str, db_path: str, top_n: int = _TOP_N) -> list[dict]:
+    """Return semantic neighbors of *query* among cached entity vectors.
+
+    Returns [{name, entityType?, similarity}] ranked desc, filtered by
+    threshold. Returns [] if no index built or embedder unavailable.
+    """
+    cached = _load_index(db_path)
+    if cached is None:
+        return []
+    vecs, names = cached
+
+    try:
+        qvec = np.array(
+            next(_get_embedder().embed([query])), dtype="float32"
+        )
+    except Exception:
+        return []
+
+    # cosine similarity against all cached vectors (normalized dot product)
+    qnorm = np.linalg.norm(qvec)
+    if qnorm == 0:
+        return []
+    qvec = qvec / qnorm
+    vnorms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    vnorms[vnorms == 0] = 1
+    normed = vecs / vnorms
+    sims = normed @ qvec
+
+    idx = np.argsort(-sims)[:top_n]
+    results = []
+    for i in idx:
+        s = float(sims[i])
+        if s < _SIM_THRESHOLD:
+            continue
+        results.append({"name": names[i], "similarity": round(s, 3)})
+    return results
+
+
+def index_age(db_path: str) -> int:
+    """Seconds since the vector index was built (or -1 if missing)."""
+    import time
+
+    vpath, _ = _index_paths(db_path)
+    if not vpath.exists():
+        return -1
+    return int(time.time() - vpath.stat().st_mtime)

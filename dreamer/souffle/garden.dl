@@ -1,0 +1,78 @@
+// Memory Graph Gardener — deterministic tiers as Datalog (Soufflé).
+// Replaces the ~80% deterministic maintenance work of the LLM gardener with
+// exact, provable, compiled Datalog rules. The LLM keeps only the fuzzy ~20%:
+// validating candidate relations, deciding semantic merges, naming relations.
+//
+// All fact files are tab-delimited (Soufflé default); no header rows.
+
+// ---------------------------------------------------------------------------
+// Facts (exported from memory.db by souffle_pipeline.export_facts)
+// ---------------------------------------------------------------------------
+.decl entity(id: number, name: symbol, type: symbol)
+.input entity(filename="entity.csv", delimiter="\t")
+
+.decl obs(eid: number, content: symbol)
+.input obs(filename="obs.csv", delimiter="\t")
+
+.decl relation(fid: number, tid: number, type: symbol)
+.input relation(filename="relation.csv", delimiter="\t")
+
+.decl token(eid: number, tok: symbol)
+.input token(filename="token.csv", delimiter="\t")
+
+// ---------------------------------------------------------------------------
+// 1. CONSOLIDATE TYPES  — map one-off labels onto canonical types.
+//    Exact, table-driven. The mapping can grow over time or come from config.
+// ---------------------------------------------------------------------------
+.decl canonical_type(from: symbol, to: symbol)
+.input canonical_type(filename="canonical_type.csv", delimiter="\t")
+
+.decl type_rename(eid: number, from: symbol, to: symbol)
+type_rename(e, from, to) :-
+    entity(e, _, from),
+    canonical_type(from, to),
+    from != to.
+
+// Type frequency distribution — which one-off labels exist and how often, so a
+// downstream LLM step (or a human) can decide canonical mappings.
+.decl type_freq(type: symbol, cnt: number)
+type_freq(t, c) :-
+    entity(_, _, t),
+    c = count : { entity(_, _, t) }.
+
+// ---------------------------------------------------------------------------
+// 2. CANDIDATE RELATIONS  — token-overlap join.
+//    Two entities sharing >= 2 significant tokens are candidates (ranked later
+//    by shared-token count, descending). Exact join.
+// ---------------------------------------------------------------------------
+.decl token_pair(a: number, b: number, tok: symbol)
+token_pair(a, b, t) :-
+    token(a, t), token(b, t), a < b.
+
+.decl candidate_relation(a: number, b: number, shared: number)
+candidate_relation(a, b, c) :-
+    token_pair(a, b, _),
+    c = count : { token_pair(a, b, _) },
+    c >= 2,
+    !relation(a, b, _),
+    !relation(b, a, _).
+
+// ---------------------------------------------------------------------------
+// 3. DETECT DUPLICATES  — normalized-name collision.
+//    norm_name(eid, norm) is precomputed in the export (Soufflé lacks
+//    to_lowercase/replace_all). Grouping by norm is done exactly in Datalog.
+// ---------------------------------------------------------------------------
+.decl norm_name(eid: number, norm: symbol)
+.input norm_name(filename="norm_name.csv", delimiter="\t")
+
+.decl duplicate_pair(a: number, b: number)
+duplicate_pair(a, b) :-
+    norm_name(a, n), norm_name(b, n), a < b.
+
+// ---------------------------------------------------------------------------
+// Outputs
+// ---------------------------------------------------------------------------
+.output type_rename
+.output type_freq
+.output candidate_relation
+.output duplicate_pair
