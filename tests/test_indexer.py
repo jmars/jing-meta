@@ -19,8 +19,14 @@ try:
 except (RuntimeError, AttributeError, OSError) as e:
     pytest.skip(f"libdafsa.so not available: {e}", allow_module_level=True)
 
-from indexer import build, update, open_index
-from indexer import SidecarCorruptError, _read_sidecar, _write_sidecar
+from indexer import (
+    SidecarCorruptError,
+    _read_sidecar,
+    _write_sidecar,
+    build,
+    open_index,
+    update,
+)
 
 
 def _write_txt(directory: Path, name: str, content: str) -> Path:
@@ -189,7 +195,7 @@ def test_tombstone_stability(tmp_path, corpus):
     update(corpus, "*.txt", "txt", out)
 
     _write_txt(corpus, "a.txt", "alpha again")
-    result = update(corpus, "*.txt", "txt", out)
+    update(corpus, "*.txt", "txt", out)
 
     # re-added file goes to a NEW slot; old slot stays tombstoned
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
@@ -370,8 +376,8 @@ def test_resolve_file_idx_tombstone(tmp_path):
 # --- 13. graceful skip for non-DAFSA extractors --------------------------------
 def test_build_index_skips_unsupported_extractor(tmp_path):
     """build_index gracefully skips domains whose extractor is not in indexer.EXTRACTORS."""
-    from search.indexer import build_index
     from search.config import DomainConfig
+    from search.indexer import build_index
 
     data_dir = tmp_path / "data"
     data_dir.mkdir()
@@ -386,8 +392,8 @@ def test_build_index_skips_unsupported_extractor(tmp_path):
 
 def test_update_index_skips_unsupported_extractor(tmp_path):
     """update_index gracefully skips domains whose extractor is not in indexer.EXTRACTORS."""
-    from search.indexer import update_index
     from search.config import DomainConfig
+    from search.indexer import update_index
 
     data_dir = tmp_path / "data"
     data_dir.mkdir()

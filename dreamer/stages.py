@@ -8,7 +8,6 @@ uses to keep its no-disk contract.
 
 from __future__ import annotations
 
-import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,11 +21,8 @@ from .contracts import (
     MutationPlan,
     RankedCandidate,
     RunContext,
-    RunManifest,
     Stage,
     StageResult,
-    ValidatedRelation,
-    to_jsonable,
 )
 
 logger = get_logger(__name__)
@@ -69,13 +65,14 @@ def discover(ctx: RunContext, prior: StageResult | None = None) -> StageResult:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     if ctx.mode == Mode.SOUFFLE:
+        import tempfile
+
         from .souffle_pipeline import (
             build_shortlist,
             export_facts,
             parse_results,
             run_souffle,
         )
-        import tempfile
 
         id2name = {i: e["name"] for i, e in enumerate(graph["entities"])}
 
@@ -224,7 +221,7 @@ def rank(ctx: RunContext, prior: StageResult | None = None) -> StageResult:
     else:  # Mode.LLM — passthrough
         chunks = discover_payload.get("chunks", [])
         all_ranked: list[RankedCandidate] = []
-        for i, chunk in enumerate(chunks):
+        for chunk in chunks:
             for c in chunk.get("candidates", []):
                 all_ranked.append(RankedCandidate(
                     from_=c.from_,
@@ -268,6 +265,8 @@ def validate(ctx: RunContext, prior: StageResult | None = None) -> StageResult |
     if ctx.mode == Mode.LLM:
         from .dreamer import (
             _chunk_graph as chunk_graph,
+        )
+        from .dreamer import (
             build_prompt,
             call_llm,
             load_graph_sqlite,
@@ -340,8 +339,8 @@ def validate(ctx: RunContext, prior: StageResult | None = None) -> StageResult |
         ))
 
     else:  # Mode.SOUFFLE
-        from .dreamer import build_validation_prompt, load_graph_sqlite
         from . import llm
+        from .dreamer import build_validation_prompt, load_graph_sqlite
 
         graph = load_graph_sqlite(ctx.snapshot_db)
         ranked = prior.payload.get("candidates", [])

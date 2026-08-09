@@ -16,7 +16,6 @@ Design goals:
 
 import json
 import os
-import re
 from pathlib import Path
 
 import numpy as np

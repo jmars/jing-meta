@@ -9,8 +9,9 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from .config import DomainConfig
 from indexer import EXTRACTORS as DAFSA_EXTRACTORS
+
+from .config import DomainConfig
 
 
 def _iter_domain_files(cfg: DomainConfig) -> list[Path]:

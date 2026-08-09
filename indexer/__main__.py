@@ -7,7 +7,7 @@ from pathlib import Path
 
 from jing_meta.log import setup_logging
 
-from . import build, update, open_index
+from . import build, open_index, update
 
 
 def _build(args) -> int:

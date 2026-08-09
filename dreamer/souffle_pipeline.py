@@ -14,7 +14,6 @@ related and what to name them — is sent to the LLM, on a capped, ranked shortl
 
 import os
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -267,7 +266,6 @@ def run_pipeline(
 
     # --- Phase 1: What was "discover" in the original ---
     id2name = {i: e["name"] for i, e in enumerate(graph["entities"])}
-    import tempfile
     with tempfile.TemporaryDirectory(prefix="souffle-garden-") as td:
         base = Path(td)
         facts = base / "facts"

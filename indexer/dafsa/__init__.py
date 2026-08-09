@@ -21,7 +21,6 @@ or:
 
 import ctypes
 import ctypes.util
-import sys
 import threading
 from pathlib import Path
 

@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from memory import archiver
 from jing_meta.schema import SCHEMA_DDL
+from memory import archiver
 
 
 def _make_test_db(path: Path, n_old: int = 5, n_new: int = 3) -> None:
@@ -84,7 +84,7 @@ class TestArchive:
         archiver.archive(memory_db=db, archive_dir=arc, days=90, apply=True)
         files = list(arc.glob("archive-*.jsonl"))
         assert len(files) == 1
-        lines = [json.loads(l) for l in files[0].read_text().splitlines() if l.strip()]
+        lines = [json.loads(line) for line in files[0].read_text().splitlines() if line.strip()]
         assert len(lines) == 5
         assert all("content" in o and "entity" in o and "created_at" in o for o in lines)
 

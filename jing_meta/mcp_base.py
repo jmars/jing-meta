@@ -22,7 +22,6 @@ will need per-thread isolation or explicit locking.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Callable, TypeVar
 
 from mcp.server.fastmcp import FastMCP
@@ -58,7 +57,7 @@ def lazy_singleton(factory: Callable[[], T]) -> Callable[[], T]:
     return get
 
 
-from .fsutil import _atomic_write, _atomic_write_json  # noqa: F401 — re-export
+from .fsutil import _atomic_write, _atomic_write_json  # noqa: E402, F401 — re-export
 
 
 def text_block(text: str) -> TextContent:

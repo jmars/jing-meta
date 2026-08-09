@@ -32,9 +32,15 @@ from pathlib import Path
 from jing_meta.mcp_base import JINGMCP, lazy_singleton
 
 from .config import DomainConfig, load_config
+from .indexer import (
+    _iter_domain_files,
+    build_index,
+    resolve_file_idx,
+    search_fst,
+    update_index,
+)
 from .renderers import render_list_entry, render_read_entry
 from .transcript import parse_transcript_file, read_transcript_text
-from .indexer import build_index, search_fst, resolve_file_idx, _iter_domain_files, update_index
 
 # ---------------------------------------------------------------------------
 # Config
@@ -675,8 +681,8 @@ def search(
                                 "date": fd.isoformat() if fd else "?",
                                 "line": line_no,
                                 "match": display,
-                                "context_before": [l[:300] for l in ctx_before],
-                                "context_after": [l[:300] for l in ctx_after],
+                                "context_before": [line[:300] for line in ctx_before],
+                                "context_after": [line[:300] for line in ctx_after],
                             }
                         )
                 finally:
@@ -1217,8 +1223,8 @@ def _format_search_results(
                 "date": rdate_str,
                 "line": entry_idx if r_domain == "transcripts" else lineno,
                 "match": display,
-                "context_before": [l[:300] for l in ctx_before],
-                "context_after": [l[:300] for l in ctx_after],
+                "context_before": [line[:300] for line in ctx_before],
+                "context_after": [line[:300] for line in ctx_after],
             }
         )
 

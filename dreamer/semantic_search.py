@@ -28,7 +28,7 @@ def embed_entities(graph: dict) -> list[tuple[dict, list[float]]]:
     texts = [_embed._entity_text(e) for e in entities]
     emb = _embed._get_embedder()
     vecs = list(emb.embed(texts, batch_size=64))
-    return list(zip(entities, vecs))
+    return list(zip(entities, vecs, strict=True))
 
 
 def semantic_candidates(graph: dict) -> list[dict]:

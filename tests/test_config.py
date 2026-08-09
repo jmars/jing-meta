@@ -4,7 +4,6 @@ import pytest
 
 from search.config import Config, ConfigError, DomainConfig, load_config
 
-
 # --- DomainConfig direct construction ---
 
 def test_valid_defaults_pass():

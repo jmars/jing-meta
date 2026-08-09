@@ -11,17 +11,21 @@ Mutations are additive only:
   - New entities/relations are additive
 """
 
-import json
 import os
-import shutil
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from jing_meta.log import get_logger
-from jing_meta.schema import SCHEMA_DDL  # noqa: F401 -- documents the shared schema contract
+from jing_meta.schema import (
+    SCHEMA_DDL,  # noqa: F401 -- documents the shared schema contract
+)
 from jing_meta.text import STOPWORDS
 
 from . import llm
+
+if TYPE_CHECKING:
+    from .runstore import RunStore
 
 logger = get_logger(__name__)
 
@@ -764,8 +768,7 @@ def _run_stages(
 
 
 # Add STAGE_ORDER import at module level used by _run_stages
-from .contracts import Stage, STAGE_ORDER, StageResult  # noqa: E402
-
+from .contracts import STAGE_ORDER, Stage, StageResult  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Soufflé mode — deterministic Datalog tiers + LLM validation
@@ -798,7 +801,8 @@ def run_souffle_mode(
     """
     from .contracts import Mode, Stage
     from .runstore import RunStore
-    from .stages import apply as apply_stage, discover, rank, validate
+    from .stages import apply as apply_stage
+    from .stages import discover, rank, validate
 
     try:
         from .souffle_pipeline import SouffleError
@@ -849,7 +853,8 @@ def run_souffle_mode(
         ctx.validator = validator
     else:
         # In-memory-only (original behavior) — no persistence
-        from datetime import timezone as _tz, datetime as _dt
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
         rid = _dt.now(_tz.utc).strftime("%Y%m%dT%H%M%SZ")
         from .contracts import RunContext as RC
         ctx = RC(
@@ -905,7 +910,8 @@ def run(
     """
     from .contracts import Mode, Stage
     from .runstore import RunStore
-    from .stages import apply as apply_stage, discover, rank, validate
+    from .stages import apply as apply_stage
+    from .stages import discover, rank, validate
 
     # --- Resolve from_stage ---
     from_stage_enum: Stage | None = None
@@ -946,7 +952,8 @@ def run(
         ctx.model = model
     else:
         # In-memory-only (original behavior) — no persistence
-        from datetime import timezone as _tz, datetime as _dt
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
         rid = _dt.now(_tz.utc).strftime("%Y%m%dT%H%M%SZ")
         from .contracts import RunContext as RC
         ctx = RC(
@@ -991,11 +998,12 @@ def replay_run(
     manifest's ``source_db`` is used. A custom *store* may be injected (e.g. for
     tests pointing at a temp run dir); it defaults to the config-run store.
     """
-    from .contracts import Mode, Stage
-    from .runstore import RunStore
-    from .stages import apply as apply_stage, discover, rank, validate
-
     from jing_meta import config as _config
+
+    from .contracts import Stage
+    from .runstore import RunStore
+    from .stages import apply as apply_stage
+    from .stages import discover, rank, validate
 
     if store is None:
         store = RunStore(_config.memory_dir() / "dreamer")
@@ -1032,13 +1040,6 @@ def replay_run(
     ctx.apply = apply
 
     print(f"Replaying run {run_id} from stage {from_stage_enum.value}...")
-
-    stage_fns = {
-        Stage.DISCOVER: discover,
-        Stage.RANK: rank,
-        Stage.VALIDATE: validate,
-        Stage.APPLY: apply_stage,
-    }
 
     try:
         return _run_stages(ctx, from_stage_enum,

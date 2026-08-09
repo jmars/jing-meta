@@ -11,6 +11,7 @@ from __future__ import annotations
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from jing_meta.fsutil import _atomic_write_json
 from jing_meta.log import get_logger
@@ -22,7 +23,6 @@ from .contracts import (
     Stage,
     StageResult,
     stage_filename,
-    stages_after,
 )
 
 logger = get_logger(__name__)

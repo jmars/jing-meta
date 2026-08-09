@@ -15,9 +15,8 @@ import json
 import os
 import re
 import zlib
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
 
 from jing_meta.log import get_logger
 from jing_meta.mcp_base import _atomic_write, _atomic_write_json
@@ -85,7 +84,7 @@ def extract_txt(path: Path, filename: str):
     except (UnicodeDecodeError, OSError):
         logger.warning("Skipping non-UTF-8 file %s: decode error", path)
         return (filename, filename, date, "txt"), []
-    return (filename, filename, date, "txt"), [l for l in content.splitlines() if l.strip()]
+    return (filename, filename, date, "txt"), [line for line in content.splitlines() if line.strip()]
 
 
 def extract_transcript(path: Path, filename: str):

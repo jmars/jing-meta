@@ -4,7 +4,6 @@ The indexer/dreamer/memory all use this so the ONNX model is loaded once and
 memory stays bounded (call `free()` to release before loading a local LLM).
 """
 
-import os
 import threading
 
 import numpy as np

@@ -5,34 +5,21 @@ replay, and backward compatibility seams.
 """
 
 import json
-import os
 import sqlite3
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from dreamer.dreamer import (
-    _cap_graph,
-    _chunk_graph,
     apply_mutations,
-    call_llm,
     load_graph_sqlite,
     replay_run,
     run,
     run_souffle_mode,
-    save_graph_sqlite,
-    suggest_relations,
-    validate_plan,
 )
 from dreamer.souffle_pipeline import (
-    build_shortlist,
-    export_facts,
-    parse_results,
     run_pipeline,
-    run_souffle,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -207,8 +194,8 @@ class TestRunStore:
     """RunStore lifecycle: create, write stages, load, list."""
 
     def test_new_run_id_collision_suffix(self, tmp_path, monkeypatch):
-        from dreamer.runstore import RunStore
         from dreamer.contracts import Mode
+        from dreamer.runstore import RunStore
 
         store = RunStore(tmp_path)
         db_path = _tmp_db(tmp_path, "collision.db")
@@ -224,8 +211,8 @@ class TestRunStore:
         assert rid2.endswith("-3")  # -2 existed, so -3
 
     def test_create_run_snapshots_db(self, tmp_path):
-        from dreamer.runstore import RunStore
         from dreamer.contracts import Mode
+        from dreamer.runstore import RunStore
 
         db_path = _tmp_db(tmp_path, "source.db")
         store = RunStore(tmp_path / "dreamer")
@@ -238,8 +225,8 @@ class TestRunStore:
         assert snapshot.read_bytes() == db_path.read_bytes()
 
     def test_write_stage_atomic_cleans_tmp(self, tmp_path):
-        from dreamer.runstore import RunStore
         from dreamer.contracts import Mode, Stage, StageResult
+        from dreamer.runstore import RunStore
 
         db_path = _tmp_db(tmp_path, "source.db")
         store = RunStore(tmp_path / "dreamer")
@@ -264,8 +251,8 @@ class TestRunStore:
         assert len(tmps) == 0
 
     def test_write_stage_updates_manifest(self, tmp_path):
-        from dreamer.runstore import RunStore
         from dreamer.contracts import Mode, Stage, StageResult
+        from dreamer.runstore import RunStore
 
         db_path = _tmp_db(tmp_path, "source.db")
         store = RunStore(tmp_path / "dreamer")
@@ -283,8 +270,8 @@ class TestRunStore:
         assert Stage.DISCOVER in manifest.completed
 
     def test_load_run_returns_all_stages(self, tmp_path):
-        from dreamer.runstore import RunStore
         from dreamer.contracts import Mode, Stage, StageResult
+        from dreamer.runstore import RunStore
 
         db_path = _tmp_db(tmp_path, "source.db")
         store = RunStore(tmp_path / "dreamer")
@@ -303,14 +290,14 @@ class TestRunStore:
         assert Stage.APPLY not in stages
 
     def test_list_runs_sorted_desc(self, tmp_path):
-        from dreamer.runstore import RunStore
         from dreamer.contracts import Mode
+        from dreamer.runstore import RunStore
 
         db_path = _tmp_db(tmp_path, "source.db")
         store = RunStore(tmp_path / "dreamer")
 
-        r1 = store.create_run("run-a", Mode.LLM, db_path)
-        r2 = store.create_run("run-b", Mode.LLM, db_path)
+        store.create_run("run-a", Mode.LLM, db_path)
+        store.create_run("run-b", Mode.LLM, db_path)
 
         runs = store.list_runs()
         assert runs == ["run-b", "run-a"]
@@ -495,7 +482,13 @@ class TestValidateStage:
     """Validate stage: Soufflé validator dispatch, LLM per-chunk merge."""
 
     def test_souffle_callable_seam_assembles_plan(self, tmp_path, monkeypatch):
-        from dreamer.contracts import Mode, RankedCandidate, RunContext, Stage, StageResult
+        from dreamer.contracts import (
+            Mode,
+            RankedCandidate,
+            RunContext,
+            Stage,
+            StageResult,
+        )
         from dreamer.stages import validate
 
         db_path = _tmp_db(tmp_path, "source.db")
@@ -531,7 +524,12 @@ class TestValidateStage:
 
     def test_validate_plan_warnings_logged_not_fatal(self, tmp_path, monkeypatch):
         """Warnings from validate_plan should be logged but not crash."""
-        from dreamer.contracts import Mode, RankedCandidate, RunContext, Stage, StageResult
+        from dreamer.contracts import (
+            Mode,
+            RunContext,
+            Stage,
+            StageResult,
+        )
         from dreamer.stages import validate
 
         db_path = _tmp_db(tmp_path, "source.db")
@@ -712,7 +710,7 @@ class TestReplay:
 
     def test_from_validate_reproduces_plan_with_stubbed_llm(self, tmp_path, monkeypatch):
         """Replaying from validate with a stubbed LLM should reproduce the plan."""
-        from dreamer.contracts import Mode, Stage
+        from dreamer.contracts import Mode
         from dreamer.runstore import RunStore
 
         db_path = _tmp_db(tmp_path, "source.db")
@@ -720,7 +718,6 @@ class TestReplay:
         rid = store.new_run_id()
         ctx = store.create_run(rid, Mode.SOUFFLE, db_path)
 
-        from dreamer.contracts import StageResult
         from dreamer.stages import discover, rank
 
         # Manually create discover and rank stages
@@ -767,7 +764,6 @@ class TestReplay:
         ctx = store.create_run(rid, Mode.LLM, db_path)
 
         from dreamer.contracts import MutationPlan, Stage, StageResult
-        from dreamer.stages import discover as discover_fn, rank as rank_fn, validate as validate_fn, apply as apply_fn
 
         # Write dummy discover/rank/validate
         for stage, payload in [

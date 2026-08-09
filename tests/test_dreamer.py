@@ -4,7 +4,6 @@ from pathlib import Path
 from dreamer.dreamer import load_graph_sqlite, save_graph_sqlite
 from jing_meta.text import STOPWORDS
 
-
 # ---------------------------------------------------------------------------
 # Item #4: shared stopwords
 # ---------------------------------------------------------------------------
@@ -48,7 +47,8 @@ class TestSqliteRoundTrip:
         conn.execute("INSERT INTO observations VALUES (2,1,'Alpha obs 2','2025-01-02')")
         conn.execute("INSERT INTO observations VALUES (3,2,'Beta obs','2025-01-01')")
         conn.execute("INSERT INTO relations VALUES (1,'Alpha','Beta','implements','2025-01-05')")
-        conn.commit(); conn.close()
+        conn.commit()
+        conn.close()
         return {
             "entities": [
                 {"name": "Gamma", "entityType": "plan", "observations": []},
@@ -84,7 +84,8 @@ class TestSqliteRoundTrip:
                 from_entity TEXT, to_entity TEXT, relation_type TEXT, created_at TEXT);
         """)
         conn.execute("INSERT INTO entities VALUES (1,'Solo','note','2025-01-01','2025-01-01')")
-        conn.commit(); conn.close()
+        conn.commit()
+        conn.close()
         result = load_graph_sqlite(db)
         assert len(result["entities"]) == 1
         assert result["entities"][0]["name"] == "Solo"
@@ -192,8 +193,8 @@ class TestLocalValidatorBatching:
         assert {r["relationType"] for r in result} == {"references", "uses"}
 
     def test_never_fabricates_relation(self):
-        from dreamer.local_validator import validate_and_name
         import dreamer.local_validator as lv
+        from dreamer.local_validator import validate_and_name
         candidates = [{"from": "other", "to": "plan_alpha", "similarity": 0.6}]
         def stub_llm(prompt):
             return {"add_relations": []}
@@ -208,8 +209,8 @@ class TestLocalValidatorBatching:
             lv._local_llm_relation = original
 
     def test_llm_failure_falls_back_to_single_pair(self):
-        from dreamer.local_validator import validate_and_name
         import dreamer.local_validator as lv
+        from dreamer.local_validator import validate_and_name
         candidates = [{"from": "other", "to": "plan_alpha", "similarity": 0.8}]
         def stub_llm(prompt):
             return None

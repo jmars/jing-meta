@@ -227,7 +227,7 @@ def call(
 
             return result, metadata
 
-        except (json.JSONDecodeError,) as e:
+        except json.JSONDecodeError as e:
             # Parse failure — retry with a repair instruction
             safe = _redact(str(e), [api_key, f"Bearer {api_key}", api_url])
             logger.warning("LLM returned malformed JSON (attempt %d): %s", attempt + 1, safe)

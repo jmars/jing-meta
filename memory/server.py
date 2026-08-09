@@ -20,8 +20,8 @@ from pathlib import Path
 
 from mcp.types import TextContent
 
-from jing_meta.mcp_base import JINGMCP
 from jing_meta import config as _jing_config
+from jing_meta.mcp_base import JINGMCP
 from jing_meta.schema import SCHEMA_DDL
 
 # ---------------------------------------------------------------------------
@@ -521,7 +521,7 @@ def search_nodes(
     result_entities = []
     result_relations = []
     names_list = []
-    for score, name, etype, eid, obs_list in scored_entities:
+    for _score, name, etype, _eid, obs_list in scored_entities:
         result_entities.append({
             "name": name,
             "entityType": etype,

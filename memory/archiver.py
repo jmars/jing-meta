@@ -268,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        result = archive(
+        archive(
             memory_db=args.memory_db,
             archive_dir=args.archive_dir,
             days=args.days,
