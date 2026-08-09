@@ -25,11 +25,9 @@ import signal
 from datetime import date, datetime
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
+from jing_meta.mcp_base import JINGMCP, lazy_singleton
 
-from jing_meta.log import setup_logging
-
-from .config import Config, DomainConfig, load_config
+from .config import DomainConfig, load_config
 from .renderers import render_list_entry, render_read_entry
 from .transcript import parse_transcript_file, read_transcript_text
 from .indexer import build_index, search_fst, resolve_file_idx, _iter_domain_files, update_index
@@ -47,22 +45,14 @@ def _regex_alarm_handler(_signum, _frame):
 _SLOW_SCAN_TIMEOUT = int(os.environ.get("SEARCH_REGEX_TIMEOUT", "5"))
 
 
-_config: Config | None = None
-
-
-def _get_config() -> Config:
-    """Lazy-load config once."""
-    global _config
-    if _config is None:
-        _config = load_config()
-    return _config
+_get_config = lazy_singleton(load_config)
 
 
 # ---------------------------------------------------------------------------
 # MCP server
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP(
+mcp = JINGMCP(
     "unified-history",
     instructions="Search and read agent sessions, meeting transcripts, and notification logs",
 )
@@ -1374,8 +1364,7 @@ def _format_transcript_summary(s: dict, name: str) -> str:
 
 def main() -> None:
     """Start the MCP server with stdio transport."""
-    setup_logging()
-    mcp.run(transport="stdio")
+    mcp.run_stdio()
 
 
 if __name__ == "__main__":

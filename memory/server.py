@@ -13,11 +13,10 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent
 
+from jing_meta.mcp_base import JINGMCP
 from jing_meta import config as _jing_config
-from jing_meta.log import setup_logging
 from jing_meta.schema import SCHEMA_DDL
 
 # ---------------------------------------------------------------------------
@@ -26,7 +25,7 @@ from jing_meta.schema import SCHEMA_DDL
 
 DB_PATH = Path(os.environ.get("MEMORY_DB_PATH", str(_jing_config.memory_db())))
 
-mcp = FastMCP(
+mcp = JINGMCP(
     "memory",
     instructions="Persistent knowledge graph with graph traversal, fuzzy search, and temporal queries",
 )
@@ -892,6 +891,4 @@ def search_similar(name: str, threshold: float = 0.3) -> list[TextContent]:
 
 def main() -> None:
     """Run the MCP server."""
-    setup_logging()
-    _get_conn()
-    mcp.run(transport="stdio")
+    mcp.run_stdio(pre_warm=_get_conn)
