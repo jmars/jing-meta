@@ -102,71 +102,61 @@ uint32_t dafsa_abi_version(void)
 
 void dafsa_stats(const dafsa *d, dafsa_stats_out *out)
 {
+    unsigned char *visited;
+    unsigned int *queue;
+    unsigned int head, tail;
+    unsigned int reachable, finals, transitions;
+
     if (!d || !out) return;
 
-    /* Lazy cache: BFS is expensive — recompute only when invalidated.
-     * Single-writer semantics (dafsa is documented non-reentrant at creation),
-     * so casting away const is safe. */
-    if (!d->stats_valid) {
-        dafsa *m = (dafsa *)d;  /* mutable cache write; see struct dafsa comment (single-writer) */
-        unsigned char *visited;
-        unsigned int *queue;
-        unsigned int head, tail;
-        unsigned int reachable, finals, transitions;
-
-        visited = (unsigned char *)calloc(d->nstates, 1);
-        queue   = (unsigned int *)malloc(d->nstates * sizeof(unsigned int));
-        if (!visited || !queue) {
-            free(visited);
-            free(queue);
-            /* Degrade gracefully: return zeros */
-            memset(out, 0, sizeof(*out));
-            return;
-        }
-
-        head     = 0;
-        tail     = 0;
-        reachable = 0;
-        finals    = 0;
-        transitions = 0;
-
-        queue[tail++] = d->initial;
-        visited[d->initial] = 1;
-
-        while (head < tail) {
-            unsigned int sid = queue[head++];
-            const State *s = &d->states[sid];
-
-            reachable++;
-            if (s->is_final) finals++;
-            transitions += s->ntrans;
-
-            {
-                unsigned int j;
-                for (j = 0; j < s->ntrans; j++) {
-                    unsigned int tgt = trans_arr_c(s)[j].target;
-                    if (!visited[tgt]) {
-                        visited[tgt] = 1;
-                        queue[tail++] = tgt;
-                    }
-                }
-            }
-        }
-
-        m->stats_reachable  = reachable;
-        m->stats_final      = finals;
-        m->stats_trans      = transitions;
-        m->stats_valid      = 1;
-
+    /* No lazy cache: compute fresh on every call.  The struct is never
+     * mutated here, so dafsa_stats is const-correct and safe to call
+     * concurrently on a shared read-only dafsa handle (search views are
+     * shareable; this function reads only states[]/trans[]/is_final which
+     * are immutable after load).  register_probes is read once below.
+     *
+     * Recomputing costs one BFS (O(nstates + ntrans)); dafsa_stats is a
+     * diagnostic API, not a hot path, so the lost caching is acceptable
+     * in exchange for dropping the const-cast data race. */
+    visited = (unsigned char *)calloc(d->nstates, 1);
+    queue   = (unsigned int *)malloc(d->nstates * sizeof(unsigned int));
+    if (!visited || !queue) {
         free(visited);
         free(queue);
+        memset(out, 0, sizeof(*out));   /* OOM: degrade to zeros */
+        return;
     }
 
-    out->n_states_total     = d->nstates - 1;  /* exclude sink 0 */
-    out->n_states_reachable = d->stats_reachable;
-    out->n_final            = d->stats_final;
-    out->n_trans            = d->stats_trans;
+    head = tail = 0;
+    reachable = finals = transitions = 0;
+    queue[tail++] = d->initial;
+    visited[d->initial] = 1;
+
+    while (head < tail) {
+        unsigned int sid = queue[head++];
+        const State *s = &d->states[sid];
+        unsigned int j;
+
+        reachable++;
+        if (s->is_final) finals++;
+        transitions += s->ntrans;
+        for (j = 0; j < s->ntrans; j++) {
+            unsigned int tgt = trans_arr_c(s)[j].target;
+            if (!visited[tgt]) {
+                visited[tgt] = 1;
+                queue[tail++] = tgt;
+            }
+        }
+    }
+
+    out->n_states_total     = d->nstates - 1;   /* exclude sink 0 */
+    out->n_states_reachable = reachable;
+    out->n_final            = finals;
+    out->n_trans            = transitions;
     out->register_probes    = d->reg_probes;
+
+    free(visited);
+    free(queue);
 }
 
 /* ─── Dot output for visualization ─────────────────────────────────────── */

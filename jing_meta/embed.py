@@ -10,6 +10,9 @@ import threading
 import numpy as np
 
 from . import config
+from .log import get_logger as _get_logger
+
+_logger = _get_logger(__name__)
 
 _embedder = None
 _lock = threading.Lock()
@@ -22,6 +25,11 @@ def _get_embedder():
         if _embedder is None:
             from fastembed import TextEmbedding
 
+            _logger.info(
+                "Loading embedding model '%s' — first use may download ~100MB-1GB "
+                "(one-time cost).",
+                config.EMBED_MODEL,
+            )
             _embedder = TextEmbedding(model_name=config.EMBED_MODEL)
     return _embedder
 

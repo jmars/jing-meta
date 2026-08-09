@@ -19,6 +19,7 @@ import tempfile
 from pathlib import Path
 
 from jing_meta import config as _config
+from jing_meta.text import STOPWORDS
 
 from .dreamer import build_validation_prompt
 
@@ -85,16 +86,12 @@ def export_facts(graph: dict, facts_dir: Path) -> dict[str, int]:
                 f.write(f"{id_by_name[e['name']]}\t{norm}\n")
     # tokens for candidate generation
     import re as _re
-    STOP = set("the a an and or but of to in on for with is are was were be it "
-               "this that from by at as its their we you they not no has have had "
-               "do does did will would can could should into via through using used "
-               "use more most".split())
     with open(facts_dir / "token.csv", "w", encoding="utf-8") as f:
         for e in graph["entities"]:
             eid = id_by_name[e["name"]]
             text = e["name"] + " " + " ".join(str(o) for o in e.get("observations", [])[:3])
             for t in set(_re.findall(r"[a-z0-9][a-z0-9_-]*", text.lower())):
-                if t not in STOP and len(t) > 2:
+                if t not in STOPWORDS and len(t) > 2:
                     f.write(f"{eid}\t{t}\n")
     counts = {
         "entity": len(graph["entities"]),

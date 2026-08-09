@@ -18,6 +18,7 @@ from mcp.types import TextContent
 
 from jing_meta import config as _jing_config
 from jing_meta.log import setup_logging
+from jing_meta.schema import SCHEMA_DDL
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -63,33 +64,7 @@ def _get_conn() -> sqlite3.Connection:
 def _init_schema() -> None:
     """Create tables if they don't exist."""
     conn = _get_conn()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS entities (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            entity_type TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS observations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
-            content TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS relations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            from_entity TEXT NOT NULL,
-            to_entity TEXT NOT NULL,
-            relation_type TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            UNIQUE(from_entity, to_entity, relation_type)
-        );
-        CREATE INDEX IF NOT EXISTS idx_obs_entity ON observations(entity_id);
-        CREATE INDEX IF NOT EXISTS idx_rel_from ON relations(from_entity);
-        CREATE INDEX IF NOT EXISTS idx_rel_to ON relations(to_entity);
-        CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);
-    """)
+    conn.executescript(SCHEMA_DDL)
 
 
 def _now() -> str:
@@ -141,10 +116,16 @@ def _get_obs_by_entity_id(conn: sqlite3.Connection, entity_id: int) -> list[str]
 # ---------------------------------------------------------------------------
 # Content-block renderers
 #
-# Read tools return their results as a list of TextContent blocks rather than a
-# single JSON-encoded string. Each observation is emitted as its own block
-# ("Observation: …"), matching the reference mcp-server-memory behaviour, so
-# agents receive discrete observations instead of one opaque string.
+# Return-contract split across the MCP servers:
+#   * memory/server.py READ tools (search_nodes, open_nodes, read_graph,
+#     traverse, recent, search_similar, rebuild_semantic_index) return their
+#     results as a list of TextContent blocks rather than a single
+#     JSON-encoded string. Each observation is emitted as its own block
+#     ("Observation: …"), matching the reference mcp-server-memory behaviour,
+#     so agents receive discrete observations instead of one opaque string.
+#   * memory/server.py WRITE tools (create_entities, create_relations,
+#     add_observations, delete_*) return a plain str (a one-line status/confirmation).
+#   * search/server.py tools return a plain str (rendered text), NOT TextContent.
 # ---------------------------------------------------------------------------
 
 def _entity_blocks(

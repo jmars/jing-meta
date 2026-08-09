@@ -405,10 +405,12 @@ dafsa *dafsa_load_impl(const char *path, int mutable)
     /* CSR: direct copy into trans[] (already sorted, no trans_add) */
     for (i = 1; i <= n_states; i++) {
         State *s = &d->states[i];
-        /* Allocate the sparse transition array for this state. On OOM abort. */
+        /* Allocate the sparse transition array for this state. On OOM, fail
+         * the load gracefully (dafsa_load returns NULL) rather than aborting.
+         * The fail: label frees d->states (and every trans_heap allocated so
+         * far via dafsa_free), final_bits, and the mmap view. */
         if (s->ntrans > 0 && trans_reserve(s, s->ntrans) != 0) {
-            fprintf(stderr, "dafsa: OOM loading transitions\n");
-            abort();
+            goto fail;
         }
         {
             Edge *e = trans_arr(s);

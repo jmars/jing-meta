@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from jing_meta.log import get_logger
+from jing_meta.schema import SCHEMA_DDL  # noqa: F401 -- documents the shared schema contract
+from jing_meta.text import STOPWORDS
 
 from . import llm
 
@@ -90,6 +92,7 @@ def save_graph_sqlite(graph: dict, db_path: Path) -> None:
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("BEGIN IMMEDIATE")
         cur = conn.cursor()
         existing = {}  # name -> {"id", "entity_type", "created_at", "obs": {content: created_at}}
         for row in cur.execute(
@@ -182,6 +185,9 @@ def save_graph_sqlite(graph: dict, db_path: Path) -> None:
                 )
 
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -345,21 +351,12 @@ def build_validation_prompt(candidates: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 
-_STOPWORDS = {
-    "the", "a", "an", "and", "or", "but", "of", "to", "in", "on", "for", "with",
-    "is", "are", "was", "were", "be", "been", "it", "this", "that", "from", "by",
-    "at", "as", "its", "his", "her", "their", "we", "you", "they", "not", "no",
-    "has", "have", "had", "do", "does", "did", "will", "would", "can", "could",
-    "should", "into", "via", "through", "using", "used", "use", "more", "most",
-}
-
-
 def _tokens(text: str) -> set[str]:
     """Lowercased alphabetic/numeric tokens, stopwords and len-1 removed."""
     import re
 
     toks = set(re.findall(r"[a-z0-9][a-z0-9_-]*", text.lower()))
-    return {t for t in toks if t not in _STOPWORDS and len(t) > 2}
+    return {t for t in toks if t not in STOPWORDS and len(t) > 2}
 
 
 def suggest_relations(
@@ -551,6 +548,7 @@ def apply_mutations(graph: dict, plan: dict) -> dict:
         mutations = {}
     entities = {e["name"]: e for e in graph["entities"]}
     changes: list[str] = []
+    run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # 1. Archive stale observations (defensive — skip malformed entries)
     for a in mutations.get("archive_observations", []) or []:
@@ -564,7 +562,7 @@ def apply_mutations(graph: dict, plan: dict) -> dict:
         reason = str(a.get("reason", "stale"))
         if name in entities and 0 <= idx < len(entities[name].get("observations", [])):
             old = entities[name]["observations"][idx]
-            tag = f"[archived: {datetime.now(timezone.utc).strftime('%Y-%m-%d')} {reason}]"
+            tag = f"[archived: {run_date} {reason}]"
             entities[name]["observations"][idx] = f"{old} {tag}"
             changes.append(f"  archived obs[{idx}] on '{name}': {reason}")
 

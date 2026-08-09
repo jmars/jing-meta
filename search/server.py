@@ -21,6 +21,7 @@ Tools:
 import json
 import os
 import re
+import signal
 from datetime import date, datetime
 from pathlib import Path
 
@@ -36,6 +37,15 @@ from .indexer import build_index, search_fst, resolve_file_idx, _iter_domain_fil
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+
+class _RegexTimeout(Exception):
+    """Raised when the slow-path regex scan exceeds its time budget."""
+
+def _regex_alarm_handler(_signum, _frame):
+    raise _RegexTimeout("regex search timed out")
+
+_SLOW_SCAN_TIMEOUT = int(os.environ.get("SEARCH_REGEX_TIMEOUT", "5"))
+
 
 _config: Config | None = None
 
@@ -564,8 +574,19 @@ def search(
     # --- Slow path: line-by-line scan ---
     flags = 0 if case_sensitive else re.IGNORECASE
     if regex:
-        if re.search(r"(\+\s*\)|\*\s*\)|\}\s*\))\s*[+*]", query):
-            return "Potentially unsafe regex - nested quantifiers detected."
+        # Reject patterns with known catastrophic backtracking constructs.
+        # These checks are conservative by design — some safe regexes may be
+        # rejected, but the cost of a ReDoS hang is higher.  The nested /
+        # adjacent-quantifier checks require a quantifier or adjacency so safe
+        # patterns like "(?:foo)+" and "\d+ *\d+" are not false-positived.
+        _danger_checks = [
+            (r"[*+?]\)\s*[+*]", "nested quantifier after group"),       # (a*)*, (a+)+
+            (r"\([^)]*\|[^)]*\)\s*[+*]", "alternation with quantifier"),  # (a|b)+
+            (r"[+*?][+*?]", "adjacent quantifiers"),                      # a**, a?*
+        ]
+        for pat, desc in _danger_checks:
+            if re.search(pat, query):
+                return f"Potentially unsafe regex — {desc} detected."
         try:
             pattern = re.compile(query, flags)
         except re.error as e:
@@ -600,54 +621,74 @@ def search(
                 continue
 
             file_matches = []
-            for line_no, line in enumerate(lines, 1):
-                if not pattern.search(line):
-                    continue
-
-                # Role filter (sessions only)
-                if role and d_name == "sessions":
+            try:
+                _has_sigalrm = hasattr(signal, "SIGALRM")
+                if _has_sigalrm:
                     try:
-                        msg = json.loads(line)
-                        if msg.get("role", "").lower() != role.lower():
-                            continue
-                    except json.JSONDecodeError:
-                        if role.lower() != "user":
-                            continue
-
-                # Speaker filter (transcripts only)
-                if speaker and d_name == "transcripts":
-                    parsed = parse_transcript_file(f)
-                    if parsed:
-                        turn_by_line = {}
-                        for t in parsed["turns"]:
-                            for ln in range(
-                                t.get("line_start", 0), t.get("line_end", 0) + 1
-                            ):
-                                turn_by_line[ln] = t
-                        turn = turn_by_line.get(line_no - 1)
-                        if (
-                            not turn
-                            or turn.get("speaker", "").lower() != speaker.lower()
-                        ):
+                        signal.signal(signal.SIGALRM, _regex_alarm_handler)
+                        signal.alarm(_SLOW_SCAN_TIMEOUT)
+                    except ValueError:
+                        # signal.signal() only works from the main thread; MCP
+                        # handlers can run on worker threads — fall back to no
+                        # timeout in that case rather than crashing the search.
+                        _has_sigalrm = False
+                try:
+                    for line_no, line in enumerate(lines, 1):
+                        if not pattern.search(line):
                             continue
 
-                if len(file_matches) >= max_matches_per_file:
-                    break
+                        # Role filter (sessions only)
+                        if role and d_name == "sessions":
+                            try:
+                                msg = json.loads(line)
+                                if msg.get("role", "").lower() != role.lower():
+                                    continue
+                            except json.JSONDecodeError:
+                                if role.lower() != "user":
+                                    continue
 
-                ctx_before = lines[max(0, line_no - 1 - context_lines) : line_no - 1]
-                ctx_after = lines[line_no : line_no + context_lines]
-                display = _msg_snippet(line)
+                        # Speaker filter (transcripts only)
+                        if speaker and d_name == "transcripts":
+                            parsed = parse_transcript_file(f)
+                            if parsed:
+                                turn_by_line = {}
+                                for t in parsed["turns"]:
+                                    for ln in range(
+                                        t.get("line_start", 0), t.get("line_end", 0) + 1
+                                    ):
+                                        turn_by_line[ln] = t
+                                turn = turn_by_line.get(line_no - 1)
+                                if (
+                                    not turn
+                                    or turn.get("speaker", "").lower() != speaker.lower()
+                                ):
+                                    continue
 
-                file_matches.append(
-                    {
-                        "file_id": f.name,
-                        "source": d_name,
-                        "date": fd.isoformat() if fd else "?",
-                        "line": line_no,
-                        "match": display,
-                        "context_before": [l[:300] for l in ctx_before],
-                        "context_after": [l[:300] for l in ctx_after],
-                    }
+                        if len(file_matches) >= max_matches_per_file:
+                            break
+
+                        ctx_before = lines[max(0, line_no - 1 - context_lines) : line_no - 1]
+                        ctx_after = lines[line_no : line_no + context_lines]
+                        display = _msg_snippet(line)
+
+                        file_matches.append(
+                            {
+                                "file_id": f.name,
+                                "source": d_name,
+                                "date": fd.isoformat() if fd else "?",
+                                "line": line_no,
+                                "match": display,
+                                "context_before": [l[:300] for l in ctx_before],
+                                "context_after": [l[:300] for l in ctx_after],
+                            }
+                        )
+                finally:
+                    if _has_sigalrm:
+                        signal.alarm(0)
+            except _RegexTimeout:
+                return (
+                    f"Search timed out after {_SLOW_SCAN_TIMEOUT}s — "
+                    "the regex pattern may be too expensive."
                 )
             all_matches.extend(file_matches)
 

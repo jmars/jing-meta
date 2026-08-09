@@ -2,6 +2,21 @@ import sqlite3
 from pathlib import Path
 
 from dreamer.dreamer import load_graph_sqlite, save_graph_sqlite
+from jing_meta.text import STOPWORDS
+
+
+# ---------------------------------------------------------------------------
+# Item #4: shared stopwords
+# ---------------------------------------------------------------------------
+
+def test_stopwords_is_frozenset():
+    assert isinstance(STOPWORDS, frozenset)
+
+def test_stopwords_contains_key_words():
+    assert "the" in STOPWORDS and "been" in STOPWORDS and "her" in STOPWORDS
+
+def test_stopwords_excludes_domain_terms():
+    assert "knowledge" not in STOPWORDS and "code" not in STOPWORDS
 
 
 class TestSqliteRoundTrip:
@@ -222,3 +237,20 @@ class TestLocalValidatorBatching:
         rel_types = {r["relationType"] for r in result}
         assert "implements" in rel_types
         assert "relates_to" in rel_types
+
+
+class TestParseRelationType:
+    """Item #5: robust _local_llm_relation parsing."""
+
+    def test_parse_relation_type_direct(self):
+        from dreamer.local_validator import _parse_relation_type
+        assert _parse_relation_type("implements") == "implements"
+        assert _parse_relation_type("the relation is fixes") == "fixes"
+        assert _parse_relation_type("Relation type: uses.") == "uses"
+        assert _parse_relation_type("I think it's part_of") == "part_of"
+        assert _parse_relation_type("") is None
+
+    def test_parse_relation_type_no_fabrication(self):
+        from dreamer.local_validator import _parse_relation_type
+        assert _parse_relation_type("the cat sat on the mat") is None
+        assert _parse_relation_type("relation: unknown_type") is None

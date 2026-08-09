@@ -24,6 +24,33 @@ LOCAL_MODEL = os.environ.get("LOCAL_LLM_MODEL", _config.LOCAL_LLM_MODEL)
 # Pairs above this are treated as certain relations (rules suffice).
 HIGH_SIM = float(os.environ.get("VALIDATOR_HIGH_SIM", "0.70"))
 
+# Set of valid relation types the LLM is prompted with.  Used to validate
+# the response from the legacy single-pair fallback path.
+_ALLOWED_RELATIONS: frozenset[str] = frozenset({
+    "implements", "part_of", "related_to", "tested_by", "fixes",
+    "depends_on", "uses", "references", "causes", "verified_by",
+    "contains", "supersedes",
+})
+
+
+def _parse_relation_type(resp: str) -> Optional[str]:
+    """Extract the first valid relation type from an LLM response string.
+
+    Strips common boilerplate like "the relation is …" then searches for an
+    allowed relation type as a whole word.  Returns ``None`` if no valid type
+    is found — never fabricates.
+    """
+    import re
+
+    cleaned = re.sub(
+        r"^(the\s+)?relation\s+(type\s+)?(is\s+)?",
+        "", resp.lower().strip(),
+    )
+    for rel in sorted(_ALLOWED_RELATIONS, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(rel)}\b", cleaned):
+            return rel
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Tier 1: deterministic rules
@@ -108,8 +135,8 @@ def _local_llm_relation(a: str, b: str) -> Optional[str]:
             },
             timeout=60,
         )
-        resp = (r.json().get("response") or "").strip().lower()
-        return resp.split()[0] if resp else None
+        resp = (r.json().get("response") or "").strip()
+        return _parse_relation_type(resp)
     except Exception:
         return None
 

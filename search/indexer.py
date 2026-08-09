@@ -6,7 +6,6 @@ with no external binary dependency. The on-disk format is identical.
 """
 
 import json
-import subprocess
 from pathlib import Path
 from typing import Optional
 
