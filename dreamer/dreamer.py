@@ -43,20 +43,24 @@ def load_graph_sqlite(db_path: Path) -> dict:
         conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
         try:
+            from collections import OrderedDict
+            entity_map: OrderedDict[str, dict] = OrderedDict()
             for row in conn.execute(
-                "SELECT name, entity_type, updated_at FROM entities "
-                "ORDER BY datetime(updated_at) DESC, name ASC"
+                "SELECT e.name, e.entity_type, o.content "
+                "FROM entities e "
+                "LEFT JOIN observations o ON o.entity_id = e.id "
+                "ORDER BY datetime(e.updated_at) DESC, e.name ASC, o.id ASC"
             ):
-                obs_rows = conn.execute(
-                    "SELECT content FROM observations WHERE entity_id = "
-                    "(SELECT id FROM entities WHERE name = ?) ORDER BY id",
-                    (row["name"],),
-                ).fetchall()
-                entities.append({
-                    "name": row["name"],
-                    "entityType": row["entity_type"],
-                    "observations": [o["content"] for o in obs_rows],
-                })
+                name = row["name"]
+                if name not in entity_map:
+                    entity_map[name] = {
+                        "name": name,
+                        "entityType": row["entity_type"],
+                        "observations": [],
+                    }
+                if row["content"] is not None:
+                    entity_map[name]["observations"].append(row["content"])
+            entities = list(entity_map.values())
             for row in conn.execute(
                 "SELECT from_entity, to_entity, relation_type FROM relations ORDER BY id"
             ):
@@ -97,13 +101,14 @@ def save_graph_sqlite(graph: dict, db_path: Path) -> None:
                 "created_at": row["created_at"],
                 "obs": {},
             }
+        # Build id→info lookup once, then map observations O(1) per row.
+        by_id = {info["id"]: info for info in existing.values()}
         for eid, content, created_at in cur.execute(
             "SELECT entity_id, content, created_at FROM observations"
         ):
-            for name, info in existing.items():
-                if info["id"] == eid:
-                    info["obs"][content] = created_at
-                    break
+            info = by_id.get(eid)
+            if info is not None:
+                info["obs"][content] = created_at
 
         # --- Existing relations keyed by triple -> created_at ---
         existing_rels = {}
@@ -300,6 +305,39 @@ def build_prompt(graph: dict, candidates: list[dict] | None = None) -> str:
     parts.append(',"summary":"1 sentence describing changes"}')
 
     return "\n".join(parts)
+
+
+def build_validation_prompt(candidates: list[dict]) -> str:
+    """Build the LLM prompt to validate/name candidate relations.
+
+    Only the fuzzy part goes to the LLM: of these candidate pairs (already found
+    by exact token-overlap in Soufflé), which are *really* related, and what
+    relation type? The LLM confirms and names; it does NOT discover.
+    """
+    lines = [
+        "You are validating candidate relations in a knowledge graph. Each pair was",
+        "found by an exact token-overlap rule (shared terms in names/observations).",
+        "Your job: decide if each is a REAL relationship, and if so name the relation",
+        "type (e.g. implements, part_of, related_to, tested_by, depends_on, fixes).",
+        "",
+        "Rules:",
+        "  - Keep only pairs that are genuinely semantically related.",
+        "  - Use a concise relationType (lower_snake_case).",
+        "  - If a pair is NOT a real relation, omit it.",
+        "  - Do NOT add relations that don't appear below.",
+        "  - Output ONLY valid JSON, nothing else.",
+        "",
+        "CANDIDATES:",
+    ]
+    for i, c in enumerate(candidates, 1):
+        signal = c.get("shared") or f"sim={c.get('similarity', '?')}"
+        lines.append(
+            f"  {i}. \"{c['from']}\"  <->  \"{c['to']}\"  (signal: {signal})"
+        )
+    lines.append("")
+    lines.append("OUTPUT FORMAT:")
+    lines.append('{"add_relations":[{"from":"...","to":"...","relationType":"..."}]}')
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

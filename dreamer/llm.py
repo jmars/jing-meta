@@ -37,6 +37,18 @@ logger = get_logger(__name__)
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
+def _is_loopback_host(api_url: str) -> bool:
+    """Return True if the API URL points to a loopback host."""
+    parsed = urlparse(api_url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname in _LOOPBACK_HOSTS:
+        return True
+    try:
+        return ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
 def _validate_api_url(api_url: str) -> None:
     """Validate *api_url* to prevent SSRF.
 
@@ -52,9 +64,9 @@ def _validate_api_url(api_url: str) -> None:
         raise ValueError(f"Invalid API URL: no hostname found in {api_url!r}")
 
     hostname = parsed.hostname.lower()
-    is_loopback = hostname in _LOOPBACK_HOSTS
+    is_loopback = _is_loopback_host(api_url)
 
-    # Check if it's an IP address — if so, it must be loopback
+    # Raw non-loopback IPs must be rejected regardless of scheme.
     try:
         addr = ip_address(hostname)
     except ValueError:
@@ -65,8 +77,6 @@ def _validate_api_url(api_url: str) -> None:
             f"IP addresses are not allowed as API hosts (got {hostname!r}). "
             f"Use a hostname or localhost."
         )
-    if addr is not None and addr.is_loopback:
-        is_loopback = True
 
     if parsed.scheme == "http" and not is_loopback:
         raise ValueError(
@@ -160,7 +170,7 @@ def call(
     if model is None:
         model = os.environ.get("GRAPH_GARDENER_MODEL", "deepseek-chat")
 
-    if not api_key:
+    if not api_key and not _is_loopback_host(api_url):
         logger.error("GRAPH_GARDENER_API_KEY is not set or is empty")
         return None, None
 
@@ -181,12 +191,12 @@ def call(
                 f" Maximum {max_tokens} tokens."
             )
         try:
+            headers = {"Content-Type": "application/json"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
             resp = requests.post(
                 _chat_url(api_url),
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers=headers,
                 json={
                     "model": model,
                     "messages": [

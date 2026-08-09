@@ -12,7 +12,7 @@ The cloud LLM is NOT needed. Everything runs on the machine.
 """
 
 import os
-from typing import Optional
+from typing import Callable, Optional
 
 from jing_meta import config as _config
 
@@ -86,7 +86,9 @@ def _shared_token_relation(a: str, b: str, graph: dict) -> Optional[str]:
 
 
 def _local_llm_relation(a: str, b: str) -> Optional[str]:
-    """Ask the local Ollama model to name the relation. Returns None on failure."""
+    """Legacy single-pair fallback via /api/generate; prefer the batched path in validate_and_name.
+
+    Ask the local Ollama model to name the relation. Returns None on failure."""
     import requests
 
     prompt = (
@@ -122,14 +124,24 @@ def validate_and_name(
     graph: dict,
     *,
     use_local_llm: bool = True,
+    llm_callable: Optional[Callable] = None,
 ) -> list[dict]:
-    """Validate + name candidate relations.
+    """Validate + name candidate relations (two-phase batching).
 
     Returns a list of {"from", "to", "relationType", "confidence"}.
-    High-similarity pairs are accepted; low-similarity pairs are dropped unless
-    rules or the LLM clearly relate them.
+
+    Phase 1: deterministic rules (type-patterns, shared tokens) name the easy
+    pairs for free. Phase 2: all remaining unnamed candidates are batched into a
+    single ``build_validation_prompt`` sent to the local LLM; any pairs the batch
+    misses fall back to the legacy single-pair ``_local_llm_relation``.
+
+    ``llm_callable`` is an injectable seam for tests — an optional
+    ``prompt -> dict|None`` callable (mapping from the batched prompt to an
+    ``{"add_relations": [...]}`` dict) that overrides the real local-LLM call.
     """
     out = []
+    unnamed = []
+
     for c in candidates:
         a, b = c["from"], c["to"]
         sim = c.get("similarity", 0.0)
@@ -145,14 +157,63 @@ def validate_and_name(
         if rel is None:
             rel = _shared_token_relation(a, b, graph)
 
-        # 2. Local LLM for the rest.
-        if rel is None and use_local_llm:
-            rel = _local_llm_relation(a, b)
+        if rel is not None:
+            out.append({
+                "from": a, "to": b,
+                "relationType": rel,
+                "confidence": round(sim, 3),
+            })
+        else:
+            unnamed.append(c)
 
-        # Never fabricate a relation: if no tier (rules / shared-token / LLM)
-        # could name it, drop the candidate rather than inventing "related_to".
-        if rel is None:
-            continue
+    # 2. Batch all unnamed through build_validation_prompt.
+    if unnamed and use_local_llm:
+        from .dreamer import build_validation_prompt
+        prompt = build_validation_prompt(unnamed)
 
-        out.append({"from": a, "to": b, "relationType": rel, "confidence": round(sim, 3)})
+        if llm_callable is not None:
+            llm_result = llm_callable(prompt)
+        else:
+            from . import llm as _llm_lib
+            llm_result, _meta = _llm_lib.call(
+                system_prompt="You are a knowledge graph relation validator.",
+                user_prompt=prompt,
+                max_tokens=2000,
+                api_url=f"{OLLAMA_URL}/v1",
+                api_key="",
+                model=LOCAL_MODEL,
+            )
+
+        if llm_result and isinstance(llm_result, dict):
+            added = llm_result.get("add_relations", [])
+            if isinstance(added, list):
+                unnamed_by_pair = {(c["from"], c["to"]): c for c in unnamed}
+                seen_in_batch = set()
+                for r in added:
+                    key = (r.get("from"), r.get("to"))
+                    if key in unnamed_by_pair and key not in seen_in_batch:
+                        seen_in_batch.add(key)
+                        c = unnamed_by_pair[key]
+                        out.append({
+                            "from": key[0], "to": key[1],
+                            "relationType": r.get("relationType", "references"),
+                            "confidence": round(c.get("similarity", 0.0), 3),
+                        })
+
+        # Single-pair fallback for any remaining unnamed candidates the batch
+        # missed or failed to parse (_local_llm_relation via /api/generate).
+        batched_pairs = {(r["from"], r["to"]) for r in out}
+        still_unnamed = [
+            c for c in unnamed
+            if (c["from"], c["to"]) not in batched_pairs
+        ]
+        for c in still_unnamed:
+            rel = _local_llm_relation(c["from"], c["to"])
+            if rel is not None:
+                out.append({
+                    "from": c["from"], "to": c["to"],
+                    "relationType": rel,
+                    "confidence": round(c.get("similarity", 0.0), 3),
+                })
+
     return out

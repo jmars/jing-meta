@@ -20,6 +20,8 @@ from pathlib import Path
 
 from jing_meta import config as _config
 
+from .dreamer import build_validation_prompt
+
 SOUFFLE = os.environ.get("SOUFFLE", _config.SOUFFLE)
 GARDEN_DL = Path(__file__).parent / "souffle" / "garden.dl"
 
@@ -226,38 +228,6 @@ def rerank_with_semantic(
     return scored[:MAX_LLM_CANDIDATES]
 
 
-def build_validation_prompt(candidates: list[dict]) -> str:
-    """Build the LLM prompt to validate/name candidate relations.
-
-    Only the fuzzy part goes to the LLM: of these candidate pairs (already found
-    by exact token-overlap in Soufflé), which are *really* related, and what
-    relation type? The LLM confirms and names; it does NOT discover.
-    """
-    lines = [
-        "You are validating candidate relations in a knowledge graph. Each pair was",
-        "found by an exact token-overlap rule (shared terms in names/observations).",
-        "Your job: decide if each is a REAL relationship, and if so name the relation",
-        "type (e.g. implements, part_of, related_to, tested_by, depends_on, fixes).",
-        "",
-        "Rules:",
-        "  - Keep only pairs that are genuinely semantically related.",
-        "  - Use a concise relationType (lower_snake_case).",
-        "  - If a pair is NOT a real relation, omit it.",
-        "  - Do NOT add relations that don't appear below.",
-        "  - Output ONLY valid JSON, nothing else.",
-        "",
-        "CANDIDATES:",
-    ]
-    for i, c in enumerate(candidates, 1):
-        lines.append(
-            f"  {i}. \"{c['from']}\"  <->  \"{c['to']}\"  (shared tokens: {c['shared']})"
-        )
-    lines.append("")
-    lines.append("OUTPUT FORMAT:")
-    lines.append('{"add_relations":[{"from":"...","to":"...","relationType":"..."}]}')
-    return "\n".join(lines)
-
-
 def run_pipeline(
     graph: dict,
     *,
@@ -280,6 +250,10 @@ def run_pipeline(
       5. Return a mutation plan in the same shape `apply_mutations` expects:
          {"mutations": {"rename_types": [...], "merge_entities": [...],
                         "add_relations": [...]}}
+
+    ``validator`` may be a string ("local"/"cloud"/"none") or a callable
+    ``(candidates, graph) -> list[dict]`` returning validated relations with
+    keys from/to/relationType (used as a test seam).
     """
     from . import llm
 
@@ -333,7 +307,13 @@ def run_pipeline(
     #   validator="cloud" -> cloud LLM call (precise but requires network/API)
     #   validator="none"  -> no validation (use at your own risk)
     if llm_candidates:
-        if validator == "local":
+        if callable(validator):
+            added = validator(llm_candidates, graph)
+            plan["mutations"]["add_relations"] = [
+                {"from": r["from"], "to": r["to"], "relationType": r["relationType"]}
+                for r in added
+            ]
+        elif validator == "local":
             from .local_validator import validate_and_name
             added = validate_and_name(llm_candidates, graph, use_local_llm=True)
             plan["mutations"]["add_relations"] = [
