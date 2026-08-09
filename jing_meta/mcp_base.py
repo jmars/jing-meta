@@ -22,7 +22,7 @@ will need per-thread isolation or explicit locking.
 
 from __future__ import annotations
 
-from typing import Callable, TypeVar
+from typing import Any, Callable, TypeVar
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent
@@ -35,7 +35,7 @@ T = TypeVar("T")
 class JINGMCP(FastMCP):
     """FastMCP subclass with jing-meta-idiomatic setup and run."""
 
-    def run_stdio(self, pre_warm: Callable[[], None] | None = None) -> None:
+    def run_stdio(self, pre_warm: Callable[[], Any] | None = None) -> None:
         """Set up logging, optionally pre-warm resources, then run stdio."""
         setup_logging()
         if pre_warm is not None:

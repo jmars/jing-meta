@@ -4,6 +4,7 @@ import re
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 from xml.etree import ElementTree as ET
 from zipfile import BadZipFile, ZipFile
 
@@ -123,7 +124,7 @@ def read_transcript_text(p: Path) -> str:
 def parse_transcript(text: str) -> dict:
     """Parse a Tactiq TXT transcript into structured data."""
     lines = text.split("\n")
-    result = {
+    result: dict[str, Any] = {
         "meeting": None, "meeting_date": None, "duration": None,
         "platform": None, "participants": [], "turns": [], "raw_lines": lines,
     }

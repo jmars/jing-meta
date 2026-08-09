@@ -20,22 +20,25 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.command == "indexer":
-        from indexer.__main__ import main as m
-        return m(args.args)
+        from indexer.__main__ import main as indexer_main
+        return indexer_main(args.args)
     elif args.command == "search":
         # MCP server — blocks on stdio transport; no extra args.
-        from search.server import main as m
-        m()
+        from search.server import main as search_main
+        search_main()
         return 0
     elif args.command == "memory":
-        from memory.__main__ import main as m
-        return m(args.args)
+        # MCP server — blocks on stdio transport; no extra args.
+        from memory.__main__ import main as memory_main
+        memory_main()
+        return 0
     elif args.command == "dreamer":
-        from dreamer.__main__ import main as m
-        return m(args.args)
+        from dreamer.__main__ import main as dreamer_main
+        dreamer_main()
+        return 0
     elif args.command == "archiver":
-        from memory.archiver import main as m
-        return m(args.args)
+        from memory.archiver import main as archiver_main
+        return archiver_main(args.args)
     elif args.command == "verify":
         return _verify()
     else:

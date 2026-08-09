@@ -383,7 +383,7 @@ def suggest_relations(
         (r.get("from"), r.get("to")) for r in graph["relations"]
     }
 
-    bags: list[tuple[int, dict]] = []
+    bags: list[tuple[set[str], dict]] = []
     for e in entities:
         name = e.get("name", "")
         obs = e.get("observations", [])

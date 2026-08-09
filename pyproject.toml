@@ -52,7 +52,7 @@ ignore = ["E501"]
 known-first-party = ["jing_meta", "indexer", "search", "memory", "dreamer"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.14"
 check_untyped_defs = true
 ignore_missing_imports = true
 disallow_untyped_defs = false

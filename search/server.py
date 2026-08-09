@@ -28,6 +28,7 @@ import re
 import signal
 from datetime import date, datetime
 from pathlib import Path
+from typing import Callable
 
 from jing_meta.mcp_base import JINGMCP, lazy_singleton
 
@@ -620,7 +621,7 @@ def search(
             if not lines:
                 continue
 
-            file_matches = []
+            file_matches: list[dict] = []
             try:
                 _has_sigalrm = hasattr(signal, "SIGALRM")
                 if _has_sigalrm:
@@ -825,7 +826,7 @@ def read(
 
     list_meta_fn = _LIST_META.get(domain, lambda p: {})
     load_summary_fn = _LOAD_SUMMARY.get(domain, lambda p: None)
-    read_fn = _READ_ENTRIES.get(domain, lambda p, n, _: [])
+    read_fn: Callable[[Path, int, str | None], list[dict]] = _READ_ENTRIES.get(domain, lambda p, n, _: [])
 
     meta = list_meta_fn(target)
     summary = load_summary_fn(target)

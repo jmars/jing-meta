@@ -16,6 +16,7 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from jing_meta import config as _config
 from jing_meta.text import STOPWORDS
@@ -149,7 +150,7 @@ def parse_results(output_dir: Path, id2name: dict[int, str]) -> dict:
     }
 
 
-def build_shortlist(results: dict, id2name: dict[int, str]) -> tuple[list[dict], list[dict]]:
+def build_shortlist(results: dict, id2name: dict[int, str]) -> tuple[dict[str, list[dict]], list[dict]]:
     """Split results into (certain, llm_needed).
 
     certain = duplicates + renames (provable, no LLM).
@@ -291,7 +292,7 @@ def run_pipeline(
             c["similarity"] = round(min(shared / 10, 1.0), 3)
 
     # --- Phase 3: Validate ---
-    plan = {"mutations": {
+    plan: dict[str, Any] = {"mutations": {
         "rename_types": certain["rename_types"],
         "merge_entities": certain["merge_entities"],
         "add_relations": [],

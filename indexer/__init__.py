@@ -10,7 +10,7 @@ Stored in the DAFSA; `prefix_enum(word)` returns the 8-byte payload
 (file_idx + entry_idx) for every entry containing that word.
 """
 
-import glob
+import fnmatch
 import json
 import os
 import re
@@ -57,7 +57,7 @@ def date_from_path(path: Path) -> str:
     return m.group(0) if m else "?"
 
 
-def extract_jsonl(path: Path, filename: str):
+def extract_jsonl(path: Path, filename: str) -> tuple[tuple[str, str, str, str], list[str]]:
     date = date_from_path(path)
     try:
         content = path.read_text(encoding="utf-8")
@@ -77,7 +77,7 @@ def extract_jsonl(path: Path, filename: str):
     return (filename, filename, date, "jsonl"), entries
 
 
-def extract_txt(path: Path, filename: str):
+def extract_txt(path: Path, filename: str) -> tuple[tuple[str, str, str, str], list[str]]:
     date = date_from_path(path)
     try:
         content = path.read_text(encoding="utf-8")
@@ -87,7 +87,7 @@ def extract_txt(path: Path, filename: str):
     return (filename, filename, date, "txt"), [line for line in content.splitlines() if line.strip()]
 
 
-def extract_transcript(path: Path, filename: str):
+def extract_transcript(path: Path, filename: str) -> tuple[tuple[str, str, str, str], list[str]]:
     date = date_from_path(path)
     entries = []
     try:
@@ -123,11 +123,11 @@ def collect_files(dir: Path, pattern: str) -> list[Path]:
     files: list[Path] = []
     for root, dirs, names in os.walk(dir):
         # prune symlinked dirs (os.walk yields root as str; wrap in Path)
-        root = Path(root)
-        dirs[:] = [d for d in dirs if not (root / d).is_symlink()]
+        root_path = Path(root)
+        dirs[:] = [d for d in dirs if not (root_path / d).is_symlink()]
         for name in names:
-            if glob.fnmatch.fnmatch(name, pattern):
-                files.append(root / name)
+            if fnmatch.fnmatch(name, pattern):
+                files.append(root_path / name)
     files.sort()
     return files
 
@@ -516,7 +516,7 @@ class Index:
             raise FileNotFoundError(f"No manifest.json found in {self.index_dir}")
         self.manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         self.files = [FileEntry(**f) for f in self.manifest.get("files", [])]
-        self._view = Dafsa.load(str(self.fst_path), readonly=True)
+        self._view: Dafsa | None = Dafsa.load(str(self.fst_path), readonly=True)
 
     def close(self) -> None:
         if hasattr(self, "_view") and self._view:
@@ -527,10 +527,12 @@ class Index:
         query_words = tokenize(query)
         if not query_words:
             return []
+        view = self._view
+        assert view is not None, "Index has been closed"
         word_sets: list[set[tuple[int, int]]] = []
         for word in query_words:
             hits: set[tuple[int, int]] = set()
-            for payload in self._view.prefix_enum(word.encode()):
+            for payload in view.prefix_enum(word.encode()):
                 if len(payload) == 8:
                     fi = int.from_bytes(payload[0:4], "big")
                     ei = int.from_bytes(payload[4:8], "big")

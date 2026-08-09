@@ -5,10 +5,12 @@
 .PHONY: test c-test lint typecheck clean
 
 test: c-test
-	@if python3 -c "import pytest" >/dev/null 2>&1; then \
+	@if command -v uv >/dev/null 2>&1; then \
+		uv run pytest tests/ -v; \
+	elif python3 -c "import pytest" >/dev/null 2>&1; then \
 		python3 -m pytest tests/ -v; \
 	else \
-		echo "SKIP: pytest not installed; skipping Python tests (pip install -e '.[dev]')"; \
+		echo "SKIP: pytest not installed; skipping Python tests (pip install -e '.[dev]' or use uv)"; \
 	fi
 
 c-test:
@@ -24,17 +26,21 @@ c-test:
 	fi
 
 lint:
-	@if command -v ruff >/dev/null 2>&1; then \
+	@if command -v uv >/dev/null 2>&1; then \
+		uv run ruff check .; \
+	elif command -v ruff >/dev/null 2>&1; then \
 		ruff check .; \
 	else \
-		echo "SKIP: ruff not installed; skipping lint (pip install -e '.[dev]')"; \
+		echo "SKIP: ruff not installed; skipping lint (pip install -e '.[dev]' or use uv)"; \
 	fi
 
 typecheck:
-	@if command -v mypy >/dev/null 2>&1; then \
+	@if command -v uv >/dev/null 2>&1; then \
+		uv run mypy --check-untyped-defs jing_meta indexer search memory dreamer; \
+	elif command -v mypy >/dev/null 2>&1; then \
 		mypy --check-untyped-defs jing_meta indexer search memory dreamer; \
 	else \
-		echo "SKIP: mypy not installed; skipping typecheck (pip install -e '.[dev]')"; \
+		echo "SKIP: mypy not installed; skipping typecheck (pip install -e '.[dev]' or use uv)"; \
 	fi
 
 clean:
