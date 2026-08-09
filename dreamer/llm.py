@@ -24,12 +24,15 @@ Or pass parameters directly to ``call()``::
 
 import json
 import os
-import sys
 from datetime import datetime, timezone
 from ipaddress import ip_address
 from urllib.parse import urlparse
 
 import requests
+
+from jing_meta.log import get_logger
+
+logger = get_logger(__name__)
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
@@ -158,13 +161,13 @@ def call(
         model = os.environ.get("GRAPH_GARDENER_MODEL", "deepseek-chat")
 
     if not api_key:
-        print("ERROR: GRAPH_GARDENER_API_KEY is not set or is empty", file=sys.stderr)
+        logger.error("GRAPH_GARDENER_API_KEY is not set or is empty")
         return None, None
 
     try:
         _validate_api_url(api_url)
     except ValueError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+        logger.error("%s", e)
         return None, None
 
     # Try the initial request plus `retries` repair attempts.
@@ -217,16 +220,13 @@ def call(
         except (json.JSONDecodeError,) as e:
             # Parse failure — retry with a repair instruction
             safe = _redact(str(e), [api_key, f"Bearer {api_key}", api_url])
-            print(
-                f"WARNING: LLM returned malformed JSON (attempt {attempt + 1}): {safe}",
-                file=sys.stderr,
-            )
+            logger.warning("LLM returned malformed JSON (attempt %d): %s", attempt + 1, safe)
             continue
 
         except (requests.RequestException, KeyError, IndexError) as e:
             safe = _redact(str(e), [api_key, f"Bearer {api_key}", api_url])
-            print(f"ERROR: LLM call failed: {safe}", file=sys.stderr)
+            logger.error("LLM call failed: %s", safe)
             return None, None
 
-    print("ERROR: LLM kept returning malformed JSON after retries.", file=sys.stderr)
+    logger.error("LLM kept returning malformed JSON after retries.")
     return None, None

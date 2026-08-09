@@ -14,11 +14,14 @@ Mutations are additive only:
 import json
 import os
 import shutil
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from jing_meta.log import get_logger
+
 from . import llm
+
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Load / save
@@ -660,8 +663,7 @@ def run_souffle_mode(
     try:
         from .souffle_pipeline import run_pipeline, SouffleError
     except ImportError as e:
-        print(f"WARNING: souffle pipeline unavailable ({e}); falling back to LLM mode.",
-              file=sys.stderr)
+        logger.warning("souffle pipeline unavailable (%s); falling back to LLM mode.", e)
         return run(memory_db, apply=apply, api_url=api_url, api_key=api_key,
                    model=model, max_entities=max_entities)
 
@@ -687,8 +689,7 @@ def run_souffle_mode(
             validator=validator,
         )
     except (SouffleError, FileNotFoundError) as e:
-        print(f"WARNING: souffle pipeline failed ({e}); falling back to LLM mode.",
-              file=sys.stderr)
+        logger.warning("souffle pipeline failed (%s); falling back to LLM mode.", e)
         return run(memory_db, apply=apply, api_url=api_url, api_key=api_key,
                    model=model, max_entities=max_entities)
 
@@ -789,17 +790,13 @@ def run(
                 f"{len(candidates)} candidate relations, prompt {len(prompt)} chars"
             )
             if len(prompt) > 80_000:
-                print(
-                    f"WARNING: chunk prompt is {len(prompt)} chars — may exceed LLM context window",
-                    file=sys.stderr,
-                )
+                logger.warning("chunk prompt is %d chars — may exceed LLM context window", len(prompt))
 
             plan, metadata = call_llm(
                 prompt, api_url=api_url, api_key=api_key, model=model
             )
             if plan is None:
-                print(f"LLM call failed on chunk {ci}. Aborting — no changes made.",
-                      file=sys.stderr)
+                logger.error("LLM call failed on chunk %d. Aborting — no changes made.", ci)
                 return 1
 
             if metadata:
@@ -824,7 +821,7 @@ def run(
         # Validate the merged plan
         warnings = validate_plan(plan)
         for w in warnings:
-            print(f"WARNING: {w}", file=sys.stderr)
+            logger.warning("%s", w)
 
         print(f"\nPlan: {' '.join(summaries) if summaries else '(no summaries)'}")
         print(f"Mutations: {total_mutations} total")
@@ -853,6 +850,5 @@ def run(
         return 0
 
     except Exception:  # noqa: BLE001 — top-level safety net for run()
-        import traceback
-        traceback.print_exc(file=sys.stderr)
+        logger.exception("Unhandled error in run()")
         return 1

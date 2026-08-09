@@ -6,7 +6,10 @@ import sys
 from pathlib import Path
 
 from jing_meta import config as _config
+from jing_meta.log import get_logger, setup_logging
 from .dreamer import run, run_souffle_mode
+
+logger = get_logger(__name__)
 
 
 def _cli() -> argparse.ArgumentParser:
@@ -59,6 +62,7 @@ def _cli() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    setup_logging()
     parser = _cli()
     args = parser.parse_args()
 
@@ -66,17 +70,11 @@ def main() -> None:
 
     check_path = memory_db
     if not check_path.is_file():
-        print(
-            f"ERROR: memory store not found or not a regular file: {check_path}",
-            file=sys.stderr,
-        )
+        logger.error("memory store not found or not a regular file: %s", check_path)
         sys.exit(1)
 
     if not os.access(str(check_path), os.R_OK):
-        print(
-            f"ERROR: memory store not readable: {check_path}",
-            file=sys.stderr,
-        )
+        logger.error("memory store not readable: %s", check_path)
         sys.exit(1)
 
     if args.souffle:

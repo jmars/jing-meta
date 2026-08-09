@@ -26,6 +26,8 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+from jing_meta.log import setup_logging
+
 from .config import Config, DomainConfig, load_config
 from .renderers import render_list_entry, render_read_entry
 from .transcript import parse_transcript_file, read_transcript_text
@@ -1326,6 +1328,7 @@ def _format_transcript_summary(s: dict, name: str) -> str:
 
 def main() -> None:
     """Start the MCP server with stdio transport."""
+    setup_logging()
     mcp.run(transport="stdio")
 
 

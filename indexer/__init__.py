@@ -14,12 +14,15 @@ import glob
 import json
 import os
 import re
-import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable
 
+from jing_meta.log import get_logger
+
 from .dafsa import Dafsa
+
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +61,7 @@ def extract_jsonl(path: Path, filename: str):
     try:
         content = path.read_text(encoding="utf-8")
     except (UnicodeDecodeError, OSError):
-        print(f"Skipping non-UTF-8 file {path}: decode error", file=sys.stderr)
+        logger.warning("Skipping non-UTF-8 file %s: decode error", path)
         return (filename, filename, date, "jsonl"), []
     entries = []
     for line in content.splitlines():
@@ -78,7 +81,7 @@ def extract_txt(path: Path, filename: str):
     try:
         content = path.read_text(encoding="utf-8")
     except (UnicodeDecodeError, OSError):
-        print(f"Skipping non-UTF-8 file {path}: decode error", file=sys.stderr)
+        logger.warning("Skipping non-UTF-8 file %s: decode error", path)
         return (filename, filename, date, "txt"), []
     return (filename, filename, date, "txt"), [l for l in content.splitlines() if l.strip()]
 
@@ -94,7 +97,7 @@ def extract_transcript(path: Path, filename: str):
             # Tactiq-style: "Speaker: text" — index the whole line (simplified)
             entries.append(s)
     except (UnicodeDecodeError, OSError):
-        print(f"Skipping non-UTF-8 file {path}: decode error", file=sys.stderr)
+        logger.warning("Skipping non-UTF-8 file %s: decode error", path)
         return (filename, filename, date, "transcript"), []
     return (filename, filename, date, "transcript"), entries
 
@@ -288,11 +291,7 @@ def build(dir: Path, pattern: str, extractor: str, output: Path) -> None:
 
     fs = fst_path.stat().st_size if fst_path.exists() else 0
     ms = manifest_path.stat().st_size if manifest_path.exists() else 0
-    print(
-        f"Done. FST: {fs / 1_048_576:.2f} MB, Manifest: {ms / 1024:.1f} KB | "
-        f"{len(keys)} unique keys from {total_entries} entries across {len(files)} files",
-        file=sys.stderr,
-    )
+    logger.warning("Done. FST: %.2f MB, Manifest: %.1f KB | %d unique keys from %d entries across %d files", fs / 1_048_576, ms / 1024, len(keys), total_entries, len(files))
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +358,7 @@ def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
                 # CHANGED: drop old keys, extract and re-add.
                 for ei, w in _read_sidecar(slots_dir, slot):
                     if not d.delete(_composite_key(w, slot, ei)):
-                        print(f"update: missing key for {rel} (orphan), healing", file=sys.stderr)
+                        logger.warning("update: missing key for %s (orphan), healing", rel)
                 meta, extracted = fn(filepath, rel)
                 pairs = _dedup_pairs(extracted)
                 for ei, w in pairs:
@@ -399,7 +398,7 @@ def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
             if not fe.get("tombstoned") and fe["filename"] not in disk_rel:
                 for ei, w in _read_sidecar(slots_dir, i):
                     if not d.delete(_composite_key(w, i, ei)):
-                        print(f"update: missing key for slot {i} (orphan), healing", file=sys.stderr)
+                        logger.warning("update: missing key for slot %d (orphan), healing", i)
                 files[i] = {
                     "filename": "",
                     "title": "",

@@ -3,8 +3,11 @@
 import argparse
 import sys
 
+from jing_meta.log import setup_logging
+
 
 def main() -> int:
+    setup_logging()
     parser = argparse.ArgumentParser(prog="jing-meta", description=(
         "Unified self-hosted knowledge system: indexer, search, memory, dreamer."
     ))

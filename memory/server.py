@@ -17,6 +17,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent
 
 from jing_meta import config as _jing_config
+from jing_meta.log import setup_logging
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -910,5 +911,6 @@ def search_similar(name: str, threshold: float = 0.3) -> list[TextContent]:
 
 def main() -> None:
     """Run the MCP server."""
+    setup_logging()
     _get_conn()
     mcp.run(transport="stdio")

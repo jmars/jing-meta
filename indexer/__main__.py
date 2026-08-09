@@ -5,6 +5,8 @@ import json
 import sys
 from pathlib import Path
 
+from jing_meta.log import setup_logging
+
 from . import build, update, open_index
 
 
@@ -34,6 +36,7 @@ def _query(args) -> int:
 
 
 def main(argv=None) -> int:
+    setup_logging()
     parser = argparse.ArgumentParser(prog="jing-indexer", description=(
         "DAFSA-based full-text indexer (Python frontend to the C DAFSA core)."
     ))
