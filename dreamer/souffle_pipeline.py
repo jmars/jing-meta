@@ -194,7 +194,7 @@ def rerank_with_semantic(
     unavailable, returns the original ranking unchanged.
     """
     try:
-        from .semantic_search import semantic_candidates, _get_embedder
+        from .semantic_search import semantic_candidates
     except Exception:
         return candidates[:MAX_LLM_CANDIDATES]
 
@@ -303,10 +303,22 @@ def run_pipeline(
         # Free the ONNX embedder BEFORE loading any local LLM, so the two big
         # models don't collide in memory (avoids OOM on low-RAM machines).
         try:
-            from .semantic_search import free_embedder
-            free_embedder()
+            from jing_meta import embed as _embed
+
+            _embed.free()
         except Exception:
             pass
+    elif llm_candidates:
+        # No semantic rerank ran (`--no-rerank`), so candidates carry no
+        # "similarity" key. The validator's similarity guard
+        # (validate_and_name: drop when sim < 0.45) would then drop every
+        # candidate. Attach a lexical fallback derived from the shared-token
+        # count, mirroring the norm_shared = min(shared / 10, 1) formula in
+        # rerank_with_semantic, so validation behaves sensibly without the
+        # embedding tier. Preserve the existing "shared" field.
+        for c in llm_candidates:
+            shared = c.get("shared", 0)
+            c["similarity"] = round(min(shared / 10, 1.0), 3)
 
     plan = {"mutations": {
         "rename_types": certain["rename_types"],

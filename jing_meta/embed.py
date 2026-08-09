@@ -15,15 +15,26 @@ _embedder = None
 _lock = threading.Lock()
 
 
-def embed(texts, batch_size: int = 64) -> list[np.ndarray]:
-    """Embed a list of strings -> list of float32 vectors. Lazy model init."""
+def _get_embedder():
+    """Lazily init and return the ONNX embedder singleton (downloads on first use)."""
     global _embedder
     with _lock:
         if _embedder is None:
             from fastembed import TextEmbedding
 
             _embedder = TextEmbedding(model_name=config.EMBED_MODEL)
-    return [np.asarray(v, dtype="float32") for v in _embedder.embed(texts, batch_size=batch_size)]
+    return _embedder
+
+
+def embed(texts, batch_size: int = 64) -> list[np.ndarray]:
+    """Embed a list of strings -> list of float32 vectors. Lazy model init."""
+    return [np.asarray(v, dtype="float32") for v in _get_embedder().embed(texts, batch_size=batch_size)]
+
+
+def _entity_text(e: dict) -> str:
+    """Build the text we embed for an entity: name + top observations."""
+    obs = e.get("observations", []) or []
+    return e.get("name", "") + ". " + " ".join(str(o) for o in obs[:4])
 
 
 def embed_one(text: str) -> np.ndarray:

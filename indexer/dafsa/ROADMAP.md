@@ -1,6 +1,7 @@
 # Roadmap: Replace the Rust `fst` backend with the Carrasco–Forcada C DAFSA (`dafsa`)
 
 **Status:** Approved plan (2026-08-06); **canonical roadmap updated 2026-08-09** for the jing-meta Python frontend. The C core (M0/M1) and the M4 optional `DafsaView` are **done**; the `build`/`search` frontend is **done in Python**. The **main remaining item is M3 — incremental `update`** (sidecars, tombstones, stable `file_idx`).
+**2026-08-09 update:** `dafsa_view_open` is now wired to Python ctypes (`Dafsa.load(readonly=True)` uses the zero-copy view; `Dafsa.stats()` and `dafsa_abi_version()` are also exposed). The library is lazy-loaded so `import indexer` works without `libdafsa.so`.
 **Naming (D10, decided 2026-08-06):** the DAFSA core / PoC is named **`dafsa`** (Deterministic Acyclic Finite State Automaton). The deployed binary **stays `fst-indexer`** for drop-in compatibility (`web-archive-mcp/server.py:602` hardcodes it; config points at it).
 **Scope:** Replaces the `fst` crate search backend in the palimpsest toolkit (`unified-history-mcp`, via `fst-indexer`) with the Carrasco–Forcada incremental minimal acyclic DFA in `dafsa.c`. **This repo (`jing-meta`) is the canonical home of the dafsa core**; the frontend here is **Python `ctypes` (no Rust toolchain)**. The Rust and standalone-C frontends below are retained as historical reference (D13).
 

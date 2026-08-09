@@ -9,6 +9,15 @@ from pathlib import Path
 
 import pytest
 
+# The DAFSA C lib is now lazy-loaded (import indexer doesn't fail), but actual
+# operations need libdafsa.so.  Probe early so the entire module skips cleanly
+# when the shared library is not built (e.g. in CI without a C toolchain).
+try:
+    from indexer.dafsa import _get_lib
+    _get_lib()  # raises RuntimeError if libdafsa.so is missing or ABI-mismatched
+except (RuntimeError, AttributeError, OSError) as e:
+    pytest.skip(f"libdafsa.so not available: {e}", allow_module_level=True)
+
 from indexer import build, update, open_index
 from indexer import _read_sidecar, _write_sidecar
 

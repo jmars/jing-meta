@@ -149,8 +149,10 @@ def validate_and_name(
         if rel is None and use_local_llm:
             rel = _local_llm_relation(a, b)
 
+        # Never fabricate a relation: if no tier (rules / shared-token / LLM)
+        # could name it, drop the candidate rather than inventing "related_to".
         if rel is None:
-            rel = "related_to"  # safe default
+            continue
 
         out.append({"from": a, "to": b, "relationType": rel, "confidence": round(sim, 3)})
     return out

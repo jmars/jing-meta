@@ -91,6 +91,13 @@ void dafsa_free(dafsa *d)
     free(d);
 }
 
+/* ─── ABI version probe ──────────────────────────────────────────────────── */
+
+uint32_t dafsa_abi_version(void)
+{
+    return DAFSA_ABI_VERSION;
+}
+
 /* ─── Statistics ───────────────────────────────────────────────────────── */
 
 void dafsa_stats(const dafsa *d, dafsa_stats_out *out)

@@ -69,6 +69,11 @@ typedef struct {
 
 void dafsa_stats(const dafsa *d, dafsa_stats_out *out);
 
+/* ─── ABI version probe ─────────────────────────────────────────────── */
+
+#define DAFSA_ABI_VERSION 1
+uint32_t dafsa_abi_version(void);
+
 /* ─── Debug ────────────────────────────────────────────────────────── */
 
 void dafsa_dot(const dafsa *d, FILE *f);

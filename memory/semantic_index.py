@@ -17,33 +17,14 @@ Design goals:
 import json
 import os
 import re
-import threading
 from pathlib import Path
 
 import numpy as np
 
-EMBED_MODEL = os.environ.get("SEMANTIC_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+from jing_meta import embed as _embed
+
 _SIM_THRESHOLD = float(os.environ.get("SEMANTIC_LOOKUP_THRESHOLD", "0.50"))
 _TOP_N = int(os.environ.get("SEMANTIC_LOOKUP_TOP", "10"))
-
-_embedder = None
-_embed_lock = threading.Lock()
-
-
-def _get_embedder():
-    """Lazily init the ONNX embedder (model downloaded once, then local)."""
-    global _embedder
-    if _embedder is None:
-        from fastembed import TextEmbedding
-
-        _embedder = TextEmbedding(model_name=EMBED_MODEL)
-    return _embedder
-
-
-def _entity_text(e: dict) -> str:
-    """Text to embed for an entity: name + top observations."""
-    obs = e.get("observations", []) or []
-    return e.get("name", "") + ". " + " ".join(str(o) for o in obs[:4])
 
 
 # ---------------------------------------------------------------------------
@@ -80,8 +61,8 @@ def build_index(conn, db_path: str) -> tuple[Path, Path]:
         e["observations"] = [o["content"] for o in obs]
 
     vecs = np.array(
-        [np.array(v, dtype="float32") for v in _get_embedder().embed(
-            [_entity_text(e) for e in entities], batch_size=64
+        [np.array(v, dtype="float32") for v in _embed._get_embedder().embed(
+            [_embed._entity_text(e) for e in entities], batch_size=64
         )],
         dtype="float32",
     )
@@ -120,7 +101,7 @@ def semantic_search(query: str, db_path: str, top_n: int = _TOP_N) -> list[dict]
 
     try:
         qvec = np.array(
-            next(_get_embedder().embed([query])), dtype="float32"
+            next(_embed._get_embedder().embed([query])), dtype="float32"
         )
     except Exception:
         return []
