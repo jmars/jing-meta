@@ -140,8 +140,9 @@ _Source: advisor review of the full repo (~9,500 LOC), 2026-08-09._
 - **`dafsa_load_impl` aborts on OOM** (`dafsa_persist.c:409-412`). A corrupt
   `index.fst` with one state claiming huge `ntrans` kills the process. Per-state
   `ntrans` is uncapped; only total `n_states` has a hard cap.
-- **`dafsa_stats` casts away `const` to write the lazy cache** (`dafsa.c:103-104`).
-  Latent data race if ever called from two threads on a shared read-only handle.
+- **`dafsa_stats` no longer casts away `const`** (lazy-stats cache removed in
+  97c1852).  The function computes fresh on every call (one BFS) and is now
+  const-correct — safe for concurrent reads on a shared read-only DAFSA handle.
 - **Implicit schema contract**: `dreamer/dreamer.py:load_graph_sqlite` +
   `save_graph_sqlite` talk directly to the memory DB tables; no shared schema
   definition between dreamer and `memory/server.py:_init_schema`.

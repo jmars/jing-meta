@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .venv/
+.py-site/
 
 # C DAFSA build artifact (build from indexer/dafsa/dafsa.c)
 indexer/dafsa/libdafsa.so

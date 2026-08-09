@@ -6,6 +6,11 @@ that adds timestamps, graph traversal, fuzzy search, and temporal queries.
 Storage:
   SQLite  at MEMORY_DB_PATH / jing_meta.config.memory_db() — primary store
 """
+
+# Concurrency: under mcp 1.23 (stdio transport), all tool handlers run
+# serially on the main event-loop thread.  See jing_meta/mcp_base.py for the
+# full model and the implications of upgrading to mcp ≥2.
+
 import os
 import re
 import sqlite3

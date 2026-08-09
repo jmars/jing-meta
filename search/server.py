@@ -18,6 +18,10 @@ Tools:
   search_log(query, level, ...)       — search vibe runtime log
 """
 
+# Concurrency: under mcp 1.23 (stdio transport), all tool handlers run
+# serially on the main event-loop thread.  See jing_meta/mcp_base.py for the
+# full model and the implications of upgrading to mcp ≥2.
+
 import json
 import os
 import re
@@ -618,9 +622,12 @@ def search(
                         signal.signal(signal.SIGALRM, _regex_alarm_handler)
                         signal.alarm(_SLOW_SCAN_TIMEOUT)
                     except ValueError:
-                        # signal.signal() only works from the main thread; MCP
-                        # handlers can run on worker threads — fall back to no
-                        # timeout in that case rather than crashing the search.
+                        # signal.signal() only works from the main thread.
+                        # Under mcp 1.23 (stdio) handlers run on the main
+                        # event-loop thread, so this path is never taken;
+                        # under mcp ≥2 handlers run in a thread pool and
+                        # this fallback avoids crashing the search there.
+                        # See jing_meta/mcp_base.py for the concurrency model.
                         _has_sigalrm = False
                 try:
                     for line_no, line in enumerate(lines, 1):
