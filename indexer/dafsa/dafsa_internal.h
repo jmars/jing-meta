@@ -101,13 +101,6 @@ struct dafsa {
     /* Orphan-state free-list. Freed slots are chained via their `sig` field
      * (reused as a `next` pointer).  0 = empty list. */
     unsigned int   free_head;
-
-    /* Lazy stats cache: BFS is expensive on large indexes; recompute only
-     * when invalidated by mutation or load.  0 = needs recompute. */
-    uint32_t       stats_reachable;
-    uint32_t       stats_final;
-    uint32_t       stats_trans;
-    int            stats_valid;
 };
 
 /* Zero-copy search-only view: mmaps the on-disk PDWG v3 file and indexes

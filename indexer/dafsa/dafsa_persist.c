@@ -362,7 +362,6 @@ dafsa *dafsa_load_impl(const char *path, int mutable)
     }
     d->nstates = n_states + 1;
     d->initial = 1;
-    d->stats_valid = 0;   /* stats will be recomputed on first dafsa_stats */
 
     /* zero sink + live states */
     memset(d->states, 0, (size_t)(n_states + 1) * sizeof(State));

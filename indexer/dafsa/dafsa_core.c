@@ -388,7 +388,6 @@ int dafsa_add_n(dafsa *d, const unsigned char *key, size_t len)
             return 0;
         }
         d->states[d->initial].is_final = 1;
-        d->stats_valid = 0;
         replace_or_register(d, d->initial, 0);
 #ifdef DAFSA_DEBUG
         dafsa_check_invariants(d);
@@ -478,7 +477,6 @@ int dafsa_add_n(dafsa *d, const unsigned char *key, size_t len)
             /* re-fetch state via index -- current is an index, safe */
             trans_add(&d->states[current], c, next);
             d->states[current].sig = 0;  /* dirty */
-            d->stats_valid = 0;
 
             incoming_add(d, current, c, next);  /* MAY REALLOC inodes */
 
@@ -494,7 +492,6 @@ int dafsa_add_n(dafsa *d, const unsigned char *key, size_t len)
     /* --- Phase 3: Mark final and confluence --- */
     d->states[current].is_final = 1;
     d->states[current].sig = 0;  /* dirty */
-    d->stats_valid = 0;
 
     /* Stale register entries are validated at lookup in replace_or_register
      * (live state + matching signature), so no full register rebuild is needed
@@ -526,7 +523,6 @@ int dafsa_delete_n(dafsa *d, const unsigned char *key, size_t len)
         }
         d->states[d->initial].is_final = 0;
         d->states[d->initial].sig = 0;
-        d->stats_valid = 0;
         replace_or_register(d, d->initial, 0);
 #ifdef DAFSA_DEBUG
         dafsa_check_invariants(d);
@@ -612,7 +608,6 @@ int dafsa_delete_n(dafsa *d, const unsigned char *key, size_t len)
     /* --- Phase 3: Unmark final and confluence --- */
     d->states[current].is_final = 0;
     d->states[current].sig = 0;
-    d->stats_valid = 0;
 
     /* Stale register entries (from merged-away/dead states) are validated at
      * lookup in replace_or_register, so no full register rebuild is needed. */
