@@ -12,7 +12,8 @@ Tools:
   list_domain(domain, date_from, ...) — list available files with metadata
   read(domain, id, max_entries, ...)  — read entries from a file
   summary(domain, id)                 — get AI-generated summary
-  rebuild(domain)                     — rebuild FST indexes
+  update(domain)                      — incrementally update FST indexes (changed/new/removed only)
+  rebuild(domain)                     — rebuild FST indexes from scratch
   search_history(query, ...)          — search vibe command history
   search_log(query, level, ...)       — search vibe runtime log
 """
@@ -870,6 +871,34 @@ def rebuild(domain: str = "all") -> str:
         results.append(f"  {d_name}: {'✓' if success else '✗'} {msg}")
 
     return "Rebuild results:\n" + "\n".join(results)
+
+
+@mcp.tool()
+def update(domain: str = "all") -> str:
+    """Incrementally update DAFSA indexes for configured domains.
+
+    Only re-indexes files that changed (by mtime+size), adds new files, and
+    tombstones removed files — without a full rebuild. First run falls back to
+    a full build.
+
+    Args:
+        domain: Domain to update, or "all" for all configured domains
+    """
+    cfg = _get_config()
+
+    if domain != "all" and domain not in cfg.domains:
+        valid = ", ".join(cfg.domains)
+        return f"Unknown domain '{domain}'. Valid: all, {valid if valid else '(no domains configured)'}"
+
+    domains_to_update = list(cfg.domains.keys()) if domain == "all" else [domain]
+
+    results: list[str] = []
+    for d_name in domains_to_update:
+        d_cfg = cfg.domains[d_name]
+        success, msg = update_index(d_cfg)
+        results.append(f"  {d_name}: {'✓' if success else '✗'} {msg}")
+
+    return "Update results:\n" + "\n".join(results)
 
 
 @mcp.tool()
