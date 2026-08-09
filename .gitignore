@@ -5,6 +5,10 @@ __pycache__/
 
 # C DAFSA build artifact (build from indexer/dafsa/dafsa.c)
 indexer/dafsa/libdafsa.so
+indexer/dafsa/_t
+indexer/dafsa/_td
+indexer/dafsa/*.o
+indexer/dafsa/dafsa.dot
 
 # Data / state (never commit personal memory)
 *.db
