@@ -15,3 +15,8 @@ indexer/dafsa/dafsa.dot
 *.db-*
 *.npy
 .jing/
+
+# Lint / typecheck caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
