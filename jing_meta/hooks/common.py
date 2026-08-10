@@ -98,6 +98,19 @@ def read_agent_profile(transcript_path: str | Path) -> str | None:
         return None
 
 
+def is_top_level_agent(transcript_path: str | Path) -> bool:
+    """Return True if this is a TOP-LEVEL agent transcript (not a subagent).
+
+    Vibe stores subagent sessions under an ``agents/`` subdirectory of their
+    parent session (e.g. ``<session>/agents/<subagent>_<ts>/messages.jsonl``),
+    while top-level agent transcripts live directly at the session root
+    (``<session>/messages.jsonl``). We key off that path structure rather than
+    a fixed agent-name allowlist so the rule covers ANY top-level agent (admin,
+    orchestrator, plan, operator, ...) and stays future-proof.
+    """
+    return "agents" not in Path(transcript_path).parts
+
+
 def last_user_index(messages: list[dict]) -> int:
     """Return the index of the last user message, or -1."""
     last = -1
