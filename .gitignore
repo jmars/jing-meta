@@ -7,6 +7,7 @@ __pycache__/
 # C DAFSA build artifacts (build from indexer/dafsa/dafsa.c)
 indexer/dafsa/libdafsa.so
 indexer/dafsa/libdafsa-musl.so
+indexer/dafsa/dafsa-cli.aarch64.elf
 indexer/dafsa/_t
 indexer/dafsa/_t.*
 indexer/dafsa/_td

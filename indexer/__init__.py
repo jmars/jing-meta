@@ -13,9 +13,11 @@ Stored in the DAFSA; `prefix_enum(word)` returns the 8-byte payload
 import contextlib
 import fcntl
 import fnmatch
+import functools
 import json
 import os
 import re
+import subprocess
 import zlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -34,6 +36,10 @@ logger = get_logger(__name__)
 # so we use \w (Unicode word chars) minus the _ and - exceptions to mirror it.
 # ---------------------------------------------------------------------------
 _TOKEN_SPLIT = re.compile(r"[^\w\-]+", re.UNICODE)
+
+# Batch size for DAFSA build adds (keys per single daemon RPC).  Stays under
+# the daemon's per-request key cap (MAX_BATCH_KEYS) and ~64KB line budget.
+_ADD_BATCH = 2048
 
 
 def tokenize(text: str) -> list[str]:
@@ -339,10 +345,13 @@ def _build_locked(dir: Path, pattern: str, extractor: str, output: Path) -> None
         for entry_idx, word in pairs:
             keys.add(_composite_key(word, file_idx, entry_idx))
 
-    # Build DAFSA in sorted key order (required for minimality).
+    # Build DAFSA in sorted key order (required for minimality).  Batch the
+    # adds into single daemon RPCs (add_many) so we don't pay the ~20us IPC
+    # round-trip per key — order is preserved within each batch.
+    sorted_keys = sorted(keys)
     with Dafsa.create() as d:
-        for key in sorted(keys):
-            d.add(key)
+        for start in range(0, len(sorted_keys), _ADD_BATCH):
+            d.add_many(sorted_keys[start:start + _ADD_BATCH])
 
         output.mkdir(parents=True, exist_ok=True)
         fst_path = output / "index.fst"
@@ -366,10 +375,91 @@ def build(dir: Path, pattern: str, extractor: str, output: Path) -> None:
 
     Acquires the exclusive index.lock so a concurrent update()/compact() cannot
     race with the build.
+
+    For the ``jsonl`` extractor, dispatches to the C ``dafsa-cli build``
+    subcommand for a one-shot in-C build (no per-key Python roundtrip).
+    Falls back to the Python path if the C binary lacks the ``build``
+    subcommand or is unavailable.
     """
     output = Path(output)
-    with _index_lock(output):
-        _build_locked(dir, pattern, extractor, output)
+    if extractor == "jsonl" and _c_build_available():
+        _build_via_c(dir, pattern, output)
+    else:
+        with _index_lock(output):
+            _build_locked(dir, pattern, extractor, output)
+
+
+# ── C-build helper ─────────────────────────────────────────────────────────
+
+@functools.lru_cache(maxsize=1)
+def _c_build_available() -> bool:
+    """Return True if ``dafsa-cli build --help`` exits 0.
+
+    Cached once on first call.  Falls back to False if the binary can't be
+    found or the subprocess call fails.
+    """
+    try:
+        cli = _resolve_cli()
+        cp = subprocess.run(
+            [cli, "build", "--help"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return cp.returncode == 0
+    except Exception:
+        return False
+
+
+def _build_via_c(dir: Path, pattern: str, output: Path) -> None:
+    """Run ``dafsa-cli build`` to build a JSONL DAFSA index entirely in C.
+
+    Raises RuntimeError on failure.  The C subprocess handles its own
+    ``index.lock`` flock, so we do NOT acquire the Python-level lock here
+    (double-lock would deadlock).
+    """
+    cli = _resolve_cli()
+    cp = subprocess.run(
+        [cli, "build",
+         "--dir", str(dir.resolve()),
+         "--pattern", pattern,
+         "--output", str(output.resolve())],
+        capture_output=True, text=True, timeout=300,
+    )
+    if cp.returncode != 0:
+        stderr = cp.stderr.strip()
+        raise RuntimeError(
+            f"dafsa-cli build failed (exit {cp.returncode}): {stderr}"
+        )
+    # The C binary logs progress to stderr; surface it.
+    if cp.stderr:
+        for line in cp.stderr.strip().splitlines():
+            logger.info("dafsa-cli: %s", line)
+
+
+def _resolve_cli() -> str:
+    """Resolve the ``dafsa-cli`` binary path.
+
+    Order: ``$JING_DAFSA_CLI`` → in-tree ``indexer/dafsa/dafsa-cli`` →
+    ``shutil.which("dafsa-cli")``.
+    """
+    import shutil
+
+    env = os.environ.get("JING_DAFSA_CLI")
+    if env and Path(env).is_file():
+        return env
+
+    in_tree = Path(__file__).parent / "dafsa" / "dafsa-cli"
+    if in_tree.is_file():
+        return str(in_tree)
+
+    found = shutil.which("dafsa-cli")
+    if found:
+        return found
+
+    raise RuntimeError(
+        "dafsa-cli daemon binary not found. Build it with: "
+        "make -C indexer/dafsa daemon  (or set $JING_DAFSA_CLI). "
+        "See AGENTS.md."
+    )
 
 
 # ---------------------------------------------------------------------------

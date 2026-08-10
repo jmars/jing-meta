@@ -1,187 +1,280 @@
-"""Python ctypes frontend to the C DAFSA core.
+"""Python stdio-daemon frontend to the C DAFSA core.
 
-Loads the C DAFSA shared library (built from the sources in this directory) and
-exposes its API to Python: create/load/save, length-delimited add/lookup/delete,
-prefix enumeration (used for search), statistics, ABI version checking, a
-write-ahead log (WAL) for incremental persistence, and layered views that
-transparently merge a WAL overlay on top of a base FST.
+Spawns a long-lived ``dafsa-cli`` subprocess (a Cosmopolitan build, assimilated
+into a native statically-linked ELF) and talks JSON-lines over stdio.  The
+daemon is libc-agnostic — it runs under both host glibc CPython and the musl
+sandbox CPython with no dynamic linker dependency and no APE loader.
 
-The library is lazy-loaded on first use so that ``import indexer`` does not fail
-when ``libdafsa.so`` is missing — only DAFSA operations do.
+Exposes the same public API as the old ctypes backend: ``Dafsa`` (with
+create/load/free/add/delete/lookup/save/prefix_enum/stats/context-manager) and
+``DafsaWal`` (open/append_add/append_del/sync/size/replay_into/close/
+context-manager).  The API is byte-for-byte identical; consumers
+(``indexer/__init__.py``, ``search/indexer.py``) need no changes.
 
-Read-only paths (``Dafsa.load(path, readonly=True)``) use the zero-copy
-``dafsa_view_open`` mmap view, which is much lighter than materializing the
-entire state table.  When a ``wal_path`` is given alongside ``readonly=True``,
-``dafsa_view_open_layered`` is used instead, merging the WAL overlay (adds
-and deletes) on top of the base read-only view at the C level — no Python-side
-merge needed.
+A C crash kills only the daemon, not the Python MCP server.  The next request
+detects the dead process and spawns a fresh one transparently.
 
-Build the shared lib once with:
-    make  (see Makefile in this directory)
-or:
-    gcc -shared -fPIC -O2 -o libdafsa.so dafsa.c dafsa_state.c dafsa_core.c \\
-        dafsa_persist.c dafsa_view.c
+Build the daemon once with:
+    make -C indexer/dafsa daemon
 """
 
-import ctypes
-import ctypes.util
+import atexit
+import base64
+import json
 import os
+import shutil
+import subprocess
 import threading
 from pathlib import Path
-
-_LIB_PATH = Path(__file__).parent / "libdafsa.so"
-# Sandbox/musl build emits a DISTINCT filename so it never clobbers the host
-# glibc libdafsa.so (musl libc.so is loader/ABI-incompatible with host glibc).
-# _load() falls back to this so in-sandbox tests pick up the musl build
-# without ever overwriting the host artifact. See AGENTS.md.
-_MUSL_LIB_PATH = Path(__file__).parent / "libdafsa-musl.so"
 
 # Matches MAX_WORD_LEN in dafsa.c. Keys longer than this are rejected by the C
 # core (returns -1); guard here too so we never build an oversized buffer.
 _MAX_WORD_LEN = 4096
 
-# Must match DAFSA_ABI_VERSION in dafsa.h.  If a stale .so is present, the
-# version probe catches the mismatch before any calls are made.
+# Must match DAFSA_ABI_VERSION in dafsa.h.
 _ABI_VERSION = 1
 
-# Enumerate callback: return 0 to continue, non-zero to stop early.
-_ENUM_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t, ctypes.c_void_p)
 
-# WAL replay callback: op(ADD=1/DEL=2), key ptr, key_len, user data.
-_WAL_REPLAY_CB = ctypes.CFUNCTYPE(
-    ctypes.c_int, ctypes.c_uint8, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_uint32, ctypes.c_void_p,
-)
+# ── Exceptions ─────────────────────────────────────────────────────────────
+
+class DafsaDaemonCrashed(RuntimeError):
+    """Raised when the daemon subprocess dies mid-request."""
 
 
-class DafsaStatsOut(ctypes.Structure):
-    """ctypes mirror of the C dafsa_stats_out struct (dafsa.h:62-68)."""
-    _fields_ = [
-        ("n_states_total", ctypes.c_uint32),
-        ("n_states_reachable", ctypes.c_uint32),
-        ("n_final", ctypes.c_uint32),
-        ("n_trans", ctypes.c_uint32),
-        ("register_probes", ctypes.c_uint64),
-    ]
+def _raise_dafsa_error(err: str, code: str) -> None:
+    """Map a daemon error code to the right Python exception type."""
+    if code in ("ELOAD",):
+        raise FileNotFoundError(err)
+    if code in ("EOOM", "EFULL"):
+        raise MemoryError(err)
+    if code in ("EOPEN",):
+        raise OSError(err)
+    # EBADH, EBADOP, EBADREQ, EPARSE, EENUM, EREPLAY → RuntimeError
+    raise RuntimeError(err)
 
 
-def _load() -> ctypes.CDLL:
-    """Find and load the DAFSA shared library, declare ctypes signatures, verify ABI.
+# ── Daemon singleton ───────────────────────────────────────────────────────
 
-    Resolution order:
-      1. ``$JING_DAFSA_SO`` (explicit absolute path override)
-      2. ``indexer/dafsa/libdafsa.so`` — the host (glibc) build
-      3. ``indexer/dafsa/libdafsa-musl.so`` — the sandbox/musl build (distinct
-         filename so a musl build can never clobber the host artifact)
-      4. ``ctypes.util.find_library("dafsa")``
+class _Daemon:
+    """Long-lived subprocess wrapper around ``dafsa-cli``.
 
-    Raises RuntimeError if the library is not found or the ABI version
-    mismatches.
+    Singleton — one daemon per process.  Lazily spawned on first request.
+    All requests are serialised through a threading.Lock; the daemon is
+    single-threaded internally.
     """
-    path = os.environ.get("JING_DAFSA_SO")
-    if not path or not Path(path).exists():
-        path = _LIB_PATH if _LIB_PATH.exists() else (
-            _MUSL_LIB_PATH if _MUSL_LIB_PATH.exists() else ctypes.util.find_library("dafsa")
-        )
-    if not path:
+
+    _instance: "_Daemon | None" = None
+    _lock: threading.Lock = threading.Lock()
+
+    @classmethod
+    def get(cls) -> "_Daemon":
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+
+    def __init__(self) -> None:
+        self._proc: subprocess.Popen | None = None
+        self._req_lock: threading.Lock = threading.Lock()
+        self._next_id: int = 0
+        self._spawn()
+        atexit.register(self.shutdown)
+
+    # ── binary discovery ──────────────────────────────────────────────
+
+    @staticmethod
+    def _find_binary() -> str:
+        """Resolve the daemon binary path.
+
+        Order: $JING_DAFSA_CLI → indexer/dafsa/dafsa-cli (in-tree) →
+        shutil.which("dafsa-cli").
+        """
+        env = os.environ.get("JING_DAFSA_CLI")
+        if env and Path(env).is_file():
+            return env
+
+        in_tree = Path(__file__).parent / "dafsa-cli"
+        if in_tree.is_file():
+            return str(in_tree)
+
+        found = shutil.which("dafsa-cli")
+        if found:
+            return found
+
         raise RuntimeError(
-            "DAFSA shared lib not found. Build the host lib in indexer/dafsa "
-            "with: make libdafsa.so  (or make musl for the in-sandbox "
-            "libdafsa-musl.so). See AGENTS.md — never build a musl lib as "
-            "libdafsa.so."
-        )
-    lib = ctypes.CDLL(str(path))
-
-    # ── ABI version probe (must happen first) ──
-    lib.dafsa_abi_version.argtypes = []
-    lib.dafsa_abi_version.restype = ctypes.c_uint32
-    abi = lib.dafsa_abi_version()
-    if abi != _ABI_VERSION:
-        raise RuntimeError(
-            f"libdafsa.so ABI mismatch: expected {_ABI_VERSION}, got {abi}; "
-            "rebuild it with 'make' in indexer/dafsa"
+            "dafsa-cli daemon binary not found. Build it with: "
+            "make -C indexer/dafsa daemon  (or set $JING_DAFSA_CLI). "
+            "See AGENTS.md."
         )
 
-    # ── Lifecycle ──
-    lib.dafsa_create.restype = ctypes.c_void_p
-    lib.dafsa_free.argtypes = [ctypes.c_void_p]
+    # ── spawn / shutdown ──────────────────────────────────────────────
 
-    # ── Persistence ──
-    lib.dafsa_load.argtypes = [ctypes.c_char_p]
-    lib.dafsa_load.restype = ctypes.c_void_p
-    lib.dafsa_save.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-    lib.dafsa_save.restype = ctypes.c_int
+    def _spawn(self) -> None:
+        """Launch the daemon subprocess and perform the handshake."""
+        path = self._find_binary()
+        self._proc = subprocess.Popen(
+            [path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        # Handshake: verify ABI + protocol version.
+        reply = self._send_recv("handshake")
+        if reply.get("abi") != _ABI_VERSION:
+            self._kill()
+            raise RuntimeError(
+                f"dafsa-cli ABI mismatch: expected {_ABI_VERSION}, "
+                f"got {reply.get('abi')}; rebuild with: "
+                "make -C indexer/dafsa daemon"
+            )
+        if reply.get("proto") != 1:
+            self._kill()
+            raise RuntimeError(
+                f"dafsa-cli protocol version mismatch: expected 1, "
+                f"got {reply.get('proto')}"
+            )
 
-    # ── Key ops (length-delimited) ──
-    lib.dafsa_add_n.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
-    lib.dafsa_add_n.restype = ctypes.c_int
-    lib.dafsa_lookup_n.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
-    lib.dafsa_lookup_n.restype = ctypes.c_int
-    lib.dafsa_delete_n.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
-    lib.dafsa_delete_n.restype = ctypes.c_int
+    def _kill(self) -> None:
+        """Forcibly terminate the daemon (best-effort)."""
+        if self._proc is not None:
+            try:
+                self._proc.stdin.close()
+                self._proc.stdout.close()
+                self._proc.stderr.close()
+            except OSError:
+                pass
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    self._proc.kill()
+                    self._proc.wait(timeout=2)
+                except OSError:
+                    pass
+            self._proc = None
 
-    # ── Prefix enumeration ──
-    lib.dafsa_prefix_enum.argtypes = [
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, _ENUM_CB, ctypes.c_void_p,
-    ]
-    lib.dafsa_prefix_enum.restype = ctypes.c_long
+    def shutdown(self) -> None:
+        """Graceful shutdown: send ``shutdown`` op, wait, force-kill backstop."""
+        if self._proc is None:
+            return
+        try:
+            self._proc.stdin.write(
+                json.dumps({"id": 0xFFFFFFFF, "op": "shutdown"}) + "\n"
+            )
+            self._proc.stdin.flush()
+        except OSError:
+            pass
+        try:
+            self._proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._kill()
+        self._proc = None
 
-    # ── Zero-copy search-only view (M4) ──
-    lib.dafsa_view_open.argtypes = [ctypes.c_char_p]
-    lib.dafsa_view_open.restype = ctypes.c_void_p
-    lib.dafsa_view_close.argtypes = [ctypes.c_void_p]
-    lib.dafsa_view_lookup_n.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
-    lib.dafsa_view_lookup_n.restype = ctypes.c_int
-    lib.dafsa_view_prefix_enum.argtypes = [
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, _ENUM_CB, ctypes.c_void_p,
-    ]
-    lib.dafsa_view_prefix_enum.restype = ctypes.c_long
+    # ── request / response ────────────────────────────────────────────
 
-    # ── Write-ahead log (WAL) ──
-    lib.dafsa_wal_open.argtypes = [ctypes.c_char_p]
-    lib.dafsa_wal_open.restype = ctypes.c_void_p
-    lib.dafsa_wal_open_rw.argtypes = [ctypes.c_char_p]
-    lib.dafsa_wal_open_rw.restype = ctypes.c_void_p
-    lib.dafsa_wal_open_ro.argtypes = [ctypes.c_char_p]
-    lib.dafsa_wal_open_ro.restype = ctypes.c_void_p
-    lib.dafsa_wal_append_add.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
-    lib.dafsa_wal_append_add.restype = ctypes.c_int
-    lib.dafsa_wal_append_del.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
-    lib.dafsa_wal_append_del.restype = ctypes.c_int
-    lib.dafsa_wal_sync.argtypes = [ctypes.c_void_p]
-    lib.dafsa_wal_sync.restype = ctypes.c_int
-    lib.dafsa_wal_size.argtypes = [ctypes.c_void_p]
-    lib.dafsa_wal_size.restype = ctypes.c_uint64
-    lib.dafsa_wal_replay.argtypes = [ctypes.c_void_p, _WAL_REPLAY_CB, ctypes.c_void_p]
-    lib.dafsa_wal_replay.restype = ctypes.c_int
-    lib.dafsa_wal_close.argtypes = [ctypes.c_void_p]
+    def _send_recv(self, op: str, **kw) -> dict:
+        """Send a request and read the reply (called under ``_req_lock``).
 
-    lib.dafsa_view_open_layered.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
-    lib.dafsa_view_open_layered.restype = ctypes.c_void_p
+        Does NOT raise on ok:false — the caller interprets the reply.
+        """
+        assert self._proc is not None
+        self._next_id += 1
+        req_id = self._next_id & 0xFFFFFFFF
+        payload = {"id": req_id, "op": op}
+        payload.update(kw)
+        line = json.dumps(payload, separators=(",", ":"),
+                          ensure_ascii=False)
 
-    # ── Statistics ──
-    lib.dafsa_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(DafsaStatsOut)]
-    lib.dafsa_stats.restype = None
+        try:
+            self._proc.stdin.write(line + "\n")
+            self._proc.stdin.flush()
+        except (BrokenPipeError, OSError) as e:
+            self._proc = None
+            raise DafsaDaemonCrashed(
+                f"Daemon crashed before sending request: {e}"
+            ) from e
 
-    return lib
+        try:
+            resp_line = self._proc.stdout.readline()
+        except Exception as e:
+            self._proc = None
+            raise DafsaDaemonCrashed(
+                f"Daemon crashed during read: {e}"
+            ) from e
+
+        if not resp_line:
+            self._proc = None
+            raise DafsaDaemonCrashed("Daemon closed stdout unexpectedly")
+
+        try:
+            reply = json.loads(resp_line)
+        except json.JSONDecodeError:
+            self._proc = None
+            raise DafsaDaemonCrashed(
+                f"Daemon sent invalid JSON: {resp_line[:200]}"
+            ) from None
+
+        if reply.get("id") != req_id:
+            self._proc = None
+            raise DafsaDaemonCrashed(
+                f"Daemon reply id mismatch: expected {req_id}, "
+                f"got {reply.get('id')}"
+            )
+
+        return reply
+
+    def request(self, op: str, **kw) -> dict:
+        """Send a request, read the reply, and raise on error.
+
+        Returns the parsed reply dict.  Raises ``DafsaDaemonCrashed`` if
+        the daemon dies; raises the appropriate Python exception (OSError,
+        FileNotFoundError, MemoryError, RuntimeError) on ok:false.
+
+        On crash, the daemon is marked dead; the *next* request spawns a
+        fresh one automatically.
+        """
+        with self._req_lock:
+            # Auto-restart: if the daemon died, spawn a fresh one.
+            if self._proc is None or self._proc.poll() is not None:
+                if self._proc is not None and self._proc.poll() is not None:
+                    # Consume the return code so it doesn't zombie.
+                    pass
+                self._spawn()
+
+            reply = self._send_recv(op, **kw)
+            if not reply.get("ok"):
+                _raise_dafsa_error(
+                    reply.get("err", "unknown error"),
+                    reply.get("code", ""),
+                )
+            return reply
 
 
-# Lazy-loaded: _load() is called on first use, not at import time.
-# This means ``import indexer`` does not fail when libdafsa.so is missing.
-_lib = None
-_lib_lock = threading.Lock()
+# ── Backward-compat shim for test skip probes ──────────────────────────────
+
+def _get_lib() -> _Daemon:
+    """Spawn and handshake the daemon (raises RuntimeError if the binary is
+    missing or the ABI mismatches).  Kept for backward compatibility so the
+    existing test skip probes (``_get_lib()`` in ``test_indexer.py``,
+    ``test_search_indexer.py``, ``test_wal.py``) work unchanged.
+    """
+    return _Daemon.get()
 
 
-def _get_lib() -> ctypes.CDLL:
-    global _lib
-    if _lib is None:
-        with _lib_lock:
-            if _lib is None:
-                _lib = _load()
-    return _lib
+# ── Helpers ────────────────────────────────────────────────────────────────
 
+def _b64(data: bytes) -> str:
+    """Base64-encode *data* (standard alphabet)."""
+    return base64.b64encode(data).decode("ascii")
+
+
+# ── Dafsa ──────────────────────────────────────────────────────────────────
 
 class Dafsa:
-    """Python wrapper around the opaque C DAFSA handle.
+    """Python wrapper around an opaque C DAFSA handle (held by the daemon).
 
     Handles may be either mutable (from ``create()`` or ``load(readonly=False)``)
     or a zero-copy search-only view (from ``load(readonly=True)``).  Views use
@@ -197,7 +290,8 @@ class Dafsa:
     @classmethod
     def create(cls) -> "Dafsa":
         """Create a new empty mutable DAFSA."""
-        h = _get_lib().dafsa_create()
+        reply = _Daemon.get().request("create")
+        h = reply["h"]
         if not h:
             raise MemoryError("dafsa_create returned NULL (OOM)")
         return cls(h)
@@ -214,32 +308,23 @@ class Dafsa:
         view via ``dafsa_view_open_layered``, merging the WAL overlay (adds
         and deletes) on top of the base view at the C level.
         """
-        lib = _get_lib()
+        kw = {"path": str(path)}
         if readonly:
+            kw["readonly"] = True
             if wal_path:
-                h = lib.dafsa_view_open_layered(str(path).encode(), str(wal_path).encode())
-                if not h:
-                    raise FileNotFoundError(f"could not open layered DAFSA view from {path} + {wal_path}")
+                kw["wal_path"] = str(wal_path)
+        try:
+            reply = _Daemon.get().request("load", **kw)
+        except FileNotFoundError:
+            if wal_path:
+                raise FileNotFoundError(
+                    f"could not open layered DAFSA view from {path} + {wal_path}"
+                )
+            elif readonly:
+                raise FileNotFoundError(f"could not open DAFSA view from {path}")
             else:
-                h = lib.dafsa_view_open(str(path).encode())
-                if not h:
-                    raise FileNotFoundError(f"could not open DAFSA view from {path}")
-            try:
-                return cls(h, is_view=True)
-            except Exception:
-                # Constructor failed — don't leak the C view handle.
-                lib.dafsa_view_close(h)
-                raise
-        else:
-            h = lib.dafsa_load(str(path).encode())
-            if not h:
                 raise FileNotFoundError(f"could not load DAFSA from {path}")
-            try:
-                return cls(h)
-            except Exception:
-                # Constructor failed — don't leak the C handle.
-                lib.dafsa_free(h)
-                raise
+        return cls(reply["h"], is_view=readonly)
 
     # ── Lifecycle ───────────────────────────────────────────────────────
 
@@ -247,11 +332,7 @@ class Dafsa:
         """Release the handle.  NULL-safe.  Uses the correct close for the
         handle type (``dafsa_view_close`` for views, ``dafsa_free`` otherwise)."""
         if self._h:
-            lib = _get_lib()
-            if self._is_view:
-                lib.dafsa_view_close(self._h)
-            else:
-                lib.dafsa_free(self._h)
+            _Daemon.get().request("free", h=self._h)
             self._h = 0
 
     # ── Mutation (mutable handles only) ─────────────────────────────────
@@ -263,8 +344,33 @@ class Dafsa:
             raise RuntimeError("Cannot mutate a read-only DafsaView")
         if len(key) > _MAX_WORD_LEN:
             return False
-        buf = ctypes.create_string_buffer(key)
-        return bool(_get_lib().dafsa_add_n(self._h, buf, len(key)))
+        return bool(_Daemon.get().request("add", h=self._h, key=_b64(key))["rc"])
+
+    def add_many(self, keys: list[bytes]) -> int:
+        """Add *keys* to the DAFSA in batched daemon RPCs.
+
+        Returns the number of keys newly added (duplicates are counted but not
+        returned).  Raises RuntimeError on a view handle.  Keys are sent in
+        chunks that fit within the daemon's per-request limits (MAX_BATCH_KEYS
+        and the line buffer), amortizing the IPC round-trip — much faster than
+        calling :meth:`add` in a loop for bulk index builds.
+        """
+        if self._is_view:
+            raise RuntimeError("Cannot mutate a read-only DafsaView")
+        items = [k for k in keys if len(k) <= _MAX_WORD_LEN]
+        if not items:
+            return 0
+        _daemon = _Daemon.get()
+        total_added = 0
+        # Chunk to stay under the daemon's per-request batch cap and line cap.
+        chunk = 2048
+        for start in range(0, len(items), chunk):
+            part = items[start:start + chunk]
+            reply = _daemon.request(
+                "batch_add", h=self._h, keys=[_b64(k) for k in part]
+            )
+            total_added += int(reply.get("added", 0))
+        return total_added
 
     def delete(self, key: bytes) -> bool:
         """Delete *key* from the DAFSA.  Returns ``True`` if deleted,
@@ -273,14 +379,14 @@ class Dafsa:
             raise RuntimeError("Cannot mutate a read-only DafsaView")
         if len(key) > _MAX_WORD_LEN:
             return False
-        buf = ctypes.create_string_buffer(key)
-        return bool(_get_lib().dafsa_delete_n(self._h, buf, len(key)))
+        return bool(_Daemon.get().request("delete", h=self._h, key=_b64(key))["rc"])
 
     def save(self, path: str) -> None:
         """Serialise the DAFSA to *path*.  Raises RuntimeError on a view handle."""
         if self._is_view:
             raise RuntimeError("Cannot save a read-only DafsaView")
-        if _get_lib().dafsa_save(self._h, str(path).encode()) != 0:
+        reply = _Daemon.get().request("save", h=self._h, path=str(path))
+        if reply["rc"] != 0:
             raise OSError(f"dafsa_save failed for {path}")
 
     # ── Search ──────────────────────────────────────────────────────────
@@ -289,31 +395,17 @@ class Dafsa:
         """Return ``True`` if *key* is present in the DAFSA."""
         if len(key) > _MAX_WORD_LEN:
             return False
-        buf = ctypes.create_string_buffer(key)
-        lib = _get_lib()
-        if self._is_view:
-            return bool(lib.dafsa_view_lookup_n(self._h, buf, len(key)))
-        else:
-            return bool(lib.dafsa_lookup_n(self._h, buf, len(key)))
+        return bool(_Daemon.get().request("lookup", h=self._h, key=_b64(key))["rc"])
 
     def prefix_enum(self, prefix: bytes) -> list[bytes]:
         """Enumerate all payloads whose key starts with *prefix* (W\\0 semantics)."""
-        results: list[bytes] = []
-
-        def cb(payload, payload_len, _user):
-            results.append(ctypes.string_at(payload, payload_len))
-            return 0  # 0 = continue enumerating (non-zero would stop early)
-
-        cb_fn = _ENUM_CB(cb)
-        buf = ctypes.create_string_buffer(prefix)
-        lib = _get_lib()
-        if self._is_view:
-            n = lib.dafsa_view_prefix_enum(self._h, buf, len(prefix), cb_fn, None)
-        else:
-            n = lib.dafsa_prefix_enum(self._h, buf, len(prefix), cb_fn, None)
+        reply = _Daemon.get().request(
+            "prefix_enum", h=self._h, prefix=_b64(prefix)
+        )
+        n = reply.get("n", 0)
         if n < 0:
             raise RuntimeError(f"prefix_enum failed (code {n})")
-        return results
+        return [base64.b64decode(p) for p in reply.get("payloads", [])]
 
     # ── Statistics ──────────────────────────────────────────────────────
 
@@ -325,15 +417,7 @@ class Dafsa:
         """
         if self._is_view:
             raise RuntimeError("stats not available on a DafsaView")
-        out = DafsaStatsOut()
-        _get_lib().dafsa_stats(self._h, ctypes.byref(out))
-        return {
-            "n_states_total": out.n_states_total,
-            "n_states_reachable": out.n_states_reachable,
-            "n_final": out.n_final,
-            "n_trans": out.n_trans,
-            "register_probes": out.register_probes,
-        }
+        return _Daemon.get().request("stats", h=self._h)["stats"]
 
     # ── Context manager ─────────────────────────────────────────────────
 
@@ -345,11 +429,13 @@ class Dafsa:
         return False
 
 
-class DafsaWal:
-    """Thin wrapper around the C write-ahead log (WAL) handle.
+# ── DafsaWal ───────────────────────────────────────────────────────────────
 
-    Mirrors the style of ``Dafsa``: holds an opaque C pointer, provides
-    factory/close/context-manager, and delegates to the C API via ctypes.
+class DafsaWal:
+    """Thin wrapper around the C write-ahead log (WAL) handle (held by the daemon).
+
+    Mirrors the style of ``Dafsa``: holds an opaque daemon handle id, provides
+    factory/close/context-manager, and delegates to the daemon via JSON-lines.
     """
 
     def __init__(self, handle: int):
@@ -358,29 +444,29 @@ class DafsaWal:
     @classmethod
     def open(cls, path: str) -> "DafsaWal":
         """Open or create the WAL at *path* (append-only log)."""
-        h = _get_lib().dafsa_wal_open(str(path).encode())
-        if not h:
-            raise OSError(f"dafsa_wal_open returned NULL for {path}")
-        return cls(h)
+        reply = _Daemon.get().request("wal_open", path=str(path))
+        return cls(reply["h"])
 
     def append_add(self, key: bytes) -> bool:
         """Append an ADD record. Returns True on success."""
-        buf = ctypes.create_string_buffer(key)
-        return _get_lib().dafsa_wal_append_add(self._h, buf, len(key)) == 0
+        return _Daemon.get().request(
+            "wal_append_add", h=self._h, key=_b64(key)
+        )["rc"] == 0
 
     def append_del(self, key: bytes) -> bool:
         """Append a DEL record. Returns True on success."""
-        buf = ctypes.create_string_buffer(key)
-        return _get_lib().dafsa_wal_append_del(self._h, buf, len(key)) == 0
+        return _Daemon.get().request(
+            "wal_append_del", h=self._h, key=_b64(key)
+        )["rc"] == 0
 
     def sync(self) -> None:
         """fflush + fsync the WAL file."""
-        if _get_lib().dafsa_wal_sync(self._h) != 0:
+        if _Daemon.get().request("wal_sync", h=self._h)["rc"] != 0:
             raise OSError("dafsa_wal_sync failed")
 
     def size(self) -> int:
         """Return the current WAL file size in bytes."""
-        return _get_lib().dafsa_wal_size(self._h)
+        return _Daemon.get().request("wal_size", h=self._h)["size"]
 
     def replay_into(self, dafsa: "Dafsa") -> int:
         """Replay all WAL records into *dafsa* (must be mutable).
@@ -390,32 +476,18 @@ class DafsaWal:
         Idempotent: already-present (add→0) or already-absent (delete→0) are
         silently skipped and do not count as failures.
         """
-        lib = _get_lib()
-        record_count = 0
-
-        @_WAL_REPLAY_CB
-        def cb(op: int, key_ptr, key_len: int, _user) -> int:
-            nonlocal record_count
-            key_buf = ctypes.create_string_buffer(ctypes.string_at(key_ptr, key_len))
-            if op == 1:
-                rc = lib.dafsa_add_n(dafsa._h, key_buf, key_len)
-            elif op == 2:
-                rc = lib.dafsa_delete_n(dafsa._h, key_buf, key_len)
-            else:
-                return -1  # unknown op → abort
-            if rc < 0:
-                return -1  # hard error → abort replay
-            record_count += 1
-            return 0  # continue (rc == 0 is idempotent duplicate, ok)
-
-        if lib.dafsa_wal_replay(self._h, cb, None) != 0:
+        try:
+            reply = _Daemon.get().request(
+                "wal_replay", wal=self._h, dafsa=dafsa._h
+            )
+            return reply["count"]
+        except RuntimeError:
             return -1
-        return record_count
 
     def close(self) -> None:
         """Close the WAL handle. NULL-safe."""
         if self._h:
-            _get_lib().dafsa_wal_close(self._h)
+            _Daemon.get().request("free", h=self._h)
             self._h = 0
 
     def __enter__(self):

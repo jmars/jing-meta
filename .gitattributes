@@ -1,0 +1,9 @@
+# Large binary files are stored with Git LFS.
+#
+# Vendored Cosmopolitan-built DAFSA CLI daemon+builder (indexer/dafsa/dafsa-cli),
+# assimilated into a native statically-linked x86-64 ELF.  Built with
+# `make -C indexer/dafsa daemon` (cosmocc + --assimilate).  Committed via LFS so
+# the indexer/search tools have a reproducible binary without re-running the
+# cosmocc/assimilate build.  Both the daemon (stdio JSON-lines) and the `build`
+# subcommand (one-shot C index build) live in this single binary.
+indexer/dafsa/dafsa-cli filter=lfs diff=lfs merge=lfs -text
