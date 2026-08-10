@@ -76,7 +76,7 @@ class RunStore:
 
         snapshot_db = run_dir / "graph.db.bak"
         # Byte-identical copy — never open the DB.
-        shutil.copy2(source_db, snapshot_db)
+        shutil.copyfile(source_db, snapshot_db)
 
         created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         manifest = RunManifest(

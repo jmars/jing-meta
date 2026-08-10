@@ -438,7 +438,7 @@ def apply(ctx: RunContext, prior: StageResult | None = None) -> StageResult:
     if ctx.apply:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         backup_path = str(ctx.source_db.with_suffix(".db.bak." + timestamp))
-        shutil.copy2(ctx.source_db, backup_path)
+        shutil.copyfile(ctx.source_db, backup_path)
         print(f"Backup saved to: {backup_path}")
 
         graph = apply_mutations(graph, plan.to_legacy_dict(), run_date=ctx.run_date)

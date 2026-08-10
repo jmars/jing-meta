@@ -110,7 +110,7 @@ def _delete_observations(conn: sqlite3.Connection, obs: list[dict]) -> int:
 def _backup_db(db: Path) -> Path:
     """Create a timestamped backup of the memory DB. Returns the backup path."""
     backup = Path(str(db) + f".bak.prearchive.{_now_micro()}")
-    shutil.copy2(db, backup)
+    shutil.copyfile(db, backup)
     return backup
 
 
