@@ -1,25 +1,34 @@
 """Context-bootstrap hook — force agents to gather context up front.
 
-Console script: ``jing-context-bootstrap``. Wired as a Vibe ``post_agent`` hook.
+Console script: ``jing-context-bootstrap``. Wired as Vibe ``pre_tool`` hooks (it
+is registered twice: once with ``match = "task"`` for the planner-dispatch gate,
+once with a regex covering the heavy work tools for the initial gate). Because it
+is a ``pre_tool`` hook it fires BEFORE the tool runs and can DENY the tool call
+itself, so the planner subagent is never dispatched and substantive work is never
+executed without the required context pass (unlike the old ``post_agent`` design,
+which could only inject a retry AFTER the damage was done).
 
 There are two gates:
 
 * INITIAL gate (ALL agents — top-level AND subagents): on the very first
-  assistant turn of a session, if the agent performs substantive work WITHOUT
-  first running a memory SEMANTIC search (``memory_search_semantic``), the hook
-  emits a ``post_agent`` deny so Vibe injects a retry forcing the context pass.
-  Memory semantic search is the MANDATORY gate; unified-history (prior-work)
-  search is an IDEAL ADDITION (recommended, not required). Pure-inspection
-  turns and later turns are never denied, so this fires only once, up front.
+  assistant turn of a session, if the agent tries to run a HEAVY work tool
+  (``bash``, ``write_file``, ``edit``, ``shell-sandbox_*``) WITHOUT having first
+  run the memory SEMANTIC search (``memory_search_semantic``) in the same turn,
+  the hook denies the tool call so it never executes. Memory semantic search is
+  the MANDATORY gate; unified-history (prior-work) search is an IDEAL ADDITION
+  (recommended, not required). Pure-inspection turns and later turns are never
+  denied, so this fires only once, up front.
 
 * PLANNER gate (TOP-LEVEL agents only, on ANY turn): before dispatching a
   planner subagent (consultant, advisor, or the offpeak advisor variant) via the
   ``task`` tool, the agent MUST first run the memory SEMANTIC search in the
   SAME turn, before the dispatch. Only top-level agents hold the ``task`` tool,
-  so subagents never hit this gate.
+  so subagents never hit this gate. The ``task`` tool call is denied (so the
+  planner never runs) unless the semantic search already happened this turn.
 
-``common.is_top_level_agent`` distinguishes the two: top-level transcripts live
-at the session root; subagent transcripts live under an ``agents/`` subdir.
+``common.is_top_level_agent`` distinguishes top-level vs subagent transcripts:
+top-level transcripts live at the session root; subagent transcripts live under
+an ``agents/`` subdir.
 """
 
 from __future__ import annotations
@@ -30,12 +39,6 @@ import sys
 from jing_meta.hooks import common
 from jing_meta.log import setup_logging
 
-# Two gates with different scopes:
-#  * INITIAL gate — ALL agents (top-level and subagents) on the first turn.
-#  * PLANNER gate — TOP-LEVEL agents only (identified via
-#    ``common.is_top_level_agent``: transcripts at the session root), on any
-#    turn, before dispatching a planner via the ``task`` tool.
-
 # Planner subagents: dispatching one of these via the ``task`` tool requires the
 # memory SEMANTIC search to have been run in the same turn, before the dispatch.
 # Includes the offpeak advisor variant.
@@ -44,12 +47,23 @@ PLANNER_AGENTS = {"consultant", "advisor", "advisor-offpeak"}
 # The ``task`` tool name used to dispatch subagents.
 TASK_TOOL = "task"
 
+# Heavy work tools gated by the INITIAL gate. These execute or mutate system
+# state, so they must be pre-tool-denied on the first substantive turn unless the
+# memory semantic search has already been run this turn. The planner gate is
+# handled separately (match = "task"); the rest are matched by this prefix/set.
+HEAVY_TOOLS = {
+    "bash", "write_file", "edit",
+}
+HEAVY_TOOL_PREFIXES = (
+    "shell-sandbox_",
+)
+
 # Context-read tools, split by requirement. Memory SEMANTIC search
-# (memory_search_semantic) is the MANDATORY gate: the orchestrator MUST run it
-# on its first substantive turn. Unified-history (prior-work) search is an IDEAL
-# ADDITION — strongly encouraged but NOT required for the gate to pass. A
-# history-only pass (or memory lexical read without semantic search) does not
-# satisfy the gate.
+# (memory_search_semantic) is the MANDATORY gate: the agent MUST run it on its
+# first substantive turn / before dispatching a planner. Unified-history
+# (prior-work) search is an IDEAL ADDITION — strongly encouraged but NOT
+# required for the gate to pass. A history-only pass (or memory lexical read
+# without semantic search) does not satisfy the gate.
 REQUIRED_MEMORY_TOOLS = {
     "memory_search_semantic",
 }
@@ -68,77 +82,24 @@ OTHER_MEMORY_READ_TOOLS = {
 MEMORY_READ_TOOLS = REQUIRED_MEMORY_TOOLS | OTHER_MEMORY_READ_TOOLS
 CONTEXT_READ_TOOLS = HISTORY_READ_TOOLS | MEMORY_READ_TOOLS
 
-# Pure inspection / bookkeeping — doing only these is not "substantive work"
-# and never triggers the requirement.
-INSPECTION_ONLY_TOOLS = {
-    "read_file", "grep", "todo", "skill", "ask_user_question",
-} | CONTEXT_READ_TOOLS
 
-# Tools that are ALWAYS substantive work — they execute or mutate system state.
-# Listed explicitly (and as a prefix) so shell/sandbox execution can never be
-# treated as inspection-only, even if INSPECTION_ONLY_TOOLS grows.
-SUBSTANTIVE_TOOLS = {
-    "bash", "write_file", "edit",
-}
-# Shell/sandbox family: any tool under these prefixes counts as substantive.
-SUBSTANTIVE_TOOL_PREFIXES = (
-    "shell-sandbox_shell",
-    "shell-sandbox_",
-)
-
-
-def _is_substantive(call: str) -> bool:
-    if call in SUBSTANTIVE_TOOLS:
+def _is_heavy(call: str) -> bool:
+    """True if *call* is a heavy work tool gated by the INITIAL gate."""
+    if call in HEAVY_TOOLS:
         return True
-    if any(call.startswith(p) for p in SUBSTANTIVE_TOOL_PREFIXES):
-        return True
-    # Anything that is not pure-inspection/bookkeeping is substantive.
-    return call not in INSPECTION_ONLY_TOOLS
+    return any(call.startswith(p) for p in HEAVY_TOOL_PREFIXES)
 
 
-def _ordered_tool_calls(turn: list[dict]) -> list[tuple[str, dict]]:
-    """Return ``(name, parsed_arguments)`` for the turn's tool calls, in order.
+def _semantic_seen_in_turn(turn: list[dict]) -> bool:
+    """True if the (already-executed part of the) current turn contains the
+    mandatory memory semantic search."""
+    return any(
+        tc.get("function", {}).get("name", "") in REQUIRED_MEMORY_TOOLS
+        for msg in turn
+        for tc in msg.get("tool_calls") or []
+    )
 
-    Arguments are parsed from the tool-call JSON string; unparseable args become
-    an empty dict. Mirrors ``common.tool_call_names`` ordering but keeps the
-    per-call arguments (needed to see which subagent a ``task`` call targets).
-    """
-    out: list[tuple[str, dict]] = []
-    for msg in turn:
-        for tc in msg.get("tool_calls") or []:
-            fn = tc.get("function") or {}
-            name = fn.get("name", "")
-            if not name:
-                continue
-            args: dict = {}
-            try:
-                parsed = json.loads(fn.get("arguments") or "{}")
-                if isinstance(parsed, dict):
-                    args = parsed
-            except (json.JSONDecodeError, TypeError):
-                args = {}
-            out.append((name, args))
-    return out
-
-
-def _dispatched_planner_without_semantic(turn: list[dict]) -> bool:
-    """True if the turn dispatches a planner via ``task`` before running
-    ``memory_search_semantic`` in the SAME turn.
-
-    Iterates the turn's tool calls in order: once ``memory_search_semantic`` is
-    seen it is satisfied for the rest of the turn; if a ``task`` call targeting a
-    planner agent is seen first (or before any semantic search), we flag a deny.
-    """
-    semantic_seen = False
-    for name, args in _ordered_tool_calls(turn):
-        if name == "memory_search_semantic":
-            semantic_seen = True
-        elif name == TASK_TOOL and args.get("agent") in PLANNER_AGENTS:
-            if not semantic_seen:
-                return True
-    return False
-
-# Direction to include in the injected retry message.
+# Direction returned for a denied HEAVY tool call (INITIAL gate).
 INSTRUCTION = (
     "You started substantive work without first running the mandatory memory "
     "semantic search. Stop and run the required context pass BEFORE "
@@ -158,11 +119,10 @@ INSTRUCTION = (
     "just perform the context pass and carry on."
 )
 
-# Direction to include in the injected retry when a planner is dispatched
-# without a preceding same-turn memory semantic search.
+# Direction returned for a denied ``task`` call (PLANNER gate).
 PLANNER_INSTRUCTION = (
-    "You dispatched a planner subagent (consultant/advisor) without first "
-    "running the mandatory memory semantic search. Stop and run the required "
+    "You attempted to dispatch a planner subagent (consultant/advisor) without "
+    "first running the mandatory memory semantic search. Run the required "
     "context pass BEFORE dispatching the planner:\n"
     "1. (REQUIRED) Search your memory knowledge graph with "
     "memory_search_semantic — the embedding-based semantic search that "
@@ -177,16 +137,24 @@ PLANNER_INSTRUCTION = (
 )
 
 
+def _deny(reason: str) -> int:
+    print(json.dumps({"decision": "deny", "reason": reason}))
+    return 0
+
+
 def main() -> int:
     setup_logging()
     payload = common.read_payload()
 
-    if payload.get("hook_event_name") != "post_agent":
+    if payload.get("hook_event_name") != "pre_tool":
         return 0
 
     transcript_path = payload.get("transcript_path")
     if not transcript_path:
         return 0
+
+    tool_name = payload.get("tool_name", "")
+    tool_input = payload.get("tool_input") or {}
 
     messages = common.read_session_messages(transcript_path)
     if not messages:
@@ -196,23 +164,29 @@ def main() -> int:
     if last_user < 0:
         return 0
 
-    # Current turn: everything after the last user message.
+    # Current turn = everything after the last user message, i.e. the
+    # already-executed tool calls in this turn (the in-flight tool being
+    # pre-tool-checked is NOT yet in the transcript).
     turn = common.current_turn(messages, last_user)
-    calls = common.tool_call_names(turn)
+    semantic_seen = _semantic_seen_in_turn(turn)
 
-    if not calls:
-        return 0  # no tools this turn — nothing to enforce
-
-    # Planner-dispatch gate: TOP-LEVEL agents only, on ANY turn. Only top-level
-    # agents hold the ``task`` tool, so the task->planner dispatch can only
-    # originate there. If a planner is dispatched before a same-turn memory
-    # semantic search, deny. Subagents do NOT get this gate.
-    if common.is_top_level_agent(transcript_path) and _dispatched_planner_without_semantic(turn):
-        print(json.dumps({"decision": "deny", "reason": PLANNER_INSTRUCTION}))
+    # ---- PLANNER gate: TOP-LEVEL agents only, on ANY turn -----------------
+    # Fires on the ``task`` tool (hooks.toml match = "task"). If the agent is
+    # about to dispatch a planner but has not run the semantic search earlier in
+    # this same turn, deny the task call so the planner is never spawned.
+    if tool_name == TASK_TOOL:
+        # Only top-level agents hold the task tool; guard defensively anyway.
+        if common.is_top_level_agent(transcript_path):
+            target = tool_input.get("agent")
+            if target in PLANNER_AGENTS and not semantic_seen:
+                return _deny(PLANNER_INSTRUCTION)
         return 0
 
-    # Initial context gate: applies to ALL agents (top-level and subagents) on
-    # the FIRST assistant turn of the session.
+    # ---- INITIAL gate: ALL agents, on the FIRST assistant turn only --------
+    # Fires on heavy work tools (bash / write_file / edit / shell-sandbox_*).
+    if not _is_heavy(tool_name):
+        return 0
+
     # Only enforce on the FIRST assistant turn of the session (no earlier
     # assistant tool calls exist before the current turn's user message).
     prior_assistant_tool_use = any(
@@ -222,15 +196,8 @@ def main() -> int:
     if prior_assistant_tool_use:
         return 0  # not the first turn — skip (avoid nagging)
 
-    # Memory SEMANTIC search is the mandatory gate. Unified-history is an ideal
-    # addition (encouraged) but does NOT affect whether the gate is satisfied.
-    gathered_memory_semantic = any(c in REQUIRED_MEMORY_TOOLS for c in calls)
-    if gathered_memory_semantic:
-        return 0  # already ran the required memory semantic search
-
-    did_substantive = any(_is_substantive(c) for c in calls)
-    if did_substantive:
-        print(json.dumps({"decision": "deny", "reason": INSTRUCTION}))
+    if not semantic_seen:
+        return _deny(INSTRUCTION)
     return 0
 
 

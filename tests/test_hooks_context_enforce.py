@@ -42,6 +42,17 @@ def _payload(transcript_path: Path) -> dict:
     return {"hook_event_name": "post_agent", "transcript_path": str(transcript_path)}
 
 
+def _pre_tool_payload(transcript_path: Path, tool_name: str, tool_input: dict | None = None) -> dict:
+    """Build a pre_tool hook payload. The transcript reflects state BEFORE the
+    tool executes (the in-flight tool is NOT in the transcript yet)."""
+    return {
+        "hook_event_name": "pre_tool",
+        "transcript_path": str(transcript_path),
+        "tool_name": tool_name,
+        "tool_input": tool_input or {},
+    }
+
+
 def _run(fn, payload: dict) -> str:
     """Run a hook main() with stdout captured (deterministic; avoids capsys
     interfering with setup_logging's force=True reconfig of the root logger)."""
@@ -84,71 +95,81 @@ def test_read_agent_profile(tmp_path):
 
 
 def test_context_denies_first_substantive_turn_without_reads(tmp_path):
-    # First turn: substantive work (bash) with no context reads -> deny.
-    msg, _ = _write_transcript(tmp_path, [_user("do the thing"), _assistant("bash")])
-    out = _run(context.main, _payload(msg))
+    # First turn: about to run bash with no context reads -> deny the tool call.
+    msg, _ = _write_transcript(tmp_path, [_user("do the thing")])
+    out = _run(context.main, _pre_tool_payload(msg, "bash"))
     decision = json.loads(out) if out.strip() else None
     assert decision is not None and decision["decision"] == "deny"
 
 
 def test_context_passes_when_memory_semantic_search_present(tmp_path):
-    # Memory SEMANTIC search satisfies the mandatory gate (history optional).
+    # Memory SEMANTIC search already ran this turn -> heavy tool allowed.
     msg, _ = _write_transcript(tmp_path, [
         _user("do the thing"),
         _assistant("memory_search_semantic"),
         _assistant("unified-history_search"),  # ideal addition, still fine
     ])
-    out = _run(context.main, _payload(msg))
+    out = _run(context.main, _pre_tool_payload(msg, "bash"))
     assert out.strip() == ""  # no deny
 
 
 def test_context_denies_when_only_history_search(tmp_path):
-    # Unified-history + substantive work but NO semantic search -> deny
-    # (semantic search is the mandatory gate; history alone does not satisfy it).
+    # Unified-history + heavy work but NO semantic search -> deny (semantic
+    # search is the mandatory gate; history alone does not satisfy it).
     msg, _ = _write_transcript(tmp_path, [
         _user("do the thing"),
         _assistant("unified-history_search"),
-        _assistant("bash"),
     ])
-    out = _run(context.main, _payload(msg))
+    out = _run(context.main, _pre_tool_payload(msg, "bash"))
     decision = json.loads(out) if out.strip() else None
     assert decision is not None and decision["decision"] == "deny"
 
 
 def test_context_denies_when_only_non_semantic_memory_read(tmp_path):
-    # A lexical memory read + substantive work but NO semantic search -> deny.
+    # A lexical memory read + heavy work but NO semantic search -> deny.
     msg, _ = _write_transcript(tmp_path, [
         _user("do the thing"),
         _assistant("memory_search_nodes"),
-        _assistant("bash"),
     ])
-    out = _run(context.main, _payload(msg))
+    out = _run(context.main, _pre_tool_payload(msg, "bash"))
     decision = json.loads(out) if out.strip() else None
     assert decision is not None and decision["decision"] == "deny"
 
 
 def test_context_denies_when_shell_sandbox_without_semantic_search(tmp_path):
-    # Shell/sandbox execution is substantive: it must trip the deny even when
-    # the turn otherwise looks like inspection. Semantic search still required.
+    # Shell/sandbox execution is heavy work: denied on the first turn unless a
+    # semantic search already ran. No prior tool calls -> deny.
     for tool in ("shell-sandbox_shell_run", "shell-sandbox_shell_job_start",
                  "shell-sandbox_shell_job_kill"):
-        msg, _ = _write_transcript(tmp_path, [
-            _user("do the thing"),
-            _assistant(tool),
-        ])
-        out = _run(context.main, _payload(msg))
+        msg, _ = _write_transcript(tmp_path, [_user("do the thing")])
+        out = _run(context.main, _pre_tool_payload(msg, tool))
         decision = json.loads(out) if out.strip() else None
         assert decision is not None and decision["decision"] == "deny", tool
 
 
 def test_context_shell_sandbox_passes_with_semantic_search(tmp_path):
-    # Shell sandbox + semantic search -> gate satisfied (no deny).
+    # Shell sandbox + semantic search earlier this turn -> gate satisfied.
     msg, _ = _write_transcript(tmp_path, [
         _user("do the thing"),
         _assistant("memory_search_semantic"),
-        _assistant("shell-sandbox_shell_run"),
     ])
-    out = _run(context.main, _payload(msg))
+    out = _run(context.main, _pre_tool_payload(msg, "shell-sandbox_shell_run"))
+    assert out.strip() == ""
+
+
+def test_context_denies_other_heavy_tools(tmp_path):
+    # write_file and edit are also heavy work gated on the first turn.
+    for tool in ("write_file", "edit"):
+        msg, _ = _write_transcript(tmp_path, [_user("do the thing")])
+        out = _run(context.main, _pre_tool_payload(msg, tool))
+        decision = json.loads(out) if out.strip() else None
+        assert decision is not None and decision["decision"] == "deny", tool
+
+
+def test_context_ignores_non_heavy_tools(tmp_path):
+    # A non-heavy tool (e.g. a memory read) is never gated by the initial gate.
+    msg, _ = _write_transcript(tmp_path, [_user("do the thing")])
+    out = _run(context.main, _pre_tool_payload(msg, "memory_search_nodes"))
     assert out.strip() == ""
 
 
@@ -158,52 +179,58 @@ def test_context_enforces_any_top_level_agent(tmp_path):
     for name in ("admin", "orchestrator", "plan", "operator", "coder"):
         msg_path = tmp_path / f"msg_{name}.jsonl"
         msg_path.write_text(
-            "\n".join(json.dumps(m, ensure_ascii=False)
-                      for m in [_user("do the thing"), _assistant("bash")]) + "\n",
+            json.dumps({"role": "user", "content": "do the thing"}) + "\n",
             encoding="utf-8")
         (tmp_path / f"meta_{name}.json").write_text(
             json.dumps({"agent_profile": {"name": name}}), encoding="utf-8")
-        out = _run(context.main, {
-            "hook_event_name": "post_agent", "transcript_path": str(msg_path)})
+        out = _run(context.main, _pre_tool_payload(msg_path, "bash"))
         decision = json.loads(out) if out.strip() else None
         assert decision is not None and decision["decision"] == "deny", name
 
 
 def test_context_initial_gate_enforces_subagents_too(tmp_path):
     # The INITIAL gate applies to ALL agents — including subagents. A subagent
-    # transcript (under an ``agents/`` dir) doing substantive work on its first
-    # turn without a semantic search is DENIED.
+    # transcript (under an ``agents/`` dir) about to run bash on its first turn
+    # without a semantic search is DENIED.
     agents_dir = tmp_path / "agents" / "coder_20260810_120000_abcd"
     agents_dir.mkdir(parents=True)
     msg_path = agents_dir / "messages.jsonl"
     msg_path.write_text(
-        "\n".join(json.dumps(m, ensure_ascii=False)
-                  for m in [_user("do the thing"), _assistant("bash")]) + "\n",
+        json.dumps({"role": "user", "content": "do the thing"}) + "\n",
         encoding="utf-8")
     (agents_dir / "meta.json").write_text(
         json.dumps({"agent_profile": {"name": "coder"}}), encoding="utf-8")
-    out = _run(context.main, _payload(msg_path))
+    out = _run(context.main, _pre_tool_payload(msg_path, "bash"))
     decision = json.loads(out) if out.strip() else None
     assert decision is not None and decision["decision"] == "deny"
 
 
 def test_context_initial_gate_subagent_passes_with_semantic(tmp_path):
-    # A subagent doing substantive work WITH a first-turn semantic search passes
-    # the initial gate (no deny).
+    # A subagent about to run bash WITH a first-turn semantic search passes.
     agents_dir = tmp_path / "agents" / "coder_20260810_120000_abcd"
     agents_dir.mkdir(parents=True)
     msg_path = agents_dir / "messages.jsonl"
     msg_path.write_text(
-        "\n".join(json.dumps(m, ensure_ascii=False)
-                  for m in [
-                      _user("do the thing"),
-                      _assistant("memory_search_semantic"),
-                      _assistant("bash"),
-                  ]) + "\n",
+        "\n".join(json.dumps(m, ensure_ascii=False) for m in [
+            _user("do the thing"),
+            _assistant("memory_search_semantic"),
+        ]) + "\n",
         encoding="utf-8")
     (agents_dir / "meta.json").write_text(
         json.dumps({"agent_profile": {"name": "coder"}}), encoding="utf-8")
-    out = _run(context.main, _payload(msg_path))
+    out = _run(context.main, _pre_tool_payload(msg_path, "bash"))
+    assert out.strip() == ""
+
+
+def test_context_skips_later_turns(tmp_path):
+    # After the first assistant turn has done tool calls, the initial gate no
+    # longer fires (no nagging on later turns).
+    msg, _ = _write_transcript(tmp_path, [
+        _user("earlier"),
+        _assistant("bash"),
+        _user("now again"),
+    ])
+    out = _run(context.main, _pre_tool_payload(msg, "bash"))
     assert out.strip() == ""
 
 
@@ -234,18 +261,18 @@ def _later_turn_transcript(messages: list[dict]) -> list[dict]:
 
 
 def test_planner_dispatch_denied_without_prior_semantic(tmp_path):
-    # Late-turn dispatch to a planner with NO semantic search in the turn -> deny,
-    # even though this is not the first assistant turn and not the orchestrator.
+    # Late-turn dispatch to a planner with NO semantic search in the turn -> the
+    # task call is denied, even though this is not the first assistant turn and
+    # not the orchestrator.
     for agent in ("consultant", "advisor", "advisor-offpeak"):
         msg_path = tmp_path / f"msg_{agent}.jsonl"
         msg_path.write_text(
             "\n".join(json.dumps(m, ensure_ascii=False)
-                      for m in _later_turn_transcript([_task(agent)])) + "\n",
+                      for m in _later_turn_transcript([])) + "\n",
             encoding="utf-8")
         (tmp_path / f"meta_{agent}.json").write_text(
             json.dumps({"agent_profile": {"name": "admin"}}), encoding="utf-8")
-        payload = {"hook_event_name": "post_agent", "transcript_path": str(msg_path)}
-        out = _run(context.main, payload)
+        out = _run(context.main, _pre_tool_payload(msg_path, "task", {"agent": agent}))
         decision = json.loads(out) if out.strip() else None
         assert decision is not None and decision["decision"] == "deny", agent
         assert "planner" in decision["reason"]
@@ -257,28 +284,26 @@ def test_planner_dispatch_passes_with_prior_semantic_same_turn(tmp_path):
     msg_path.write_text(
         "\n".join(json.dumps(m, ensure_ascii=False)
                   for m in _later_turn_transcript(
-                      [_assistant("memory_search_semantic"), _task("advisor")]))
+                      [_assistant("memory_search_semantic")]))
         + "\n",
         encoding="utf-8")
     (tmp_path / "meta.json").write_text(
         json.dumps({"agent_profile": {"name": "admin"}}), encoding="utf-8")
-    out = _run(context.main, _payload(msg_path))
+    out = _run(context.main, _pre_tool_payload(msg_path, "task", {"agent": "advisor"}))
     assert out.strip() == ""
 
 
-def test_planner_dispatch_passes_semantic_after_in_turn(tmp_path):
-    # Semantic search AFTER the dispatch in the same turn does NOT satisfy the
-    # "before" ordering requirement -> deny.
+def test_planner_dispatch_denied_semantic_not_yet_run(tmp_path):
+    # Semantic search NOT yet run in the turn (it would come after the dispatch,
+    # or not at all) -> the task call is denied.
     msg_path = tmp_path / "messages.jsonl"
     msg_path.write_text(
         "\n".join(json.dumps(m, ensure_ascii=False)
-                  for m in _later_turn_transcript(
-                      [_task("consultant"), _assistant("memory_search_semantic")]))
-        + "\n",
+                  for m in _later_turn_transcript([])) + "\n",
         encoding="utf-8")
     (tmp_path / "meta.json").write_text(
         json.dumps({"agent_profile": {"name": "admin"}}), encoding="utf-8")
-    out = _run(context.main, _payload(msg_path))
+    out = _run(context.main, _pre_tool_payload(msg_path, "task", {"agent": "consultant"}))
     decision = json.loads(out) if out.strip() else None
     assert decision is not None and decision["decision"] == "deny"
 
@@ -288,19 +313,18 @@ def test_planner_dispatch_passes_non_planner_agent(tmp_path):
     msg_path = tmp_path / "messages.jsonl"
     msg_path.write_text(
         "\n".join(json.dumps(m, ensure_ascii=False)
-                  for m in _later_turn_transcript([_task("coder")])) + "\n",
+                  for m in _later_turn_transcript([])) + "\n",
         encoding="utf-8")
     (tmp_path / "meta.json").write_text(
         json.dumps({"agent_profile": {"name": "admin"}}), encoding="utf-8")
-    out = _run(context.main, _payload(msg_path))
-    # Not first turn + not orchestrator -> no deny from the planner gate.
+    out = _run(context.main, _pre_tool_payload(msg_path, "task", {"agent": "coder"}))
     assert out.strip() == ""
 
 
 def test_planner_dispatch_on_first_turn_still_enforced(tmp_path):
     # Planner dispatch on the very first turn, no semantic search -> deny.
-    msg, _ = _write_transcript(tmp_path, [_user("do it"), _task("advisor")])
-    out = _run(context.main, _payload(msg))
+    msg, _ = _write_transcript(tmp_path, [_user("do it")])
+    out = _run(context.main, _pre_tool_payload(msg, "task", {"agent": "advisor"}))
     decision = json.loads(out) if out.strip() else None
     assert decision is not None and decision["decision"] == "deny"
     assert "planner" in decision["reason"]
@@ -308,16 +332,9 @@ def test_planner_dispatch_on_first_turn_still_enforced(tmp_path):
 
 def test_planner_dispatch_passes_missing_agent_arg(tmp_path):
     # A task call with no/invalid agent arg is not a planner dispatch -> no deny.
-    msg, _ = _write_transcript(tmp_path, [
-        _user("do it"),
-        _assistant("task", args="{}"),
-    ])
-    out = _run(context.main, _payload(msg))
-    # Not a planner dispatch, but IS a substantive first turn without semantic
-    # search -> the general first-turn gate denies it.
-    decision = json.loads(out) if out.strip() else None
-    assert decision is not None and decision["decision"] == "deny"
-    assert "planner" not in decision["reason"]
+    msg, _ = _write_transcript(tmp_path, [_user("do it")])
+    out = _run(context.main, _pre_tool_payload(msg, "task", {}))
+    assert out.strip() == ""
 
 
 def test_planner_gate_skips_subagent_transcripts(tmp_path):
@@ -331,11 +348,11 @@ def test_planner_gate_skips_subagent_transcripts(tmp_path):
     msg_path = agents_dir / "messages.jsonl"
     msg_path.write_text(
         "\n".join(json.dumps(m, ensure_ascii=False)
-                  for m in _later_turn_transcript([_task("advisor")])) + "\n",
+                  for m in _later_turn_transcript([])) + "\n",
         encoding="utf-8")
     (agents_dir / "meta.json").write_text(
         json.dumps({"agent_profile": {"name": "advisor"}}), encoding="utf-8")
-    out = _run(context.main, _payload(msg_path))
+    out = _run(context.main, _pre_tool_payload(msg_path, "task", {"agent": "advisor"}))
     assert out.strip() == ""  # planner gate not applied to subagents
 
 
