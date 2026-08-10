@@ -129,3 +129,41 @@ class TestBudget:
         # search_nodes still uses the default per-observation char cap (500).
         blocks = server.search_nodes("A", include_semantic=False)
         assert self._long_obs(blocks).endswith("…")
+
+    def _entity_obs(self, blocks, name: str) -> list[str]:
+        """Return the 'Observation: …' lines rendered for the named entity."""
+        texts = [b.text for b in blocks]
+        idx = texts.index(f"Name: {name}")
+        # Collect observation lines until the next separator ("---") or EOF.
+        obs = []
+        for t in texts[idx + 1:]:
+            if t == "---" or t.startswith("Name: ") or t.startswith("Window:"):
+                break
+            if t.startswith("Observation: "):
+                obs.append(t)
+        return obs
+
+    def test_recent_max_obs_per_entity(self, _db):
+        # recent bounds observations per entity; 'x' has 30 obs, cap is 5.
+        blocks = server.recent(hours=168, max_obs_per_entity=5)
+        assert len(self._entity_obs(blocks, "x")) == 5
+
+    def test_recent_limit_entities(self, _db):
+        # recent bounds the number of entities returned (most recently updated first).
+        blocks = server.recent(hours=168, limit=2)
+        out = _blocks_text(blocks)
+        # Only 2 entities rendered -> exactly 2 "Name:" lines.
+        assert out.count("Name:") == 2
+
+    def test_recent_hours_default_returns_current(self, _db):
+        # Fixture entities are created "now", so a small window still returns them;
+        # with a high limit all 5 entities are returned.
+        blocks = server.recent(hours=1, limit=100)
+        out = _blocks_text(blocks)
+        assert out.count("Name:") == 5
+
+    def test_recent_relations_capped(self, _db):
+        # recent bounds the number of relations rendered via max_relations.
+        blocks = server.recent(hours=168, max_relations=1)
+        out = _blocks_text(blocks)
+        assert out.count("Relation:") == 1

@@ -834,18 +834,32 @@ def traverse(start_node: str, depth: int = 1, max_obs_per_entity: int = 5) -> li
 
 
 @mcp.tool()
-def recent(hours: int = 24) -> list[TextContent]:
+def recent(
+    hours: int = 24,
+    limit: int = 20,
+    max_obs_per_entity: int = 5,
+    max_relations: int = 50,
+) -> list[TextContent]:
     """Return entities, relations, and observations created or updated in the last N hours.
 
     Time-scoped on observations: only observations whose own ``created_at`` falls
     within the window are returned for a recently-updated entity — not the entity's
     full observation history. This keeps the result proportional to recent activity
-    rather than to entity size.
+    rather than to entity size. Results are bounded by ``limit`` entities (most
+    recently updated first), at most ``max_obs_per_entity`` observations per entity,
+    and at most ``max_relations`` relations, so a single call cannot blow out the
+    context window.
 
     Args:
-        hours: Look-back window in hours (default 24, max 720)
+        hours:              Look-back window in hours (default 24, max 720).
+        limit:              Max number of entities to return (default 20).
+        max_obs_per_entity: Max observations to render per entity (default 5).
+        max_relations:      Max relations to render (default 50).
     """
     hours = max(1, min(hours, 720))
+    limit = max(1, limit)
+    max_obs_per_entity = max(1, max_obs_per_entity)
+    max_relations = max(1, max_relations)
     conn = _get_conn()
     cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -853,8 +867,8 @@ def recent(hours: int = 24) -> list[TextContent]:
     entities = []
     rows = conn.execute(
         "SELECT id, name, entity_type, created_at, updated_at FROM entities "
-        "WHERE datetime(updated_at) >= datetime(?) ORDER BY updated_at DESC",
-        (cutoff_iso,),
+        "WHERE datetime(updated_at) >= datetime(?) ORDER BY updated_at DESC LIMIT ?",
+        (cutoff_iso, limit),
     ).fetchall()
 
     # Fetch, in a single query, only the observations created within the window
@@ -875,7 +889,7 @@ def recent(hours: int = 24) -> list[TextContent]:
         entities.append({
             "name": row["name"],
             "entityType": row["entity_type"],
-            "observations": recent_obs_by_entity.get(row["id"], []),
+            "observations": recent_obs_by_entity.get(row["id"], [])[:max_obs_per_entity],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         })
@@ -883,8 +897,8 @@ def recent(hours: int = 24) -> list[TextContent]:
     relations = []
     for row in conn.execute(
         "SELECT from_entity, to_entity, relation_type, created_at FROM relations "
-        "WHERE datetime(created_at) >= datetime(?) ORDER BY created_at DESC",
-        (cutoff_iso,),
+        "WHERE datetime(created_at) >= datetime(?) ORDER BY created_at DESC LIMIT ?",
+        (cutoff_iso, max_relations),
     ):
         relations.append({
             "from": row["from_entity"],
