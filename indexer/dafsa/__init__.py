@@ -25,10 +25,16 @@ or:
 
 import ctypes
 import ctypes.util
+import os
 import threading
 from pathlib import Path
 
 _LIB_PATH = Path(__file__).parent / "libdafsa.so"
+# Sandbox/musl build emits a DISTINCT filename so it never clobbers the host
+# glibc libdafsa.so (musl libc.so is loader/ABI-incompatible with host glibc).
+# _load() falls back to this so in-sandbox tests pick up the musl build
+# without ever overwriting the host artifact. See AGENTS.md.
+_MUSL_LIB_PATH = Path(__file__).parent / "libdafsa-musl.so"
 
 # Matches MAX_WORD_LEN in dafsa.c. Keys longer than this are rejected by the C
 # core (returns -1); guard here too so we never build an oversized buffer.
@@ -59,16 +65,29 @@ class DafsaStatsOut(ctypes.Structure):
 
 
 def _load() -> ctypes.CDLL:
-    """Find and load libdafsa.so, declare all ctypes signatures, and verify ABI.
+    """Find and load the DAFSA shared library, declare ctypes signatures, verify ABI.
+
+    Resolution order:
+      1. ``$JING_DAFSA_SO`` (explicit absolute path override)
+      2. ``indexer/dafsa/libdafsa.so`` — the host (glibc) build
+      3. ``indexer/dafsa/libdafsa-musl.so`` — the sandbox/musl build (distinct
+         filename so a musl build can never clobber the host artifact)
+      4. ``ctypes.util.find_library("dafsa")``
 
     Raises RuntimeError if the library is not found or the ABI version
     mismatches.
     """
-    path = _LIB_PATH if _LIB_PATH.exists() else ctypes.util.find_library("dafsa")
+    path = os.environ.get("JING_DAFSA_SO")
+    if not path or not Path(path).exists():
+        path = _LIB_PATH if _LIB_PATH.exists() else (
+            _MUSL_LIB_PATH if _MUSL_LIB_PATH.exists() else ctypes.util.find_library("dafsa")
+        )
     if not path:
         raise RuntimeError(
-            "libdafsa.so not found. Build it in indexer/dafsa with: "
-            "make  (or see Makefile for the full gcc incantation)"
+            "DAFSA shared lib not found. Build the host lib in indexer/dafsa "
+            "with: make libdafsa.so  (or make musl for the in-sandbox "
+            "libdafsa-musl.so). See AGENTS.md — never build a musl lib as "
+            "libdafsa.so."
         )
     lib = ctypes.CDLL(str(path))
 
