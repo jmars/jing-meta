@@ -30,11 +30,11 @@ def _user(text: str = "hello") -> dict:
     return {"role": "user", "content": text}
 
 
-def _assistant(tool: str | None = None, content: str = "thinking...") -> dict:
+def _assistant(tool: str | None = None, content: str = "thinking...", args: str = "{}") -> dict:
     m = {"role": "assistant", "content": content}
     if tool:
         m["tool_calls"] = [{"id": "call_1", "type": "function",
-                            "function": {"name": tool, "arguments": "{}"}}]
+                            "function": {"name": tool, "arguments": args}}]
     return m
 
 
@@ -152,13 +152,191 @@ def test_context_shell_sandbox_passes_with_semantic_search(tmp_path):
     assert out.strip() == ""
 
 
-def test_context_passes_non_orchestrator(tmp_path):
-    msg_path = tmp_path / "messages.jsonl"
-    msg_path.write_text(json.dumps(_assistant("bash")) + "\n", encoding="utf-8")
-    (tmp_path / "meta.json").write_text(
+def test_context_enforces_any_top_level_agent(tmp_path):
+    # Any transcript at the session root is a top-level agent and IS enforced,
+    # regardless of profile name (not just orchestrator).
+    for name in ("admin", "orchestrator", "plan", "operator", "coder"):
+        msg_path = tmp_path / f"msg_{name}.jsonl"
+        msg_path.write_text(
+            "\n".join(json.dumps(m, ensure_ascii=False)
+                      for m in [_user("do the thing"), _assistant("bash")]) + "\n",
+            encoding="utf-8")
+        (tmp_path / f"meta_{name}.json").write_text(
+            json.dumps({"agent_profile": {"name": name}}), encoding="utf-8")
+        out = _run(context.main, {
+            "hook_event_name": "post_agent", "transcript_path": str(msg_path)})
+        decision = json.loads(out) if out.strip() else None
+        assert decision is not None and decision["decision"] == "deny", name
+
+
+def test_context_initial_gate_enforces_subagents_too(tmp_path):
+    # The INITIAL gate applies to ALL agents — including subagents. A subagent
+    # transcript (under an ``agents/`` dir) doing substantive work on its first
+    # turn without a semantic search is DENIED.
+    agents_dir = tmp_path / "agents" / "coder_20260810_120000_abcd"
+    agents_dir.mkdir(parents=True)
+    msg_path = agents_dir / "messages.jsonl"
+    msg_path.write_text(
+        "\n".join(json.dumps(m, ensure_ascii=False)
+                  for m in [_user("do the thing"), _assistant("bash")]) + "\n",
+        encoding="utf-8")
+    (agents_dir / "meta.json").write_text(
         json.dumps({"agent_profile": {"name": "coder"}}), encoding="utf-8")
     out = _run(context.main, _payload(msg_path))
-    assert out.strip() == ""  # coder not enforced
+    decision = json.loads(out) if out.strip() else None
+    assert decision is not None and decision["decision"] == "deny"
+
+
+def test_context_initial_gate_subagent_passes_with_semantic(tmp_path):
+    # A subagent doing substantive work WITH a first-turn semantic search passes
+    # the initial gate (no deny).
+    agents_dir = tmp_path / "agents" / "coder_20260810_120000_abcd"
+    agents_dir.mkdir(parents=True)
+    msg_path = agents_dir / "messages.jsonl"
+    msg_path.write_text(
+        "\n".join(json.dumps(m, ensure_ascii=False)
+                  for m in [
+                      _user("do the thing"),
+                      _assistant("memory_search_semantic"),
+                      _assistant("bash"),
+                  ]) + "\n",
+        encoding="utf-8")
+    (agents_dir / "meta.json").write_text(
+        json.dumps({"agent_profile": {"name": "coder"}}), encoding="utf-8")
+    out = _run(context.main, _payload(msg_path))
+    assert out.strip() == ""
+
+
+def test_common_is_top_level_agent(tmp_path):
+    top = tmp_path / "messages.jsonl"
+    assert common.is_top_level_agent(top) is True
+    sub = tmp_path / "agents" / "coder_x" / "messages.jsonl"
+    assert common.is_top_level_agent(sub) is False
+
+
+# ---------------------------------------------------------------------------
+# context-bootstrap — planner-dispatch gate (any top-level agent, any turn)
+# ---------------------------------------------------------------------------
+
+
+def _task(agent: str) -> dict:
+    return _assistant("task", args=json.dumps({"agent": agent, "task": "plan it"}))
+
+
+def _later_turn_transcript(messages: list[dict]) -> list[dict]:
+    """Prefix with an earlier completed turn so the turn under test is NOT the
+    first assistant turn (proves the planner gate fires regardless of turn)."""
+    return [
+        _user("earlier"),
+        _assistant("bash"),
+        _user("now dispatch a planner"),
+    ] + messages
+
+
+def test_planner_dispatch_denied_without_prior_semantic(tmp_path):
+    # Late-turn dispatch to a planner with NO semantic search in the turn -> deny,
+    # even though this is not the first assistant turn and not the orchestrator.
+    for agent in ("consultant", "advisor", "advisor-offpeak"):
+        msg_path = tmp_path / f"msg_{agent}.jsonl"
+        msg_path.write_text(
+            "\n".join(json.dumps(m, ensure_ascii=False)
+                      for m in _later_turn_transcript([_task(agent)])) + "\n",
+            encoding="utf-8")
+        (tmp_path / f"meta_{agent}.json").write_text(
+            json.dumps({"agent_profile": {"name": "admin"}}), encoding="utf-8")
+        payload = {"hook_event_name": "post_agent", "transcript_path": str(msg_path)}
+        out = _run(context.main, payload)
+        decision = json.loads(out) if out.strip() else None
+        assert decision is not None and decision["decision"] == "deny", agent
+        assert "planner" in decision["reason"]
+
+
+def test_planner_dispatch_passes_with_prior_semantic_same_turn(tmp_path):
+    # Semantic search BEFORE the task dispatch in the same turn -> passes.
+    msg_path = tmp_path / "messages.jsonl"
+    msg_path.write_text(
+        "\n".join(json.dumps(m, ensure_ascii=False)
+                  for m in _later_turn_transcript(
+                      [_assistant("memory_search_semantic"), _task("advisor")]))
+        + "\n",
+        encoding="utf-8")
+    (tmp_path / "meta.json").write_text(
+        json.dumps({"agent_profile": {"name": "admin"}}), encoding="utf-8")
+    out = _run(context.main, _payload(msg_path))
+    assert out.strip() == ""
+
+
+def test_planner_dispatch_passes_semantic_after_in_turn(tmp_path):
+    # Semantic search AFTER the dispatch in the same turn does NOT satisfy the
+    # "before" ordering requirement -> deny.
+    msg_path = tmp_path / "messages.jsonl"
+    msg_path.write_text(
+        "\n".join(json.dumps(m, ensure_ascii=False)
+                  for m in _later_turn_transcript(
+                      [_task("consultant"), _assistant("memory_search_semantic")]))
+        + "\n",
+        encoding="utf-8")
+    (tmp_path / "meta.json").write_text(
+        json.dumps({"agent_profile": {"name": "admin"}}), encoding="utf-8")
+    out = _run(context.main, _payload(msg_path))
+    decision = json.loads(out) if out.strip() else None
+    assert decision is not None and decision["decision"] == "deny"
+
+
+def test_planner_dispatch_passes_non_planner_agent(tmp_path):
+    # Dispatching a non-planner subagent (coder) does not trip the planner gate.
+    msg_path = tmp_path / "messages.jsonl"
+    msg_path.write_text(
+        "\n".join(json.dumps(m, ensure_ascii=False)
+                  for m in _later_turn_transcript([_task("coder")])) + "\n",
+        encoding="utf-8")
+    (tmp_path / "meta.json").write_text(
+        json.dumps({"agent_profile": {"name": "admin"}}), encoding="utf-8")
+    out = _run(context.main, _payload(msg_path))
+    # Not first turn + not orchestrator -> no deny from the planner gate.
+    assert out.strip() == ""
+
+
+def test_planner_dispatch_on_first_turn_still_enforced(tmp_path):
+    # Planner dispatch on the very first turn, no semantic search -> deny.
+    msg, _ = _write_transcript(tmp_path, [_user("do it"), _task("advisor")])
+    out = _run(context.main, _payload(msg))
+    decision = json.loads(out) if out.strip() else None
+    assert decision is not None and decision["decision"] == "deny"
+    assert "planner" in decision["reason"]
+
+
+def test_planner_dispatch_passes_missing_agent_arg(tmp_path):
+    # A task call with no/invalid agent arg is not a planner dispatch -> no deny.
+    msg, _ = _write_transcript(tmp_path, [
+        _user("do it"),
+        _assistant("task", args="{}"),
+    ])
+    out = _run(context.main, _payload(msg))
+    # Not a planner dispatch, but IS a substantive first turn without semantic
+    # search -> the general first-turn gate denies it.
+    decision = json.loads(out) if out.strip() else None
+    assert decision is not None and decision["decision"] == "deny"
+    assert "planner" not in decision["reason"]
+
+
+def test_planner_gate_skips_subagent_transcripts(tmp_path):
+    # The PLANNER gate is TOP-LEVEL only. A subagent transcript (under an
+    # ``agents/`` dir) dispatching a planner with no semantic search is NOT
+    # denied by the planner gate. (If it's the subagent's first substantive
+    # turn, it would still be caught by the INITIAL gate with INSTRUCTION — so
+    # use a later turn here to isolate the planner gate.)
+    agents_dir = tmp_path / "agents" / "advisor_20260810_120000_abcd"
+    agents_dir.mkdir(parents=True)
+    msg_path = agents_dir / "messages.jsonl"
+    msg_path.write_text(
+        "\n".join(json.dumps(m, ensure_ascii=False)
+                  for m in _later_turn_transcript([_task("advisor")])) + "\n",
+        encoding="utf-8")
+    (agents_dir / "meta.json").write_text(
+        json.dumps({"agent_profile": {"name": "advisor"}}), encoding="utf-8")
+    out = _run(context.main, _payload(msg_path))
+    assert out.strip() == ""  # planner gate not applied to subagents
 
 
 # ---------------------------------------------------------------------------
