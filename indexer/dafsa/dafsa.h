@@ -79,7 +79,9 @@ void dafsa_stats(const dafsa *d, dafsa_stats_out *out);
 
 typedef struct dafsa_wal dafsa_wal;   /* opaque */
 
-dafsa_wal *dafsa_wal_open(const char *path);
+dafsa_wal *dafsa_wal_open(const char *path);        /* back-compat: writer open (same as _rw) */
+dafsa_wal *dafsa_wal_open_rw(const char *path);     /* writer: O_RDWR|O_CREAT|O_APPEND, may ftruncate */
+dafsa_wal *dafsa_wal_open_ro(const char *path);     /* reader: O_RDONLY, never mutates, no O_CREAT */
 int   dafsa_wal_append_add(dafsa_wal *w, const unsigned char *key, uint32_t key_len);
 int   dafsa_wal_append_del(dafsa_wal *w, const unsigned char *key, uint32_t key_len);
 int   dafsa_wal_sync(dafsa_wal *w);

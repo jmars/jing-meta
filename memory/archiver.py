@@ -161,16 +161,20 @@ def archive(
     conn = sqlite3.connect(str(memory_db))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    # The memory server / dreamer can write to this same DB in a separate
+    # process; wait for a competing writer instead of failing with
+    # "database is locked".
+    conn.execute("PRAGMA busy_timeout=5000")
     try:
         old = _select_old_observations(conn, cutoff)
     finally:
         conn.close()
 
-    total_obs = (
-        sqlite3.connect(f"file:{memory_db}?mode=ro", uri=True)
-        .execute("SELECT COUNT(*) FROM observations")
-        .fetchone()[0]
-    )
+    count_conn = sqlite3.connect(f"file:{memory_db}?mode=ro", uri=True)
+    # Read-only, but still wait briefly in case a writer holds a lock.
+    count_conn.execute("PRAGMA busy_timeout=5000")
+    total_obs = count_conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+    count_conn.close()
 
     print(f"Observations older than {days}d (before {cutoff}): {len(old)} of {total_obs}")
     if not old:
@@ -200,6 +204,10 @@ def archive(
     conn = sqlite3.connect(str(memory_db))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    # The memory server / dreamer can write to this same DB in a separate
+    # process; wait for a competing writer instead of failing with
+    # "database is locked".
+    conn.execute("PRAGMA busy_timeout=5000")
     try:
         conn.execute("BEGIN IMMEDIATE")
         deleted = _delete_observations(conn, old)

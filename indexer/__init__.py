@@ -284,6 +284,18 @@ def _manifest_files(output: Path) -> list[dict]:
         return []
 
 
+def _read_commit_seq(output: Path) -> int:
+    """Return the commit_seq from the manifest, or -1 if absent/unreadable."""
+    manifest_path = output / "manifest.json"
+    if not manifest_path.exists():
+        return -1
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return data.get("commit_seq", -1)
+    except (OSError, json.JSONDecodeError):
+        return -1
+
+
 def _fsync_dir_of(path: Path) -> None:
     """fsync the directory to make renames durable (best-effort)."""
     try:
@@ -297,8 +309,11 @@ def _fsync_dir_of(path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
-def build(dir: Path, pattern: str, extractor: str, output: Path) -> None:
-    """Build a DAFSA index over files in *dir* matching *pattern*."""
+def _build_locked(dir: Path, pattern: str, extractor: str, output: Path) -> None:
+    """Build a DAFSA index over files in *dir* matching *pattern*.
+
+    Caller MUST hold the index.lock flock (either via _index_lock or because it
+    already holds it — e.g. update() on first run)."""
     fn = EXTRACTORS.get(extractor)
     if fn is None:
         raise ValueError(f"unknown extractor {extractor!r}; choices: {list(EXTRACTORS)}")
@@ -339,11 +354,22 @@ def build(dir: Path, pattern: str, extractor: str, output: Path) -> None:
         _write_sidecar(slots_dir, file_idx, pairs)
 
     manifest_path = output / "manifest.json"
-    _atomic_write_json(manifest_path, {"files": [asdict(e) for e in entries]})
+    _atomic_write_json(manifest_path, {"files": [asdict(e) for e in entries], "commit_seq": 0})
 
     fs = fst_path.stat().st_size if fst_path.exists() else 0
     ms = manifest_path.stat().st_size if manifest_path.exists() else 0
     logger.warning("Done. FST: %.2f MB, Manifest: %.1f KB | %d unique keys from %d entries across %d files", fs / 1_048_576, ms / 1024, len(keys), total_entries, len(files))
+
+
+def build(dir: Path, pattern: str, extractor: str, output: Path) -> None:
+    """Build a DAFSA index over files in *dir* matching *pattern*.
+
+    Acquires the exclusive index.lock so a concurrent update()/compact() cannot
+    race with the build.
+    """
+    output = Path(output)
+    with _index_lock(output):
+        _build_locked(dir, pattern, extractor, output)
 
 
 # ---------------------------------------------------------------------------
@@ -386,9 +412,8 @@ def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
 
     output = Path(output)
     # The flock on index.lock gives mutual exclusion against concurrent
-    # update()/compact() calls. build() is intentionally NOT locked: the
-    # first-run path below calls build() internally, and build() trying to
-    # re-acquire the same flock would deadlock.
+    # update()/compact()/build() calls.  We use _build_locked() (not build())
+    # on first run to avoid re-acquiring the same flock.
     with _index_lock(output):
         fst_path = output / "index.fst"
         manifest_path = output / "manifest.json"
@@ -396,7 +421,7 @@ def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
 
         # First run — no index yet.
         if not fst_path.exists():
-            build(dir, pattern, extractor, output)
+            _build_locked(dir, pattern, extractor, output)
             return {
                 "command": "update",
                 "index_dir": str(output),
@@ -412,6 +437,7 @@ def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
 
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
         files = data.get("files", [])
+        commit_seq = data.get("commit_seq", 0)
         live = {
             fe["filename"]: i
             for i, fe in enumerate(files)
@@ -554,7 +580,7 @@ def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
                 sp.unlink(missing_ok=True)
             except OSError:
                 pass
-        _atomic_write_json(manifest_path, {"files": files})
+        _atomic_write_json(manifest_path, {"files": files, "commit_seq": commit_seq + 1})
 
         # Compaction trigger: if WAL > 25 % of base, fold it into a fresh snapshot.
         # We already hold the flock, so call the locked-compaction core directly
@@ -612,6 +638,16 @@ def _compact_locked(output: Path) -> None:
 
     wal_path.unlink(missing_ok=True)
     _fsync_dir_of(output)
+
+    # Bump commit_seq so cached reader views are invalidated.
+    manifest_path = output / "manifest.json"
+    if manifest_path.exists():
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        seq = data.get("commit_seq", 0)
+        _atomic_write_json(manifest_path, {**data, "commit_seq": seq + 1})
 
 
 # ---------------------------------------------------------------------------

@@ -5,8 +5,12 @@ Python DAFSA indexer in the `indexer` package, build/search happen in-process
 with no external binary dependency. The on-disk format is identical.
 """
 
+import contextlib
+import fcntl
 import json
+import os
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -17,43 +21,231 @@ from .config import DomainConfig
 if TYPE_CHECKING:
     from indexer import Index
 
-# Cache of open Index objects keyed by (dir, fst_mtime_ns, wal_size). Unchanged
-# indexes are reused across search_fst calls; a changed index (update/rebuild/
-# compact) evicts the stale entry and opens a fresh one. Guarded by a lock so
-# concurrent searches can't race on eviction.
-_index_cache: dict[tuple, "Index"] = {}
+# ---------------------------------------------------------------------------
+# Refcounted open-Index cache.
+#
+# Cache of open Index objects keyed by (dir, commit_seq). The commit_seq is
+# a monotonically-increasing integer in manifest.json, bumped on every
+# update()/compact()/build() commit — a stronger consistency signal than
+# (fst_mtime_ns, wal_size).  A reader briefly takes a shared flock on
+# index.lock for the stat+open window, then re-checks commit_seq after opening
+# to catch the narrow window where a writer committed mid-snapshot.
+#
+# Each cached value is a `_CacheEntry` wrapping an Index (which holds an mmap'd
+# DAFSA view + optional WAL overlay). Two invariants keep long-running servers
+# from leaking mmaps and prevent use-after-free under a thread pool:
+#
+#   * Refcount: every lookup increments `_CacheEntry.refcount`; the caller
+#     releases it with `_release_entry` when done. An entry is only closed
+#     (view freed) once its refcount is 0, so an in-flight reader never
+#     observes a freed view — the `assert view is not None` path in the
+#     indexer is unreachable for any reader that holds a reference.
+#
+#   * Bounded + TTL eviction: entries idle past `_CACHE_TTL_SECONDS` or beyond
+#     `_CACHE_MAX_ENTRIES` (LRU) are retired and closed. Retirement removes an
+#     entry from the dict immediately (bounded cache size), but if a reader
+#     still references it the actual close is deferred until its refcount
+#     drops to 0.
+# ---------------------------------------------------------------------------
+_CACHE_TTL_SECONDS = 300.0  # close idle indexes after this many idle seconds
+_CACHE_MAX_ENTRIES = 32  # LRU cap on simultaneously-open indexes
+
+_index_cache: dict[tuple, "_CacheEntry"] = {}
+# Entries retired from the dict but still referenced by an in-flight reader.
+# Swept (closed) once their refcount drops to 0.
+_retired: list["_CacheEntry"] = []
 _index_cache_lock = threading.Lock()
 
 
-def _get_cached_index(idx_dir: Path) -> "Index":
-    """Return a cached Index for *idx_dir*, reopening it when the index changed.
+class _CacheEntry:
+    """Refcounted wrapper around an open Index.
 
-    The cache key is (dir, index.fst mtime_ns, index.wal size). Missing files
-    contribute 0, so a brand-new or not-yet-built index is handled uniformly.
+    `index` may be None after the entry has been closed. `refcount` counts
+    in-flight readers; `retired` marks an entry removed from `_index_cache`
+    that is awaiting final close. `last_used` is a monotonic clock timestamp
+    for LRU/TTL eviction.
+
+    All other attribute access delegates to the wrapped Index so callers can
+    treat an entry like the Index itself (`.search`, `.files`, ...).
+    """
+
+    __slots__ = ("index", "refcount", "last_used", "retired")
+
+    def __init__(self, index: "Index", now: float):
+        self.index = index
+        self.refcount = 1
+        self.last_used = now
+        self.retired = False
+
+    def __getattr__(self, name):
+        # __getattr__ is only called for attributes not found via __slots__,
+        # so this cleanly delegates search/files/etc. to the wrapped Index.
+        return getattr(self.index, name)
+
+
+def _retire(entry: "_CacheEntry", now: float) -> None:
+    """Retire *entry* (already removed from `_index_cache`).
+
+    Close it immediately if nothing references it; otherwise defer the close
+    to `_release_entry`/`_sweep_retired` once its refcount drops to 0.
+    """
+    entry.retired = True
+    if entry.refcount == 0:
+        try:
+            entry.close()
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        _retired.append(entry)
+
+
+def _close_entry(entry: "_CacheEntry") -> None:
+    try:
+        entry.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _sweep_retired() -> None:
+    """Close retired entries whose refcount has dropped to 0. Caller holds lock."""
+    keep: list["_CacheEntry"] = []
+    for entry in _retired:
+        if entry.refcount == 0:
+            _close_entry(entry)
+        else:
+            keep.append(entry)
+    _retired[:] = keep
+
+
+def _evict_lru(now: float) -> None:
+    """Apply the TTL and size bound (LRU). Caller holds the lock.
+
+    Only evicts entries with no in-flight readers; a referenced (active)
+    entry is left for `_sweep_retired`/`_release_entry` to close later.
+    """
+    if len(_index_cache) > _CACHE_MAX_ENTRIES:
+        excess = len(_index_cache) - _CACHE_MAX_ENTRIES
+        candidates = sorted(
+            ((k, e) for k, e in _index_cache.items() if e.refcount == 0),
+            key=lambda kv: kv[1].last_used,
+        )
+        for k, e in candidates[:excess]:
+            del _index_cache[k]
+            _retire(e, now)
+    for k in [
+        k
+        for k, e in _index_cache.items()
+        if e.refcount == 0 and (now - e.last_used) > _CACHE_TTL_SECONDS
+    ]:
+        e = _index_cache.pop(k)
+        _retire(e, now)
+
+
+def _release_entry(entry: "_CacheEntry") -> None:
+    """Release a reference previously taken by `_get_cached_index`.
+
+    If the entry was retired while referenced, this is what finally closes it
+    (freeing its mmap) once the last reader is done.
+    """
+    with _index_cache_lock:
+        if entry.refcount <= 0:
+            return  # already fully released — never go negative
+        entry.refcount -= 1
+        if entry.retired and entry.refcount == 0:
+            _close_entry(entry)
+            try:
+                _retired.remove(entry)
+            except ValueError:
+                pass
+
+
+def _read_commit_seq(idx_dir: Path) -> int:
+    """Return the commit_seq from the manifest, or -1 if absent/unreadable."""
+    from indexer import _read_commit_seq as _rcs
+    return _rcs(idx_dir)
+
+
+@contextlib.contextmanager
+def _index_lock_shared(idx_dir: Path):
+    """Acquire a shared flock on index.lock for consistent snapshot reads.
+
+    Does NOT create the lock file — that is the writer's job.  If the lock
+    file is absent, there are no concurrent writers and we proceed unlocked.
+    """
+    lock_path = idx_dir / "index.lock"
+    if not lock_path.exists():
+        yield
+        return
+    fd = os.open(str(lock_path), os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def _get_cached_index(idx_dir: Path) -> "_CacheEntry":
+    """Return a refcounted cached Index wrapper for *idx_dir*.
+
+    The cache key is (dir, commit_seq).  A brief shared flock on index.lock
+    ensures we read a consistent snapshot (manifest + WAL + FST).  After
+    opening the layered view we re-check commit_seq to catch the narrow window
+    where a writer committed between our stat and open.
+
+    The returned entry holds a reference; callers MUST pair this with
+    `_release_entry(entry)` when they are done using the Index.
     """
     from indexer import Index
 
-    fst = idx_dir / "index.fst"
-    wal = idx_dir / "index.wal"
-    fst_mtime = fst.stat().st_mtime_ns if fst.exists() else 0
-    wal_size = wal.stat().st_size if wal.exists() else 0
-    key = (str(idx_dir), fst_mtime, wal_size)
+    # Bounded retry on writer contention: if a writer commits faster than we
+    # can open the index, bail out rather than spinning indefinitely.
+    max_retries = 5
+    for _ in range(max_retries):
+        # Acquire a shared lock for the stat+open window — keeps the writer
+        # (which holds LOCK_EX) from committing mid-snapshot.
+        with _index_lock_shared(idx_dir):
+            seq = _read_commit_seq(idx_dir)
+            key = (str(idx_dir), seq)
+            now = time.monotonic()
 
-    with _index_cache_lock:
-        cached = _index_cache.get(key)
-        if cached is not None:
-            return cached
-        # Evict and close stale entries for this dir (different key).
-        for k, idx in list(_index_cache.items()):
-            if k[0] == str(idx_dir) and k != key:
-                try:
-                    idx.close()
-                except Exception:  # noqa: BLE001
-                    pass
-                del _index_cache[k]
-        idx = Index(idx_dir)
-        _index_cache[key] = idx
-        return idx
+            with _index_cache_lock:
+                _sweep_retired()
+                cached = _index_cache.get(key)
+                if cached is not None:
+                    cached.refcount += 1
+                    cached.last_used = now
+                    _evict_lru(now)
+                    return cached
+                # Retire stale entries for this dir (different key). These are
+                # removed from the dict immediately so the cache can't pile up
+                # old generations; the actual close is deferred if a reader
+                # still references one.
+                for k, entry in list(_index_cache.items()):
+                    if k[0] == str(idx_dir) and k != key:
+                        del _index_cache[k]
+                        _retire(entry, now)
+
+            entry = _CacheEntry(Index(idx_dir), now)
+
+            # Re-check commit_seq after opening. If a writer committed during
+            # our open, seq2 will differ from seq and we retry.
+            seq2 = _read_commit_seq(idx_dir)
+            if seq2 != seq:
+                entry.close()
+                time.sleep(0.01)  # brief backoff before retrying
+                continue  # retry with the new seq
+
+            with _index_cache_lock:
+                _index_cache[key] = entry
+                _evict_lru(now)
+            return entry
+
+    # Too much writer churn to get a consistent snapshot.
+    raise RuntimeError(f"index at {idx_dir} is changing too quickly to open a consistent view")
 
 
 def _iter_domain_files(cfg: DomainConfig) -> list[Path]:
@@ -178,17 +370,24 @@ def search_fst(
         return None
 
     try:
-        idx = _get_cached_index(idx_dir)
-        hits = idx.search(query, any_word=any_word)
-        results = []
-        for h in hits:
-            results.append({
-                "file_idx": h.file_idx,
-                "entry_idx": h.entry_idx,
-                "_domain": cfg.name,
-                "date": idx.files[h.file_idx].date if h.file_idx < len(idx.files) else "?",
-            })
-        return results
+        entry = _get_cached_index(idx_dir)
+        try:
+            hits = entry.search(query, any_word=any_word)
+            results = []
+            for h in hits:
+                results.append(
+                    {
+                        "file_idx": h.file_idx,
+                        "entry_idx": h.entry_idx,
+                        "_domain": cfg.name,
+                        "date": entry.files[h.file_idx].date
+                        if h.file_idx < len(entry.files)
+                        else "?",
+                    }
+                )
+            return results
+        finally:
+            _release_entry(entry)
     except Exception:  # noqa: BLE001
         return None
 

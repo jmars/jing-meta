@@ -287,9 +287,18 @@ def run_pipeline(
         except Exception:
             pass
     elif llm_candidates:
+        # --no-rerank is a PERFORMANCE toggle, not a correctness/precision
+        # toggle. It should NOT change which candidates survive the validator's
+        # sim gate (0.45 in local_validator) purely because of ranking choice.
+        # The semantic path scores candidates ~0.5-1.0 for true relations, so
+        # use a lexical similarity that isn't systematically lower. Calibrated
+        # so MIN_SHARED (2) shared tokens => 2/3 ~= 0.67 > 0.45, meaning the
+        # same candidates that a semantic rerank would keep also clear the gate
+        # here. (Do not use /10: that would drop 2-4 shared-token candidates
+        # that the semantic ranker would keep.)
         for c in llm_candidates:
             shared = c.get("shared", 0)
-            c["similarity"] = round(min(shared / 10, 1.0), 3)
+            c["similarity"] = round(min(shared / 3, 1.0), 3)
 
     # --- Phase 3: Validate ---
     plan: dict[str, Any] = {"mutations": {
@@ -309,11 +318,14 @@ def run_pipeline(
             ]
         elif validator == "local":
             from .local_validator import validate_and_name
-            added = validate_and_name(llm_candidates, graph, use_local_llm=True)
+            health: dict[str, Any] = {}
+            added = validate_and_name(llm_candidates, graph, use_local_llm=True, health=health)
             plan["mutations"]["add_relations"] = [
                 {"from": r["from"], "to": r["to"], "relationType": r["relationType"]}
                 for r in added
             ]
+            if health:
+                plan["_validator_health"] = dict(health)
         elif validator == "cloud" and validate_relations:
             prompt = build_validation_prompt(llm_candidates)
             llm_result, _meta = llm.call(
@@ -333,6 +345,8 @@ def run_pipeline(
         "certain_merges": len(certain["merge_entities"]),
         "certain_renames": len(certain["rename_types"]),
     }
+    if plan.get("_validator_health"):
+        plan["_stats"]["validator_health"] = plan.pop("_validator_health")
     return plan
 
 

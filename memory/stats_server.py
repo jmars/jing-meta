@@ -28,8 +28,10 @@ import sqlite3
 from pathlib import Path
 from urllib.parse import quote
 
+from mcp.types import TextContent
+
 from jing_meta import config as _jing_config
-from jing_meta.mcp_base import JINGMCP
+from jing_meta.mcp_base import JINGMCP, text_block, text_blocks
 
 logger = logging.getLogger("memory-stats")
 
@@ -100,7 +102,7 @@ def _query_sqlite(query: str, params: tuple = ()) -> list:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def graph_stats() -> str:
+def graph_stats() -> list[TextContent]:
     """Show a high-level overview of the knowledge graph.
 
     Returns entity type counts, relation type counts, recently added entities,
@@ -109,7 +111,7 @@ def graph_stats() -> str:
     exist in the graph — no keyword guessing needed.
     """
     if not _has_sqlite():
-        return f"Knowledge graph database not found at {DB_PATH}"
+        return [text_block(f"Knowledge graph database not found at {DB_PATH}")]
 
     def q(sql: str, params: tuple = ()) -> list:
         return _query_sqlite(sql, params)
@@ -164,29 +166,29 @@ def graph_stats() -> str:
         output.append(f"    Newest: {newest[0]['name']} ({newest[0]['created_at']})")
         output.append(f"    24h activity: {recent_24h[0]['n']} entities updated")
 
-    return "\n".join(output)
+    return text_blocks(*output)
 
 
 @mcp.tool()
-def entity_summary(name: str) -> str:
+def entity_summary(name: str) -> list[TextContent]:
     """Get full details for a specific entity by name.
 
     Returns entity type, all observations with timestamps, related entities
     (inbound and outbound relations), and creation/update timestamps.
     """
     if not _has_sqlite():
-        return f"Knowledge graph database not found at {DB_PATH}"
+        return [text_block(f"Knowledge graph database not found at {DB_PATH}")]
 
     rows = _query_sqlite(
         "SELECT id, name, entity_type, created_at, updated_at FROM entities WHERE name = ?",
         (name,),
     )
     if not rows:
-        return f"Entity not found: {name}"
+        return [text_block(f"Entity not found: {name}")]
     return _entity_summary_sqlite(rows[0])
 
 
-def _entity_summary_sqlite(e) -> str:
+def _entity_summary_sqlite(e) -> list[TextContent]:
     entity_id = e["id"]
     obs_rows = _query_sqlite(
         "SELECT content, created_at FROM observations WHERE entity_id = ? ORDER BY id",
@@ -228,7 +230,7 @@ def _entity_summary_sqlite(e) -> str:
         for r in in_rel:
             output.append(f"    {r['from_entity']} → ({r['relation_type']})")
 
-    return "\n".join(output)
+    return text_blocks(*output)
 
 
 # ---------------------------------------------------------------------------

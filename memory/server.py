@@ -60,14 +60,22 @@ def _get_conn() -> sqlite3.Connection:
                 _conn = sqlite3.connect(str(DB_PATH))
                 _conn.execute("PRAGMA journal_mode=WAL")
                 _conn.execute("PRAGMA foreign_keys=ON")
+                # The dreamer, archiver, and stats hooks can open this same
+                # memory DB concurrently in separate processes, so a writer
+                # must wait for a competing writer's lock rather than failing
+                # immediately with "database is locked".
+                _conn.execute("PRAGMA busy_timeout=5000")
                 _conn.row_factory = sqlite3.Row
-                _init_schema()
+                _init_schema(_conn)
     return _conn
 
 
-def _init_schema() -> None:
-    """Create tables if they don't exist."""
-    conn = _get_conn()
+def _init_schema(conn: sqlite3.Connection) -> None:
+    """Create tables if they don't exist.
+
+    Takes the connection explicitly so it never re-enters ``_get_conn``
+    (which would otherwise recurse through the same ``_conn_lock``).
+    """
     conn.executescript(SCHEMA_DDL)
 
 

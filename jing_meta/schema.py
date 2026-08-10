@@ -4,7 +4,20 @@ Single source of truth for table/column definitions used by both
 ``memory/server.py`` (schema initialization) and ``dreamer/dreamer.py``
 (SQLite read/write).  Any column addition, rename, or type change MUST
 be made here first, then reflected in both consumers.
+
+Stale-observation archiving — canonical strategy (decision record)
+=================================================================
+Archiving stale observations is the ARCHIVER's job: ``memory/archiver.py``
+DELETES observations older than the cutoff and writes them to a JSONL
+archive (searchable via the DAFSA indexer).  The dreamer must NOT also tag
+observations with an ``[archived: ...]`` prefix — that would leave the stale
+text in the live graph instead of removing it.  This constant documents the
+forbidden prefix; do not use it to mark observations in the live graph.
 """
+
+# Prefix the dreamer is forbidden to apply when it "archives" observations.
+# Real archiving = delete from the live graph + write to JSONL (archiver.py).
+ARCHIVED_OBSERVATION_PREFIX = "[archived: "
 
 SCHEMA_DDL = """\
     CREATE TABLE IF NOT EXISTS entities (

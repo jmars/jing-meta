@@ -216,14 +216,16 @@ static int overlay_build_cb(uint8_t op, const unsigned char *key,
 }
 
 /* Load overlay from a WAL file path. Returns NULL on any error.
- * The WAL is opened, validated, replayed into the overlay, then closed. */
+ * The WAL is opened read-only, validated, replayed into the overlay,
+ * then closed.  Uses dafsa_wal_open_ro to ensure a concurrent reader
+ * never mutates a writer's WAL. */
 static struct wal_overlay *overlay_load(const char *wal_path)
 {
     dafsa_wal *w;
     struct wal_overlay *ov;
     struct overlay_build_ctx ctx;
 
-    w = dafsa_wal_open(wal_path);
+    w = dafsa_wal_open_ro(wal_path);
     if (!w) return NULL;
 
     ov = calloc(1, sizeof(*ov));

@@ -134,6 +134,20 @@ def _record_digest(out: str) -> None:
     if saved:
         detail_parts.append(f"graph now {saved.group(1)} entities / {saved.group(2)} rels")
 
+    # Surfaces local-validator health (e.g. "Ollama was down for N/M pairs") so
+    # a silently-failing validator is observable in the digest. Printed by the
+    # dreamer as: "  validator health: batch X/Y ok, N/M pairs returned None (K single-pair fallbacks)"
+    m_vh = re.search(
+        r"validator health: batch (\d+)/(\d+) ok, (\d+)/(\d+) pairs returned None",
+        out,
+    )
+    if m_vh:
+        none, total = int(m_vh.group(3)), int(m_vh.group(4))
+        if none > 0:
+            detail_parts.append(f"validator: {none}/{total} pairs failed")
+        elif total > 0:
+            detail_parts.append(f"validator: {total} pairs ok")
+
     common.digest_append({
         "system": "graph-gardener",
         "action": "maintenance",

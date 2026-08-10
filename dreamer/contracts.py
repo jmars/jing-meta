@@ -86,9 +86,27 @@ class ValidatedRelation:
 # ---------------------------------------------------------------------------
 
 
+# Keys recorded under ``MutationPlan.stats["validator_health"]`` when a local
+# LLM validator (Ollama) is used. Lets an operator see, e.g. "Ollama was down
+# for 17/40 pairs" rather than silently swallowing validation failures.
+VALIDATOR_HEALTH_KEYS: tuple[str, ...] = (
+    "candidates_in",
+    "batch_calls_attempted",
+    "batch_calls_succeeded",
+    "single_pair_fallbacks",
+    "single_pair_returns_none",
+)
+
+
 @dataclass
 class MutationPlan:
-    """The mutation plan assembled by validate and consumed by apply."""
+    """The mutation plan assembled by validate and consumed by apply.
+
+    ``stats["validator_health"]`` (when a local LLM validator ran) holds a dict
+    with the keys in ``VALIDATOR_HEALTH_KEYS``, used for observability of the
+    relation validator (e.g. how many pairs the LLM batch handled vs. how many
+    the single-pair fallback returned ``None`` for).
+    """
     archive_observations: list[dict] = field(default_factory=list)
     rename_types: list[dict] = field(default_factory=list)
     merge_entities: list[dict] = field(default_factory=list)

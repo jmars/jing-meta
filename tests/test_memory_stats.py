@@ -16,6 +16,11 @@ from jing_meta.schema import SCHEMA_DDL
 from memory import stats_server
 
 
+def _text(blocks) -> str:
+    """Join the rendered text blocks into a single string for assertions."""
+    return "\n".join(b.text for b in blocks)
+
+
 def _make_test_db(path: Path) -> None:
     """Build a synthetic graph: 4 entities, 4 observations, 2 relations.
 
@@ -70,22 +75,22 @@ def _db(monkeypatch, tmp_path):
 
 class TestGraphStats:
     def test_counts(self, _db):
-        out = stats_server.graph_stats()
+        out = _text(stats_server.graph_stats())
         assert "Entities: 4, Relations: 2, Observations: 4" in out
 
     def test_entity_types(self, _db):
-        out = stats_server.graph_stats()
+        out = _text(stats_server.graph_stats())
         assert "concept: 2" in out
         assert "person: 1" in out
         assert "project: 1" in out
 
     def test_relation_types(self, _db):
-        out = stats_server.graph_stats()
+        out = _text(stats_server.graph_stats())
         assert "relates_to: 1" in out
         assert "depends_on: 1" in out
 
     def test_recent_and_temporal(self, _db):
-        out = stats_server.graph_stats()
+        out = _text(stats_server.graph_stats())
         assert "[concept] alpha" in out
         assert "Oldest:" in out and "Newest:" in out
         assert "24h activity:" in out
@@ -94,13 +99,18 @@ class TestGraphStats:
         monkeypatch.setattr(
             stats_server, "DB_PATH", Path("/nonexistent/does-not-exist.db")
         )
-        out = stats_server.graph_stats()
+        out = _text(stats_server.graph_stats())
         assert "Knowledge graph database not found" in out
+
+    def test_returns_text_blocks(self, _db):
+        blocks = stats_server.graph_stats()
+        assert isinstance(blocks, list)
+        assert all(getattr(b, "type", None) == "text" for b in blocks)
 
 
 class TestEntitySummary:
     def test_present_entity(self, _db):
-        out = stats_server.entity_summary("alpha")
+        out = _text(stats_server.entity_summary("alpha"))
         assert "Entity: alpha" in out
         assert "Type: concept" in out
         assert "Observations (2):" in out
@@ -111,16 +121,17 @@ class TestEntitySummary:
         assert "delta → (depends_on)" in out
 
     def test_entity_no_observations(self, _db):
-        out = stats_server.entity_summary("gamma")
+        out = _text(stats_server.entity_summary("gamma"))
         assert "Entity: gamma" in out
         assert "Observations (0):" in out
 
     def test_missing_entity(self, _db):
-        assert stats_server.entity_summary("missing") == "Entity not found: missing"
+        out = _text(stats_server.entity_summary("missing"))
+        assert out == "Entity not found: missing"
 
     def test_missing_db_returns_message(self, monkeypatch):
         monkeypatch.setattr(
             stats_server, "DB_PATH", Path("/nonexistent/does-not-exist.db")
         )
-        out = stats_server.entity_summary("alpha")
+        out = _text(stats_server.entity_summary("alpha"))
         assert "Knowledge graph database not found" in out

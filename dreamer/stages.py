@@ -185,12 +185,16 @@ def rank(ctx: RunContext, prior: StageResult | None = None) -> StageResult:
             except Exception:
                 pass
         elif cand_dicts:
-            # Lexical fallback (no semantic rerank)
+            # Lexical fallback (no semantic rerank). --no-rerank is a
+            # PERFORMANCE toggle, not a correctness/precision toggle — it must
+            # not drop candidates the validator gate (sim >= 0.45) would keep
+            # under semantic ranking. Calibrate so MIN_SHARED (2) shared tokens
+            # => 2/3 ~= 0.67 > 0.45 (same candidates survive either ranker).
             reranked = []
             for c in cand_dicts:
                 shared = c.get("shared", 0)
                 c_copy = dict(c)
-                c_copy["similarity"] = round(min(shared / 10, 1.0), 3)
+                c_copy["similarity"] = round(min(shared / 3, 1.0), 3)
                 reranked.append(c_copy)
         else:
             reranked = []
@@ -199,7 +203,7 @@ def rank(ctx: RunContext, prior: StageResult | None = None) -> StageResult:
             RankedCandidate(
                 from_=c["from"],
                 to=c["to"],
-                score=c.get("similarity", c.get("shared", 0) / 10),
+                score=c.get("similarity", c.get("shared", 0) / 3),
                 shared=c.get("shared", 0),
                 similarity=c.get("similarity", 0.0),
             )
@@ -353,6 +357,7 @@ def validate(ctx: RunContext, prior: StageResult | None = None) -> StageResult |
         ]
 
         added_relations: list[dict] = []
+        health: dict[str, Any] = {}
         if cand_dicts:
             validator = ctx.validator
             if callable(validator):
@@ -363,7 +368,7 @@ def validate(ctx: RunContext, prior: StageResult | None = None) -> StageResult |
                 ]
             elif validator == "local":
                 from .local_validator import validate_and_name
-                added = validate_and_name(cand_dicts, graph, use_local_llm=True)
+                added = validate_and_name(cand_dicts, graph, use_local_llm=True, health=health)
                 added_relations = [
                     {"from": r["from"], "to": r["to"], "relationType": r["relationType"]}
                     for r in added
@@ -394,6 +399,8 @@ def validate(ctx: RunContext, prior: StageResult | None = None) -> StageResult |
             "certain_merges": len(certain.get("merge_entities", [])),
             "certain_renames": len(certain.get("rename_types", [])),
         }
+        if health:
+            plan.stats["validator_health"] = dict(health)
 
         payload = {"plan": plan.to_legacy_dict()}
         return _persist(ctx, StageResult(

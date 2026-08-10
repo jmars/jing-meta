@@ -152,6 +152,7 @@ def validate_and_name(
     *,
     use_local_llm: bool = True,
     llm_callable: Optional[Callable] = None,
+    health: Optional[dict] = None,
 ) -> list[dict]:
     """Validate + name candidate relations (two-phase batching).
 
@@ -165,9 +166,25 @@ def validate_and_name(
     ``llm_callable`` is an injectable seam for tests — an optional
     ``prompt -> dict|None`` callable (mapping from the batched prompt to an
     ``{"add_relations": [...]}`` dict) that overrides the real local-LLM call.
+
+    ``health`` is an optional out-param dict that, when provided, is populated
+    with validator observability counters (see ``MutationPlan.stats``
+    ``validator_health``): ``candidates_in``, ``batch_calls_attempted``,
+    ``batch_calls_succeeded``, ``single_pair_fallbacks``,
+    ``single_pair_returns_none``. It lets callers see how often the LLM batch
+    failed and pairs silently fell back (or returned ``None``) instead of
+    swallowing the failure.
     """
     out = []
     unnamed = []
+
+    if health is None:
+        health = {}
+    health["candidates_in"] = len(candidates)
+    health["batch_calls_attempted"] = 0
+    health["batch_calls_succeeded"] = 0
+    health["single_pair_fallbacks"] = 0
+    health["single_pair_returns_none"] = 0
 
     for c in candidates:
         a, b = c["from"], c["to"]
@@ -197,6 +214,7 @@ def validate_and_name(
     if unnamed and use_local_llm:
         from .dreamer import build_validation_prompt
         prompt = build_validation_prompt(unnamed)
+        health["batch_calls_attempted"] += 1
 
         if llm_callable is not None:
             llm_result = llm_callable(prompt)
@@ -212,6 +230,7 @@ def validate_and_name(
             )
 
         if llm_result and isinstance(llm_result, dict):
+            health["batch_calls_succeeded"] += 1
             added = llm_result.get("add_relations", [])
             if isinstance(added, list):
                 unnamed_by_pair = {(c["from"], c["to"]): c for c in unnamed}
@@ -235,6 +254,7 @@ def validate_and_name(
             if (c["from"], c["to"]) not in batched_pairs
         ]
         for c in still_unnamed:
+            health["single_pair_fallbacks"] += 1
             rel = _local_llm_relation(c["from"], c["to"])
             if rel is not None:
                 out.append({
@@ -242,5 +262,7 @@ def validate_and_name(
                     "relationType": rel,
                     "confidence": round(c.get("similarity", 0.0), 3),
                 })
+            else:
+                health["single_pair_returns_none"] += 1
 
     return out

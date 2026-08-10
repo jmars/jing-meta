@@ -163,6 +163,9 @@ def graph_counts(db: Path | None = None) -> tuple[int, int] | None:
         return None
     try:
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        # The memory server / archiver can write to this DB in another process;
+        # wait briefly for any writer lock rather than failing with "database is locked".
+        conn.execute("PRAGMA busy_timeout=5000")
         try:
             n_entities = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
             n_obs = conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0]

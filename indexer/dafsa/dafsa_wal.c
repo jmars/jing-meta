@@ -174,7 +174,9 @@ static int wal_validate_header(const uint8_t *map, size_t size,
 
 /* ─── WAL lifecycle ─────────────────────────────────────────────────────── */
 
-dafsa_wal *dafsa_wal_open(const char *path)
+/* Writer-side open: O_RDWR|O_CREAT|O_APPEND.  May write a fresh header or
+ * ftruncate a torn tail.  Use this for update() / compact() paths only. */
+dafsa_wal *dafsa_wal_open_rw(const char *path)
 {
     int fd = -1;
     dafsa_wal *w = NULL;
@@ -232,6 +234,62 @@ dafsa_wal *dafsa_wal_open(const char *path)
     }
 
     return w;
+}
+
+/* Reader-side open: O_RDONLY, no O_CREAT, never mutates the file.
+ * Validates the header, scans for torn tail but does NOT ftruncate —
+ * the self-framing record format already handles torn tails by stopping
+ * at the first invalid CRC.  Returns NULL if the file is missing, empty,
+ * or has a corrupt header. */
+dafsa_wal *dafsa_wal_open_ro(const char *path)
+{
+    int fd = -1;
+    dafsa_wal *w = NULL;
+    struct stat st;
+
+    if (!path) return NULL;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+
+    if (fstat(fd, &st) != 0) { close(fd); return NULL; }
+
+    if (st.st_size < 16) {
+        /* Too small to contain a valid header — not a usable WAL. */
+        close(fd); return NULL;
+    }
+
+    w = calloc(1, sizeof(*w));
+    if (!w) { close(fd); return NULL; }
+    w->fd = fd;
+
+    {
+        uint8_t *map;
+        size_t good_bytes;
+
+        map = (uint8_t *)mmap(NULL, (size_t)st.st_size, PROT_READ,
+                              MAP_PRIVATE, fd, 0);
+        if (map == MAP_FAILED) { close(fd); free(w); return NULL; }
+
+        if (wal_validate_header(map, (size_t)st.st_size, &good_bytes) != 0) {
+            /* Corrupt header: reader cannot repair — return error. */
+            munmap(map, (size_t)st.st_size);
+            close(fd); free(w); return NULL;
+        }
+
+        munmap(map, (size_t)st.st_size);
+        /* Remember where the valid records end; replay stops at the
+         * first invalid record anyway, so a torn tail is harmless. */
+        w->size = (uint64_t)good_bytes;
+    }
+
+    return w;
+}
+
+/* Back-compat alias: writer-side open (same as dafsa_wal_open_rw). */
+dafsa_wal *dafsa_wal_open(const char *path)
+{
+    return dafsa_wal_open_rw(path);
 }
 
 /* ─── Append ────────────────────────────────────────────────────────────── */

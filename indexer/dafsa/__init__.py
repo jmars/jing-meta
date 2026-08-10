@@ -120,6 +120,10 @@ def _load() -> ctypes.CDLL:
     # ── Write-ahead log (WAL) ──
     lib.dafsa_wal_open.argtypes = [ctypes.c_char_p]
     lib.dafsa_wal_open.restype = ctypes.c_void_p
+    lib.dafsa_wal_open_rw.argtypes = [ctypes.c_char_p]
+    lib.dafsa_wal_open_rw.restype = ctypes.c_void_p
+    lib.dafsa_wal_open_ro.argtypes = [ctypes.c_char_p]
+    lib.dafsa_wal_open_ro.restype = ctypes.c_void_p
     lib.dafsa_wal_append_add.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
     lib.dafsa_wal_append_add.restype = ctypes.c_int
     lib.dafsa_wal_append_del.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
@@ -363,19 +367,31 @@ class DafsaWal:
         """Replay all WAL records into *dafsa* (must be mutable).
 
         Returns the number of records replayed, or -1 on error.
+        Per-record errors (add/delete returning <0) abort replay immediately.
+        Idempotent: already-present (add→0) or already-absent (delete→0) are
+        silently skipped and do not count as failures.
         """
         lib = _get_lib()
+        record_count = 0
 
         @_WAL_REPLAY_CB
         def cb(op: int, key_ptr, key_len: int, _user) -> int:
-            key = ctypes.string_at(key_ptr, key_len)
+            nonlocal record_count
+            key_buf = ctypes.create_string_buffer(ctypes.string_at(key_ptr, key_len))
             if op == 1:
-                dafsa.add(key)
+                rc = lib.dafsa_add_n(dafsa._h, key_buf, key_len)
             elif op == 2:
-                dafsa.delete(key)
-            return 0  # continue
+                rc = lib.dafsa_delete_n(dafsa._h, key_buf, key_len)
+            else:
+                return -1  # unknown op → abort
+            if rc < 0:
+                return -1  # hard error → abort replay
+            record_count += 1
+            return 0  # continue (rc == 0 is idempotent duplicate, ok)
 
-        return lib.dafsa_wal_replay(self._h, cb, None)
+        if lib.dafsa_wal_replay(self._h, cb, None) != 0:
+            return -1
+        return record_count
 
     def close(self) -> None:
         """Close the WAL handle. NULL-safe."""

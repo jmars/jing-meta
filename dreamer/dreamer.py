@@ -1,11 +1,12 @@
 """Graph Gardener — LLM-powered knowledge graph maintenance.
 
 Two-pass analysis:
-  1. CLEANUP — archive stale observations, consolidate entity types, merge duplicates
+  1. CLEANUP — consolidate entity types, merge duplicates
   2. SYNTHESIS — add missing relations, create summary entities from patterns
 
 Mutations are additive only:
-  - Stale observations get ``[archived: YYYY-MM-DD reason]`` appended, never deleted
+  - Stale observations are NOT handled here — the archiver (memory/archiver.py)
+    is the sole owner of archiving stale observations
   - Type renames preserve all observations
   - Merges concatenate observations under one name; self-referencing relations are removed
   - New entities/relations are additive
@@ -47,6 +48,10 @@ def load_graph_sqlite(db_path: Path) -> dict:
     relations: list[dict] = []
     if db_path.exists():
         conn = sqlite3.connect(str(db_path))
+        # Busy timeout so a concurrent writer (e.g. memory MCP server, or the
+        # dreamer's own save_graph_sqlite in another process) does not produce
+        # an immediate `database is locked` — wait instead.
+        conn.execute("PRAGMA busy_timeout=5000")
         conn.row_factory = sqlite3.Row
         try:
             from collections import OrderedDict
@@ -93,6 +98,9 @@ def save_graph_sqlite(graph: dict, db_path: Path) -> None:
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     conn = sqlite3.connect(str(db_path))
+    # Busy timeout so this writer waits for the memory MCP server / other
+    # writers (SQLite WAL: one writer at a time) instead of failing immediately.
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA foreign_keys=ON")
@@ -246,9 +254,7 @@ def build_prompt(graph: dict, candidates: list[dict] | None = None) -> str:
         "  2. CONSOLIDATE ENTITY TYPES — see TYPE DISTRIBUTION below; collapse one-off",
         "     labels onto the canonical type for that kind of thing.",
         "  3. MERGE duplicate entities (same thing, different name).",
-        "  4. Archive stale observations — things referencing deleted servers/files.",
-        "     Append [archived: date reason]. NEVER delete.",
-        "  5. Create summary entities ONLY if 2+ entities share a strong theme.",
+        "  4. Create summary entities ONLY if 2+ entities share a strong theme.",
         "     Only from existing data.",
         "",
         "RULES: never delete, never invent facts. Output ONLY valid JSON.",
@@ -307,8 +313,8 @@ def build_prompt(graph: dict, candidates: list[dict] | None = None) -> str:
 
     # Output format — compact, show only needed fields
     parts.append("--- OUTPUT FORMAT (return ONLY this JSON, nothing else) ---")
-    parts.append('{"mutations":{"archive_observations":[{"entity":"...","observation_index":0,"reason":"..."}],')
-    parts.append('"rename_types":[{"entity":"...","new_type":"convention"}],')
+    parts.append('{"mutations":{"rename_types":[{"entity":"...","new_type":"convention"}],')
+    parts.append('"merge_entities":[{"keep":"...","remove":"...","reason":"..."}],')
     parts.append('"merge_entities":[{"keep":"...","remove":"...","reason":"..."}],')
     parts.append('"add_relations":[{"from":"...","to":"...","relationType":"references"}],')
     parts.append('"add_entities":[{"name":"...","entityType":"summary","observations":["..."]}]}')
@@ -538,43 +544,26 @@ def apply_mutations(graph: dict, plan: dict, *, run_date: str | None = None) -> 
     """Apply the mutation plan to *graph*.
 
     Mutation order:
-      1. archive_observations
-      2. rename_types
-      3. merge_entities (with dedup and self-reference cleanup)
-      4. add_entities (before relations so new entities can be referenced)
-      5. add_relations
+      1. rename_types
+      2. merge_entities (with dedup and self-reference cleanup)
+      3. add_entities (before relations so new entities can be referenced)
+      4. add_relations
+
+    Stale-observation archiving is deliberately NOT handled here: the archiver
+    (memory/archiver.py) owns archiving (it deletes stale observations and writes
+    JSONL). Any ``archive_observations`` mutations in the plan are ignored so the
+    dreamer and archiver don't fight over the same observations.
 
     This function operates defensively — malformed or missing fields from LLM
     output are silently skipped rather than crashing.
-
-    ``run_date`` is threaded into archive tags as the ``YYYY-MM-DD`` part. If
-    None (the default), the current date is used.
     """
     mutations = plan.get("mutations", {})
     if not isinstance(mutations, dict):
         mutations = {}
     entities = {e["name"]: e for e in graph["entities"]}
     changes: list[str] = []
-    if run_date is None:
-        run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    # 1. Archive stale observations (defensive — skip malformed entries)
-    for a in mutations.get("archive_observations", []) or []:
-        if not isinstance(a, dict):
-            continue
-        name = a.get("entity", "")
-        try:
-            idx = int(a.get("observation_index", -1))
-        except (ValueError, TypeError):
-            continue
-        reason = str(a.get("reason", "stale"))
-        if name in entities and 0 <= idx < len(entities[name].get("observations", [])):
-            old = entities[name]["observations"][idx]
-            tag = f"[archived: {run_date} {reason}]"
-            entities[name]["observations"][idx] = f"{old} {tag}"
-            changes.append(f"  archived obs[{idx}] on '{name}': {reason}")
-
-    # 2. Rename entity types
+    # 1. Rename entity types
     for r in mutations.get("rename_types", []) or []:
         if not isinstance(r, dict):
             continue
@@ -747,6 +736,15 @@ def _run_stages(
             print(f"  deterministic: {stats.get('certain_renames')} renames, "
                   f"{stats.get('certain_merges')} merges")
             print(f"  LLM-validated relations: {len(muts.get('add_relations', []))}")
+            vh = stats.get("validator_health")
+            if vh:
+                _none = vh.get("single_pair_returns_none", 0)
+                _fb = vh.get("single_pair_fallbacks", 0)
+                _cand = vh.get("candidates_in", 0)
+                print(f"  validator health: batch {vh.get('batch_calls_succeeded', 0)}/"
+                      f"{vh.get('batch_calls_attempted', 0)} ok, "
+                      f"{_none}/{_cand} pairs returned None "
+                      f"({_fb} single-pair fallbacks)")
         print(f"  TOTAL mutations: {total}")
         for key, val in muts.items():
             if val:

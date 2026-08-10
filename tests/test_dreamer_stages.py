@@ -665,7 +665,8 @@ class TestApplyStage:
         rels = {(r["from"], r["to"], r["relationType"]) for r in graph["relations"]}
         assert ("Alpha", "Gamma", "causes") in rels
 
-    def test_run_date_threaded_into_archive_tag(self, tmp_path):
+    def test_archive_observations_ignored_by_dreamer(self, tmp_path):
+        """archive_observations are ignored — the archiver owns archiving."""
         from dreamer.contracts import Mode, MutationPlan, RunContext, Stage, StageResult
         from dreamer.stages import apply
 
@@ -697,7 +698,9 @@ class TestApplyStage:
         apply(ctx, prior)
         graph = load_graph_sqlite(db_path)
         obs_entity = next(e for e in graph["entities"] if e["name"] == "ObsEntity")
-        assert "[archived: 2025-12-25 stale]" in obs_entity["observations"][0]
+        # The dreamer must NOT tag observations with [archived: ...] — the
+        # archiver (memory/archiver.py) is the sole owner of archiving.
+        assert "[archived:" not in obs_entity["observations"][0]
 
 
 # ---------------------------------------------------------------------------
@@ -870,8 +873,8 @@ class TestBackwardCompat:
         rc = run_souffle_mode(db_path, apply=False, validator="none", rerank=False)
         assert rc == 0
 
-    def test_apply_mutations_no_run_date_kwarg(self):
-        """apply_mutations without run_date uses current date."""
+    def test_apply_mutations_ignores_archive_observations(self):
+        """apply_mutations does NOT tag observations — the archiver owns archiving."""
         graph = {
             "entities": [{"name": "E", "entityType": "note", "observations": ["old"]}],
             "relations": [],
@@ -883,12 +886,12 @@ class TestBackwardCompat:
             },
         }
         result = apply_mutations(graph, plan)
-        # Should have archived tag with today's date
         obs = result["entities"][0]["observations"][0]
-        assert "[archived:" in obs
+        assert obs == "old"
+        assert "[archived:" not in obs
 
-    def test_apply_mutations_with_run_date_kwarg(self):
-        """apply_mutations with run_date uses the supplied date."""
+    def test_apply_mutations_ignores_archive_with_run_date(self):
+        """apply_mutations ignores archive_observations even with run_date given."""
         graph = {
             "entities": [{"name": "E", "entityType": "note", "observations": ["old"]}],
             "relations": [],
@@ -901,4 +904,5 @@ class TestBackwardCompat:
         }
         result = apply_mutations(graph, plan, run_date="2025-07-04")
         obs = result["entities"][0]["observations"][0]
-        assert "[archived: 2025-07-04" in obs
+        assert obs == "old"
+        assert "[archived:" not in obs

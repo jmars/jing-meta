@@ -26,11 +26,14 @@ import json
 import os
 import re
 import signal
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Callable
 
-from jing_meta.mcp_base import JINGMCP, lazy_singleton
+from mcp.types import TextContent
+
+from jing_meta.mcp_base import JINGMCP, lazy_singleton, text_blocks
 
 from .config import DomainConfig, load_config
 from .indexer import (
@@ -54,6 +57,27 @@ def _regex_alarm_handler(_signum, _frame):
     raise _RegexTimeout("regex search timed out")
 
 _SLOW_SCAN_TIMEOUT = int(os.environ.get("SEARCH_REGEX_TIMEOUT", "5"))
+
+
+def _regex_danger(query: str) -> str | None:
+    r"""Return a short description if *query* is a potentially unsafe regex, else None.
+
+    Conservative ReDoS guard shared by all regex search paths (``search``,
+    ``search_history``, ``search_log``): it rejects patterns with known
+    catastrophic-backtracking constructs.  Some safe regexes are
+    false-positived by design — the cost of a hang is higher than a spurious
+    rejection.  The nested / adjacent-quantifier checks require a quantifier or
+    adjacency so safe patterns like "(?:foo)+" and "\d+ *\d+" are not caught.
+    """
+    _danger_checks = [
+        (r"[*+?]\)\s*[+*]", "nested quantifier after group"),       # (a*)*, (a+)+
+        (r"\([^)]*\|[^)]*\)\s*[+*]", "alternation with quantifier"),  # (a|b)+
+        (r"[+*?][+*?]", "adjacent quantifiers"),                      # a**, a?*
+    ]
+    for pat, desc in _danger_checks:
+        if re.search(pat, query):
+            return desc
+    return None
 
 
 _get_config = lazy_singleton(load_config)
@@ -166,17 +190,6 @@ def _notify_date(p: Path) -> date | None:
     return None
 
 
-_DATE_EXTRACTORS = {
-    "sessions": _session_date_from_dir,
-    "transcripts": _transcript_date,
-    "notifications": _notify_date,
-    "web-archive": _notify_date,
-    "dns-whois": _notify_date,
-    "image-analysis": _notify_date,
-    "pdf-extract": _notify_date,
-}
-
-
 # ---------------------------------------------------------------------------
 # Domain helpers — list metadata
 # ---------------------------------------------------------------------------
@@ -234,17 +247,6 @@ def _list_notify_meta(p: Path) -> dict:
         "entries": count,
         "size_kb": round(p.stat().st_size / 1024, 1),
     }
-
-
-_LIST_META = {
-    "sessions": _list_session_meta,
-    "transcripts": _list_transcript_meta,
-    "notifications": _list_notify_meta,
-    "web-archive": _list_notify_meta,
-    "dns-whois": _list_notify_meta,
-    "image-analysis": _list_notify_meta,
-    "pdf-extract": _list_notify_meta,
-}
 
 
 # ---------------------------------------------------------------------------
@@ -325,17 +327,6 @@ def _read_jsonl_entries(p: Path, max_n: int, _filter: str | None = None) -> list
     return entries
 
 
-_READ_ENTRIES = {
-    "sessions": _read_session_messages,
-    "transcripts": _read_transcript_turns,
-    "notifications": _read_notify_entries,
-    "web-archive": _read_jsonl_entries,
-    "dns-whois": _read_jsonl_entries,
-    "image-analysis": _read_jsonl_entries,
-    "pdf-extract": _read_jsonl_entries,
-}
-
-
 # ---------------------------------------------------------------------------
 # Domain helpers — search lines (for slow path)
 # ---------------------------------------------------------------------------
@@ -388,17 +379,6 @@ def _jsonl_search_lines(p: Path) -> list[str]:
         return []
 
 
-_SEARCH_LINES = {
-    "sessions": _session_search_lines,
-    "transcripts": _transcript_search_lines,
-    "notifications": _notify_search_lines,
-    "web-archive": _jsonl_search_lines,
-    "dns-whois": _jsonl_search_lines,
-    "image-analysis": _jsonl_search_lines,
-    "pdf-extract": _jsonl_search_lines,
-}
-
-
 # ---------------------------------------------------------------------------
 # Domain helpers — load summary
 # ---------------------------------------------------------------------------
@@ -412,11 +392,78 @@ def _load_transcript_summary(p: Path) -> dict | None:
     return _load_json(p.parent / (p.stem + ".summary.json"))
 
 
-_LOAD_SUMMARY = {
-    "sessions": _load_session_summary,
-    "transcripts": _load_transcript_summary,
-    "notifications": lambda p: None,
+# ---------------------------------------------------------------------------
+# Domain dispatch — consolidated per-domain handlers
+#
+# A single ``DomainHandler`` dataclass replaces what used to be five parallel
+# dictionaries keyed by domain name (_DATE_EXTRACTORS, _LIST_META,
+# _READ_ENTRIES, _SEARCH_LINES, _LOAD_SUMMARY).  Adding a new domain now means
+# registering one handler here instead of editing five separate dicts.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DomainHandler:
+    """Per-domain dispatch functions. Unset fields fall back to no-op defaults."""
+
+    date_extract: Callable[[Path], date | None] = lambda p: None
+    list_meta: Callable[[Path], dict] = lambda p: {}
+    read_entries: Callable[[Path, int, str | None], list[dict]] = lambda p, n, f: []
+    search_lines: Callable[[Path], list[str]] = lambda p: []
+    load_summary: Callable[[Path], dict | None] = lambda p: None
+
+
+_DOMAIN_HANDLERS: dict[str, DomainHandler] = {
+    "sessions": DomainHandler(
+        date_extract=_session_date_from_dir,
+        list_meta=_list_session_meta,
+        read_entries=_read_session_messages,
+        search_lines=_session_search_lines,
+        load_summary=_load_session_summary,
+    ),
+    "transcripts": DomainHandler(
+        date_extract=_transcript_date,
+        list_meta=_list_transcript_meta,
+        read_entries=_read_transcript_turns,
+        search_lines=_transcript_search_lines,
+        load_summary=_load_transcript_summary,
+    ),
+    "notifications": DomainHandler(
+        date_extract=_notify_date,
+        list_meta=_list_notify_meta,
+        read_entries=_read_notify_entries,
+        search_lines=_notify_search_lines,
+    ),
+    "web-archive": DomainHandler(
+        date_extract=_notify_date,
+        list_meta=_list_notify_meta,
+        read_entries=_read_jsonl_entries,
+        search_lines=_jsonl_search_lines,
+    ),
+    "dns-whois": DomainHandler(
+        date_extract=_notify_date,
+        list_meta=_list_notify_meta,
+        read_entries=_read_jsonl_entries,
+        search_lines=_jsonl_search_lines,
+    ),
+    "image-analysis": DomainHandler(
+        date_extract=_notify_date,
+        list_meta=_list_notify_meta,
+        read_entries=_read_jsonl_entries,
+        search_lines=_jsonl_search_lines,
+    ),
+    "pdf-extract": DomainHandler(
+        date_extract=_notify_date,
+        list_meta=_list_notify_meta,
+        read_entries=_read_jsonl_entries,
+        search_lines=_jsonl_search_lines,
+    ),
 }
+
+
+def _get_domain_handler(name: str) -> DomainHandler:
+    """Return the dispatch handler for *name*, falling back to no-op defaults."""
+    return _DOMAIN_HANDLERS.get(name, DomainHandler())
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +534,7 @@ def search(
     speaker: str | None = None,
     cwd: str | None = None,
     any_word: bool = True,
-) -> str:
+) -> list[TextContent]:
     """Search across domains with FST-backed full-text search.
 
     Domains:
@@ -521,20 +568,20 @@ def search(
 
     if domain not in cfg.domains and domain != "all":
         valid = ", ".join(cfg.domains)
-        return f"Unknown domain '{domain}'. Valid: all, {valid if valid else '(no domains configured)'}"
+        return text_blocks(f"Unknown domain '{domain}'. Valid: all, {valid if valid else '(no domains configured)'}")
 
     if not query.strip():
-        return "Empty query - refine your search."
+        return text_blocks("Empty query - refine your search.")
 
     domains_to_search = list(cfg.domains.keys()) if domain == "all" else [domain]
 
     # Validate domain-specific filters
     if role and not any("role" in cfg.domains[d].filters for d in domains_to_search):
-        return f"'role' filter not supported for domain '{domain}'"
+        return text_blocks(f"'role' filter not supported for domain '{domain}'")
     if speaker and not any(
         "speaker" in cfg.domains[d].filters for d in domains_to_search
     ):
-        return f"'speaker' filter not supported for domain '{domain}'"
+        return text_blocks(f"'speaker' filter not supported for domain '{domain}'")
 
     # --- Fast path: try FST for each domain ---
     all_fst_results: list[dict] = []
@@ -549,7 +596,7 @@ def search(
             all_fst_results.extend(fst_results)
 
     if all_fst_results:
-        return _format_search_results(
+        return text_blocks(_format_search_results(
             all_fst_results,
             domain,
             query,
@@ -563,35 +610,28 @@ def search(
             role,
             speaker,
             cwd,
-        )
+        ))
 
     # FST was available for at least one domain but found nothing — treat the
     # FST index as authoritative and do NOT fall through to the slow scan.
     # (Previously an AND query with no all-words match would fall through to the
     # regex line scan, silently changing semantics.)
     if any_fst_attempted:
-        return "No results found."
+        return text_blocks("No results found.")
 
     # --- Slow path: line-by-line scan ---
     flags = 0 if case_sensitive else re.IGNORECASE
     if regex:
-        # Reject patterns with known catastrophic backtracking constructs.
-        # These checks are conservative by design — some safe regexes may be
-        # rejected, but the cost of a ReDoS hang is higher.  The nested /
-        # adjacent-quantifier checks require a quantifier or adjacency so safe
-        # patterns like "(?:foo)+" and "\d+ *\d+" are not false-positived.
-        _danger_checks = [
-            (r"[*+?]\)\s*[+*]", "nested quantifier after group"),       # (a*)*, (a+)+
-            (r"\([^)]*\|[^)]*\)\s*[+*]", "alternation with quantifier"),  # (a|b)+
-            (r"[+*?][+*?]", "adjacent quantifiers"),                      # a**, a?*
-        ]
-        for pat, desc in _danger_checks:
-            if re.search(pat, query):
-                return f"Potentially unsafe regex — {desc} detected."
+        # Reject patterns with known catastrophic backtracking constructs (shared
+        # ReDoS guard — see _regex_danger). Conservative by design: some safe
+        # regexes may be rejected, but the cost of a ReDoS hang is higher.
+        danger = _regex_danger(query)
+        if danger is not None:
+            return text_blocks(f"Potentially unsafe regex — {danger} detected.")
         try:
             pattern = re.compile(query, flags)
         except re.error as e:
-            return f"Invalid regex: {e}"
+            return text_blocks(f"Invalid regex: {e}")
     else:
         pattern = re.compile(re.escape(query), flags)
 
@@ -603,8 +643,9 @@ def search(
     for d_name in domains_to_search:
         d_cfg = cfg.domains[d_name]
         files = _iter_domain_files(d_cfg)
-        date_fn = _DATE_EXTRACTORS.get(d_name, lambda p: None)
-        search_fn = _SEARCH_LINES.get(d_name, lambda p: [])
+        handler = _get_domain_handler(d_name)
+        date_fn = handler.date_extract
+        search_fn = handler.search_lines
 
         for f in files:
             if not f.exists():
@@ -623,10 +664,20 @@ def search(
 
             file_matches: list[dict] = []
             try:
+                # Install a temporary SIGALRM handler for the slow-path regex
+                # scan so a pathological pattern cannot hang the server.  Save
+                # the previous handler and restore it in the finally block
+                # below — otherwise the _RegexTimeout-raising handler leaks into
+                # the whole process and any later signal.alarm() from a library
+                # would raise _RegexTimeout in an unguarded context.
                 _has_sigalrm = hasattr(signal, "SIGALRM")
+                _prev_alarm_handler = None
+                _alarm_installed = False
                 if _has_sigalrm:
                     try:
+                        _prev_alarm_handler = signal.getsignal(signal.SIGALRM)
                         signal.signal(signal.SIGALRM, _regex_alarm_handler)
+                        _alarm_installed = True
                         signal.alarm(_SLOW_SCAN_TIMEOUT)
                     except ValueError:
                         # signal.signal() only works from the main thread.
@@ -635,7 +686,7 @@ def search(
                         # under mcp ≥2 handlers run in a thread pool and
                         # this fallback avoids crashing the search there.
                         # See jing_meta/mcp_base.py for the concurrency model.
-                        _has_sigalrm = False
+                        _alarm_installed = False
                 # Speaker filter (transcripts only): build the line->turn map
                 # ONCE per file, before the per-line loop, then look it up by
                 # line number inside the loop. Hoisting avoids re-parsing the
@@ -693,21 +744,26 @@ def search(
                             }
                         )
                 finally:
-                    if _has_sigalrm:
+                    # Always cancel the pending alarm AND restore the previous
+                    # SIGALRM handler so nothing leaks into the rest of the
+                    # process — including on the _RegexTimeout exception path
+                    # (raised inside the loop above) that this finally guards.
+                    if _alarm_installed:
                         signal.alarm(0)
+                        signal.signal(signal.SIGALRM, _prev_alarm_handler)
             except _RegexTimeout:
-                return (
+                return text_blocks(
                     f"Search timed out after {_SLOW_SCAN_TIMEOUT}s — "
                     "the regex pattern may be too expensive."
                 )
             all_matches.extend(file_matches)
 
     if not all_matches:
-        return f"No matching entries found for '{query}' in {domain}."
+        return text_blocks(f"No matching entries found for '{query}' in {domain}.")
 
     all_matches.sort(key=lambda m: (m["date"], m["line"]), reverse=False)
     all_matches.sort(key=lambda m: m["date"], reverse=True)
-    return _render_matches(
+    return text_blocks(_render_matches(
         all_matches[:max_results],
         domain,
         query,
@@ -716,7 +772,7 @@ def search(
         regex,
         role,
         speaker,
-    )
+    ))
 
 
 @mcp.tool()
@@ -726,7 +782,7 @@ def list_domain(
     date_to: str | None = None,
     max_results: int = 50,
     cwd: str | None = None,
-) -> str:
+) -> list[TextContent]:
     """List available files in a domain with metadata and summaries.
 
     Args:
@@ -741,18 +797,19 @@ def list_domain(
     d_cfg = cfg.domains.get(domain)
     if d_cfg is None:
         valid = ", ".join(cfg.domains)
-        return f"Unknown domain '{domain}'. Valid: {valid if valid else '(no domains configured)'}"
+        return text_blocks(f"Unknown domain '{domain}'. Valid: {valid if valid else '(no domains configured)'}")
 
     d_from = date.fromisoformat(date_from) if date_from else None
     d_to = date.fromisoformat(date_to) if date_to else None
 
     files = _iter_domain_files(d_cfg)
     if not files:
-        return f"No {d_cfg.label}s found."
+        return text_blocks(f"No {d_cfg.label}s found.")
 
-    date_fn = _DATE_EXTRACTORS.get(domain, lambda p: None)
-    list_meta_fn = _LIST_META.get(domain, lambda p: {})
-    load_summary_fn = _LOAD_SUMMARY.get(domain, lambda p: None)
+    handler = _get_domain_handler(domain)
+    date_fn = handler.date_extract
+    list_meta_fn = handler.list_meta
+    load_summary_fn = handler.load_summary
 
     label = f"filtered: {date_from} -> {date_to}" if date_from or date_to else "all"
     output = [f"{d_cfg.label.title()}s ({label}):"]
@@ -793,8 +850,8 @@ def list_domain(
         count += 1
 
     if count == 0:
-        return f"No {d_cfg.label}s match the filter."
-    return "\n".join(output)
+        return text_blocks(f"No {d_cfg.label}s match the filter.")
+    return text_blocks("\n".join(output))
 
 
 @mcp.tool()
@@ -805,7 +862,7 @@ def read(
     role: str | None = None,
     speaker: str | None = None,
     cwd: str | None = None,
-) -> str:
+) -> list[TextContent]:
     """Read entries from a domain file.
 
     Args:
@@ -821,18 +878,19 @@ def read(
     d_cfg = cfg.domains.get(domain)
     if d_cfg is None:
         valid = ", ".join(cfg.domains)
-        return f"Unknown domain '{domain}'. Valid: {valid if valid else '(no domains configured)'}"
+        return text_blocks(f"Unknown domain '{domain}'. Valid: {valid if valid else '(no domains configured)'}")
 
     target = _resolve_file(d_cfg, id)
     if target is None:
-        return f"{d_cfg.label.title()} not found: {id}"
+        return text_blocks(f"{d_cfg.label.title()} not found: {id}")
 
     if cwd and domain == "sessions" and not _session_matches_cwd(target, cwd):
-        return f"{d_cfg.label.title()} not found in {cwd}: {id}"
+        return text_blocks(f"{d_cfg.label.title()} not found in {cwd}: {id}")
 
-    list_meta_fn = _LIST_META.get(domain, lambda p: {})
-    load_summary_fn = _LOAD_SUMMARY.get(domain, lambda p: None)
-    read_fn: Callable[[Path, int, str | None], list[dict]] = _READ_ENTRIES.get(domain, lambda p, n, _: [])
+    handler = _get_domain_handler(domain)
+    list_meta_fn = handler.list_meta
+    load_summary_fn = handler.load_summary
+    read_fn: Callable[[Path, int, str | None], list[dict]] = handler.read_entries
 
     meta = list_meta_fn(target)
     summary = load_summary_fn(target)
@@ -860,11 +918,11 @@ def read(
     for entry in entries:
         output.extend(render_read_entry(domain, entry))
 
-    return "\n".join(output)
+    return text_blocks("\n".join(output))
 
 
 @mcp.tool()
-def summary(domain: str, id: str, cwd: str | None = None) -> str:
+def summary(domain: str, id: str, cwd: str | None = None) -> list[TextContent]:
     """Get the AI-generated summary for a domain entry.
 
     Args:
@@ -877,33 +935,34 @@ def summary(domain: str, id: str, cwd: str | None = None) -> str:
     d_cfg = cfg.domains.get(domain)
     if d_cfg is None:
         valid = ", ".join(cfg.domains)
-        return f"Unknown domain '{domain}'. Valid: {valid if valid else '(no domains configured)'}"
+        return text_blocks(f"Unknown domain '{domain}'. Valid: {valid if valid else '(no domains configured)'}")
     if domain not in ("sessions", "transcripts"):
-        return f"Summaries not available for domain '{domain}'."
+        return text_blocks(f"Summaries not available for domain '{domain}'.")
 
     target = _resolve_file(d_cfg, id)
     if target is None:
-        return f"{d_cfg.label.title()} not found: {id}"
+        return text_blocks(f"{d_cfg.label.title()} not found: {id}")
 
     if cwd and domain == "sessions" and not _session_matches_cwd(target, cwd):
-        return f"{d_cfg.label.title()} not found in {cwd}: {id}"
+        return text_blocks(f"{d_cfg.label.title()} not found in {cwd}: {id}")
 
-    load_summary_fn = _LOAD_SUMMARY.get(domain, lambda p: None)
-    list_meta_fn = _LIST_META.get(domain, lambda p: {})
+    handler = _get_domain_handler(domain)
+    load_summary_fn = handler.load_summary
+    list_meta_fn = handler.list_meta
 
     s = load_summary_fn(target)
     if s is None:
         meta = list_meta_fn(target)
-        return (
+        return text_blocks(
             f"No summary available for {target.name}\n"
             f"  Title: {meta.get('title', '?')}\n"
             f"This {d_cfg.label} has not been summarized yet."
         )
 
     if domain == "sessions":
-        return _format_session_summary(s, target.name)
+        return text_blocks(_format_session_summary(s, target.name))
     else:
-        return _format_transcript_summary(s, target.name)
+        return text_blocks(_format_transcript_summary(s, target.name))
 
 
 @mcp.tool()
@@ -964,7 +1023,7 @@ def search_history(
     max_results: int = 30,
     regex: bool = False,
     case_sensitive: bool = False,
-) -> str:
+) -> list[TextContent]:
     """Search the Vibe command history (vibehistory file).
 
     Args:
@@ -974,27 +1033,26 @@ def search_history(
         case_sensitive: If True, match case-sensitively (default False)
     """
     if not query.strip():
-        return "Empty query."
+        return text_blocks("Empty query.")
 
     cfg = _get_config()
     if not cfg.history_file or not cfg.history_file.is_file():
-        return "No history file found."
+        return text_blocks("No history file found.")
 
     flags = 0 if case_sensitive else re.IGNORECASE
-    if regex:
-        if re.search(r"(\+\s*\)|\*\s*\)|\}\s*\))\s*[+*]", query):
-            return "Potentially unsafe regex - nested quantifiers detected."
+    if regex and _regex_danger(query) is not None:
+        return text_blocks(f"Potentially unsafe regex - {_regex_danger(query)} detected.")
     try:
         pattern = re.compile(query, flags) if regex else re.compile(
             re.escape(query), flags
         )
     except re.error as e:
-        return f"Invalid regex: {e}"
+        return text_blocks(f"Invalid regex: {e}")
 
     try:
         lines = cfg.history_file.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError as e:
-        return f"Error: {e}"
+        return text_blocks(f"Error: {e}")
 
     matches = []
     for i, line in enumerate(lines, 1):
@@ -1003,9 +1061,9 @@ def search_history(
             matches.append({"line": i, "text": stripped.strip('"')[:300]})
 
     if not matches:
-        return "No matching commands found."
+        return text_blocks("No matching commands found.")
     capped = matches[:max_results]
-    return (
+    return text_blocks(
         f"Found {len(capped)} match(es) for '{query}':\n"
         + "\n".join(f"  L{m['line']}: {m['text']}" for m in capped)
     )
@@ -1018,7 +1076,7 @@ def search_log(
     regex: bool = False,
     case_sensitive: bool = False,
     level: str | None = None,
-) -> str:
+) -> list[TextContent]:
     """Search the Vibe runtime log (vibe.log).
 
     Args:
@@ -1029,27 +1087,26 @@ def search_log(
         level:          Filter by log level: WARNING, INFO, ERROR, DEBUG
     """
     if not query.strip():
-        return "Empty query."
+        return text_blocks("Empty query.")
 
     cfg = _get_config()
     if not cfg.log_file or not cfg.log_file.is_file():
-        return "No log file found."
+        return text_blocks("No log file found.")
 
     flags = 0 if case_sensitive else re.IGNORECASE
-    if regex:
-        if re.search(r"(\+\s*\)|\*\s*\)|\}\s*\))\s*[+*]", query):
-            return "Potentially unsafe regex - nested quantifiers detected."
+    if regex and _regex_danger(query) is not None:
+        return text_blocks(f"Potentially unsafe regex - {_regex_danger(query)} detected.")
     try:
         pattern = re.compile(query, flags) if regex else re.compile(
             re.escape(query), flags
         )
     except re.error as e:
-        return f"Invalid regex: {e}"
+        return text_blocks(f"Invalid regex: {e}")
 
     try:
         lines = cfg.log_file.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError as e:
-        return f"Error: {e}"
+        return text_blocks(f"Error: {e}")
 
     matches = []
     for i, line in enumerate(lines, 1):
@@ -1064,9 +1121,9 @@ def search_log(
             matches.append({"line": i, "text": stripped[:400]})
 
     if not matches:
-        return f"No matching entries found for '{query}'."
+        return text_blocks(f"No matching entries found for '{query}'.")
     capped = matches[:max_results]
-    return (
+    return text_blocks(
         f"Found {len(capped)} match(es) for '{query}':\n"
         + "\n".join(f"  L{m['line']}: {m['text']}" for m in capped)
     )
