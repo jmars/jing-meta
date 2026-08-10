@@ -91,14 +91,65 @@ def test_context_denies_first_substantive_turn_without_reads(tmp_path):
     assert decision is not None and decision["decision"] == "deny"
 
 
-def test_context_passes_when_both_reads_present(tmp_path):
+def test_context_passes_when_memory_semantic_search_present(tmp_path):
+    # Memory SEMANTIC search satisfies the mandatory gate (history optional).
     msg, _ = _write_transcript(tmp_path, [
         _user("do the thing"),
-        _assistant("unified-history_search"),
-        _assistant("memory_search_nodes"),
+        _assistant("memory_search_semantic"),
+        _assistant("unified-history_search"),  # ideal addition, still fine
     ])
     out = _run(context.main, _payload(msg))
     assert out.strip() == ""  # no deny
+
+
+def test_context_denies_when_only_history_search(tmp_path):
+    # Unified-history + substantive work but NO semantic search -> deny
+    # (semantic search is the mandatory gate; history alone does not satisfy it).
+    msg, _ = _write_transcript(tmp_path, [
+        _user("do the thing"),
+        _assistant("unified-history_search"),
+        _assistant("bash"),
+    ])
+    out = _run(context.main, _payload(msg))
+    decision = json.loads(out) if out.strip() else None
+    assert decision is not None and decision["decision"] == "deny"
+
+
+def test_context_denies_when_only_non_semantic_memory_read(tmp_path):
+    # A lexical memory read + substantive work but NO semantic search -> deny.
+    msg, _ = _write_transcript(tmp_path, [
+        _user("do the thing"),
+        _assistant("memory_search_nodes"),
+        _assistant("bash"),
+    ])
+    out = _run(context.main, _payload(msg))
+    decision = json.loads(out) if out.strip() else None
+    assert decision is not None and decision["decision"] == "deny"
+
+
+def test_context_denies_when_shell_sandbox_without_semantic_search(tmp_path):
+    # Shell/sandbox execution is substantive: it must trip the deny even when
+    # the turn otherwise looks like inspection. Semantic search still required.
+    for tool in ("shell-sandbox_shell_run", "shell-sandbox_shell_job_start",
+                 "shell-sandbox_shell_job_kill"):
+        msg, _ = _write_transcript(tmp_path, [
+            _user("do the thing"),
+            _assistant(tool),
+        ])
+        out = _run(context.main, _payload(msg))
+        decision = json.loads(out) if out.strip() else None
+        assert decision is not None and decision["decision"] == "deny", tool
+
+
+def test_context_shell_sandbox_passes_with_semantic_search(tmp_path):
+    # Shell sandbox + semantic search -> gate satisfied (no deny).
+    msg, _ = _write_transcript(tmp_path, [
+        _user("do the thing"),
+        _assistant("memory_search_semantic"),
+        _assistant("shell-sandbox_shell_run"),
+    ])
+    out = _run(context.main, _payload(msg))
+    assert out.strip() == ""
 
 
 def test_context_passes_non_orchestrator(tmp_path):
