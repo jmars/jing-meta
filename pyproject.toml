@@ -33,10 +33,22 @@ jing-memory = "memory.__main__:main"
 jing-dreamer = "dreamer.__main__:main"
 jing-archiver = "memory.archiver:main"
 jing-memory-stats = "memory.stats_server:main"
+jing-gardener-hook = "jing_meta.hooks.gardener:main"
+jing-archiver-hook = "jing_meta.hooks.archiver:main"
+jing-context-bootstrap = "jing_meta.hooks.context:main"
+jing-enforce-memory = "jing_meta.hooks.enforce:main"
+jing-maintenance-digest = "jing_meta.hooks.common:digest_cli"
 jing-meta = "jing_meta.cli:main"
+jing-index-hook = "jing_meta.hooks.indexhook:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["jing_meta", "indexer", "search", "memory", "dreamer"]
+
+[tool.hatch.build.targets.wheel.force-include]
+# Bundle the C DAFSA shared lib into the wheel so jing-indexer / jing-search
+# work after a `uv tool install` (libdafsa.so is gitignored and not otherwise
+# shipped; the ctypes layer resolves it relative to the installed package).
+"indexer/dafsa/libdafsa.so" = "indexer/dafsa/libdafsa.so"
 
 [tool.uv]
 package = true
@@ -59,3 +71,4 @@ disallow_untyped_defs = false
 disallow_incomplete_defs = false
 warn_no_return = false
 show_error_codes = true
+

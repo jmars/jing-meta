@@ -69,6 +69,27 @@ typedef struct {
 
 void dafsa_stats(const dafsa *d, dafsa_stats_out *out);
 
+/* ─── Write-ahead log (M5) ──────────────────────────────────────────── */
+
+#define DAFSA_WAL_MAGIC0 'D'   /* 'D','A','W','L' */
+#define DAFSA_WAL_VERSION 1
+
+#define DAFSA_WAL_OP_ADD 1
+#define DAFSA_WAL_OP_DEL 2
+
+typedef struct dafsa_wal dafsa_wal;   /* opaque */
+
+dafsa_wal *dafsa_wal_open(const char *path);
+int   dafsa_wal_append_add(dafsa_wal *w, const unsigned char *key, uint32_t key_len);
+int   dafsa_wal_append_del(dafsa_wal *w, const unsigned char *key, uint32_t key_len);
+int   dafsa_wal_sync(dafsa_wal *w);
+uint64_t dafsa_wal_size(const dafsa_wal *w);
+typedef int (*dafsa_wal_replay_cb)(uint8_t op, const unsigned char *key, uint32_t key_len, void *user);
+int   dafsa_wal_replay(dafsa_wal *w, dafsa_wal_replay_cb cb, void *user);
+void  dafsa_wal_close(dafsa_wal *w);
+
+dafsa_view *dafsa_view_open_layered(const char *fst_path, const char *wal_path);
+
 /* ─── ABI version probe ─────────────────────────────────────────────── */
 
 #define DAFSA_ABI_VERSION 1

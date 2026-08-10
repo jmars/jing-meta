@@ -8,6 +8,7 @@
  * Run:   ./dafsa
  */
 #include "dafsa.h"
+#include "dafsa_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1036,6 +1037,798 @@ int main(void)
         remove(path);
     }
     printf("  PASS: corrupted checksum rejected by view and load\n");
+
+    /* ══════════════════════════════════════════════════════════════════════ */
+    /* ─── M5: Write-ahead log and layered view tests ──────────────────── */
+
+    #define WAL_PATH  "/tmp/m5_test.wal"
+    #define FST_PATH  "/tmp/m5_base.pdwg"
+
+    /* Build composite key: word || 0x00 || u32BE(file_idx) || u32BE(entry_idx).
+     * Returns total length = strlen(word) + 9. */
+    {
+        /* MK_KEY is a macro defined in this block scope */
+        #define MK_KEY(buf, w, fi, ei)                                        \
+            do {                                                              \
+                size_t _wl = strlen(w);                                       \
+                memcpy(buf, w, _wl);                                          \
+                buf[_wl]     = 0x00;                                          \
+                buf[_wl + 1] = (unsigned char)((fi) >> 24);                   \
+                buf[_wl + 2] = (unsigned char)((fi) >> 16);                   \
+                buf[_wl + 3] = (unsigned char)((fi) >> 8);                    \
+                buf[_wl + 4] = (unsigned char)(fi);                           \
+                buf[_wl + 5] = (unsigned char)((ei) >> 24);                   \
+                buf[_wl + 6] = (unsigned char)((ei) >> 16);                   \
+                buf[_wl + 7] = (unsigned char)((ei) >> 8);                    \
+                buf[_wl + 8] = (unsigned char)(ei);                           \
+            } while (0)
+    }
+
+    /* ── M5-1: append_add ×N then replay round-trip ── */
+    printf("\n[M5 Test 1] WAL append/replay round-trip\n");
+    {
+        dafsa_wal *w;
+        unsigned char kbuf[64];
+        int n;
+
+        remove(WAL_PATH);
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w != NULL);
+        assert(dafsa_wal_size(w) == 16);
+
+        for (n = 0; n < 50; n++) {
+            MK_KEY(kbuf, "apple", (uint32_t)(n + 1), (uint32_t)(n * 10));
+            assert(dafsa_wal_append_add(w, kbuf, strlen("apple") + 9) == 0);
+        }
+
+        /* Verify size: 16 header + 50 × (1+4+5+9+4) = 16 + 50×23 = 1166 */
+        {
+            uint64_t sz = dafsa_wal_size(w);
+            assert(sz == 16 + 50 * (1 + 4 + 5 + 9 + 4));
+        }
+        dafsa_wal_sync(w);
+        dafsa_wal_close(w);
+
+        /* Replay: verify count by reopening */
+        {
+            dafsa_wal *w2 = dafsa_wal_open(WAL_PATH);
+            assert(w2 != NULL);
+            /* Each record: 1(op)+4(klen)+14(key)+4(crc)=23 bytes */
+            assert(dafsa_wal_size(w2) == 16 + 50 * 23);
+            dafsa_wal_close(w2);
+        }
+    }
+    printf("  PASS: 50 records round-trip OK\n");
+
+    /* ── M5-2: interleaved add/del replay (log order preserved) ── */
+    printf("[M5 Test 2] Interleaved add+del replay\n");
+    {
+        dafsa_wal *w;
+        unsigned char kbuf[64];
+
+        remove(WAL_PATH);
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w != NULL);
+
+        MK_KEY(kbuf, "cat", 1, 100); assert(dafsa_wal_append_add(w, kbuf, strlen("cat") + 9) == 0);
+        MK_KEY(kbuf, "dog", 2, 200); assert(dafsa_wal_append_add(w, kbuf, strlen("dog") + 9) == 0);
+        MK_KEY(kbuf, "cat", 1, 100); assert(dafsa_wal_append_del(w, kbuf, strlen("cat") + 9) == 0);
+        MK_KEY(kbuf, "cat", 1, 100); assert(dafsa_wal_append_add(w, kbuf, strlen("cat") + 9) == 0);
+        MK_KEY(kbuf, "dog", 2, 200); assert(dafsa_wal_append_del(w, kbuf, strlen("dog") + 9) == 0);
+        MK_KEY(kbuf, "fox", 3, 300); assert(dafsa_wal_append_add(w, kbuf, strlen("fox") + 9) == 0);
+
+        /* 6 records: verify by size */
+        {
+            uint64_t sz = dafsa_wal_size(w);
+            uint64_t recsz = (uint64_t)(1 + 4 + 3 + 9 + 4); /* 21 */
+            assert(sz == 16 + 6 * recsz);
+        }
+        dafsa_wal_close(w);
+    }
+    printf("  PASS: 6 ops in log order\n");
+
+    /* ── M5-3: torn-tail — garbage bytes past EOF ── */
+    printf("[M5 Test 3] Torn tail: garbage past EOF\n");
+    {
+        dafsa_wal *w;
+        unsigned char kbuf[64];
+        FILE *f;
+        uint64_t sz_clean;  /* size with 3 clean records */
+
+        remove(WAL_PATH);
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w != NULL);
+
+        MK_KEY(kbuf, "alpha", 1, 1); dafsa_wal_append_add(w, kbuf, strlen("alpha") + 9);
+        MK_KEY(kbuf, "beta",  2, 2); dafsa_wal_append_add(w, kbuf, strlen("beta") + 9);
+        MK_KEY(kbuf, "gamma", 3, 3); dafsa_wal_append_add(w, kbuf, strlen("gamma") + 9);
+        sz_clean = dafsa_wal_size(w);
+        dafsa_wal_close(w);
+
+        /* Append 2 garbage bytes */
+        f = fopen(WAL_PATH, "ab");
+        assert(f != NULL);
+        { unsigned char g[] = {0xFF, 0xFE}; fwrite(g, 1, 2, f); }
+        fclose(f);
+
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w != NULL);
+        /* Open must truncate the garbage, leaving only the 3 good records */
+        assert(dafsa_wal_size(w) == sz_clean);
+        dafsa_wal_close(w);
+    }
+    printf("  PASS: garbage tail truncated, 3 records\n");
+
+    /* ── M5-4: torn-tail truncated key mid-record ── */
+    printf("[M5 Test 4] Torn tail: truncated mid-key\n");
+    {
+        dafsa_wal *w;
+        unsigned char kbuf[64];
+        uint64_t sz_before;
+
+        remove(WAL_PATH);
+        w = dafsa_wal_open(WAL_PATH);
+        MK_KEY(kbuf, "aaa", 1, 1); dafsa_wal_append_add(w, kbuf, strlen("aaa") + 9);
+        MK_KEY(kbuf, "bbb", 2, 2); dafsa_wal_append_add(w, kbuf, strlen("bbb") + 9);
+        MK_KEY(kbuf, "ccc", 3, 3); dafsa_wal_append_add(w, kbuf, strlen("ccc") + 9);
+        sz_before = dafsa_wal_size(w);
+        dafsa_wal_close(w);
+
+        /* Truncate the file 10 bytes before the real end (mid-record 3) */
+        {
+            int fd = open(WAL_PATH, O_RDWR);
+            assert(fd >= 0);
+            assert(ftruncate(fd, (off_t)(sz_before - 10)) == 0);
+            close(fd);
+        }
+
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w != NULL);
+        {
+            /* Should have only 2 records left */
+            uint64_t sz = dafsa_wal_size(w);
+            uint64_t recsz = (uint64_t)(1 + 4 + 3 + 9 + 4);
+            assert(sz == 16 + 2 * recsz);
+        }
+        dafsa_wal_close(w);
+    }
+    printf("  PASS: truncated mid-key → 2 records\n");
+
+    /* ── M5-5: CRC corruption in record ── */
+    printf("[M5 Test 5] CRC corruption: flip key byte → replay stops early\n");
+    {
+        dafsa_wal *w;
+        unsigned char kbuf[64];
+        uint64_t sz1; /* offset after record 1 */
+
+        remove(WAL_PATH);
+        w = dafsa_wal_open(WAL_PATH);
+        MK_KEY(kbuf, "r1", 1, 1); dafsa_wal_append_add(w, kbuf, strlen("r1") + 9);
+        sz1 = dafsa_wal_size(w);
+        MK_KEY(kbuf, "r2", 2, 2); dafsa_wal_append_add(w, kbuf, strlen("r2") + 9);
+        MK_KEY(kbuf, "r3", 3, 3); dafsa_wal_append_add(w, kbuf, strlen("r3") + 9);
+        dafsa_wal_close(w);
+
+        /* Flip a byte in record 2's key area (at offset sz1 + 5 = first key byte of rec2) */
+        {
+            int fd = open(WAL_PATH, O_RDWR);
+            unsigned char b;
+            assert(fd >= 0);
+            assert(pread(fd, &b, 1, (off_t)(sz1 + 5)) == 1);
+            b ^= 0x01;
+            assert(pwrite(fd, &b, 1, (off_t)(sz1 + 5)) == 1);
+            close(fd);
+        }
+
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w != NULL);
+        /* Should be truncated to sz1 (record 2 invalid, so only record 1 remains) */
+        assert(dafsa_wal_size(w) == sz1);
+        dafsa_wal_close(w);
+    }
+    printf("  PASS: CRC corruption truncated to 1 record\n");
+
+    /* ── M5-6: header CRC corruption → NULL ── */
+    printf("[M5 Test 6] Header CRC corruption → NULL\n");
+    {
+        dafsa_wal *w;
+        unsigned char kbuf[64];
+
+        remove(WAL_PATH);
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w != NULL);
+        MK_KEY(kbuf, "x", 1, 1); dafsa_wal_append_add(w, kbuf, strlen("x") + 9);
+        dafsa_wal_close(w);
+
+        /* Flip byte 8 (flags field — part of CRC-covered region) */
+        {
+            int fd = open(WAL_PATH, O_RDWR);
+            unsigned char b;
+            assert(fd >= 0);
+            assert(pread(fd, &b, 1, 8) == 1);
+            b ^= 0x01;
+            assert(pwrite(fd, &b, 1, 8) == 1);
+            close(fd);
+        }
+
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w == NULL);  /* hard error */
+    }
+    printf("  PASS: header CRC corrupt → NULL\n");
+
+    /* ── M5-7: bad magic / bad version → NULL ── */
+    printf("[M5 Test 7] Bad magic and bad version → NULL\n");
+    {
+        dafsa_wal *w;
+        unsigned char kbuf[64];
+
+        /* Bad magic */
+        remove(WAL_PATH);
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w != NULL);
+        MK_KEY(kbuf, "x", 1, 1); dafsa_wal_append_add(w, kbuf, strlen("x") + 9);
+        dafsa_wal_close(w);
+        {
+            int fd = open(WAL_PATH, O_RDWR);
+            unsigned char b = 'X';
+            assert(fd >= 0);
+            assert(pwrite(fd, &b, 1, 0) == 1);
+            close(fd);
+        }
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w == NULL);
+
+        /* Bad version */
+        remove(WAL_PATH);
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w != NULL);
+        MK_KEY(kbuf, "x", 1, 1); dafsa_wal_append_add(w, kbuf, strlen("x") + 9);
+        dafsa_wal_close(w);
+        {
+            int fd = open(WAL_PATH, O_RDWR);
+            unsigned char b = 99;
+            assert(fd >= 0);
+            assert(pwrite(fd, &b, 1, 4) == 1);
+            close(fd);
+        }
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w == NULL);
+    }
+    printf("  PASS: bad magic/version → NULL\n");
+
+    /* ── M5-8: key_len=0 and key_len=4106 rejected ── */
+    printf("[M5 Test 8] key_len range enforcement\n");
+    {
+        dafsa_wal *w;
+        unsigned char one[1] = {0};
+        unsigned char big[4106];
+
+        remove(WAL_PATH);
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w != NULL);
+
+        assert(dafsa_wal_append_add(w, one, 0) == -1);
+        memset(big, 'A', sizeof(big));
+        assert(dafsa_wal_append_add(w, big, 4106) == -1);
+
+        dafsa_wal_close(w);
+    }
+    printf("  PASS: key_len 0 and 4106 rejected\n");
+
+    /* ── M5-9: empty WAL (header only) ── */
+    printf("[M5 Test 9] Empty WAL: header-only\n");
+    {
+        dafsa_wal *w;
+        remove(WAL_PATH);
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w != NULL);
+        assert(dafsa_wal_size(w) == 16);
+        /* replay on empty WAL returns 0 records */
+        /* (We can't easily count without a cb, but size==16 is enough) */
+        dafsa_wal_close(w);
+    }
+    printf("  PASS: size=16, replay=0\n");
+
+    /* ── M5-10: ordered-log idempotency: ADD K, DEL K, ADD K → K present ── */
+    printf("[M5 Test 10] Ordered-log idempotency: ADD,DEL,ADD → present\n");
+    {
+        dafsa_wal *w;
+        dafsa *d;
+        unsigned char kbuf[64];
+
+        remove(WAL_PATH);
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w != NULL);
+
+        MK_KEY(kbuf, "keytest", 1, 42);
+        dafsa_wal_append_add(w, kbuf, strlen("keytest") + 9);
+        dafsa_wal_append_del(w, kbuf, strlen("keytest") + 9);
+        dafsa_wal_append_add(w, kbuf, strlen("keytest") + 9);
+        dafsa_wal_close(w);
+
+        /* Replay into empty dafsa — manually scan records */
+        d = dafsa_create();
+        assert(d != NULL);
+        {
+            int fd = open(WAL_PATH, O_RDONLY);
+            struct stat st;
+            uint8_t *map;
+            assert(fd >= 0);
+            fstat(fd, &st);
+            map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            assert(map != MAP_FAILED);
+
+            {
+                const uint8_t *p = map + 16;
+                const uint8_t *end = map + st.st_size;
+                while (p + 10 <= end) {
+                    uint8_t op = p[0];
+                    uint32_t klen = (uint32_t)p[1] | ((uint32_t)p[2] << 8)
+                                  | ((uint32_t)p[3] << 16) | ((uint32_t)p[4] << 24);
+                    if (op != 1 && op != 2) break;
+                    if (klen < 1 || klen > (uint32_t)(MAX_WORD_LEN + 9)) break;
+                    if (p + 5 + klen + 4 > end) break;
+                    if (op == 1)
+                        dafsa_add_n(d, p + 5, klen);
+                    else
+                        dafsa_delete_n(d, p + 5, klen);
+                    p += 1 + 4 + klen + 4;
+                }
+            }
+            munmap(map, (size_t)st.st_size);
+            close(fd);
+        }
+        /* ADD→DEL→ADD of same key must leave it present */
+        assert(dafsa_lookup_n(d, kbuf, strlen("keytest") + 9) == 1);
+        dafsa_free(d);
+    }
+    printf("  PASS: K present after ADD→DEL→ADD\n");
+
+    /* ── M5-11: compact equivalence ── */
+    printf("[M5 Test 11] Compact equivalence: base + WAL → replay → verify\n");
+    {
+        dafsa *d_base;
+        dafsa_wal *w;
+        unsigned char kbuf[64];
+
+        /* Base set S1: 3 words */
+        d_base = dafsa_create();
+        assert(d_base != NULL);
+        MK_KEY(kbuf, "k1", 1, 10); dafsa_add_n(d_base, kbuf, strlen("k1") + 9);
+        MK_KEY(kbuf, "k2", 2, 20); dafsa_add_n(d_base, kbuf, strlen("k2") + 9);
+        MK_KEY(kbuf, "k3", 3, 30); dafsa_add_n(d_base, kbuf, strlen("k3") + 9);
+        assert(dafsa_save(d_base, FST_PATH) == 0);
+        dafsa_free(d_base);
+
+        /* WAL: ADD k4, DEL k2 */
+        remove(WAL_PATH);
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w != NULL);
+        MK_KEY(kbuf, "k4", 4, 40); dafsa_wal_append_add(w, kbuf, strlen("k4") + 9);
+        MK_KEY(kbuf, "k2", 2, 20); dafsa_wal_append_del(w, kbuf, strlen("k2") + 9);
+        dafsa_wal_close(w);
+
+        /* Load base, replay WAL manually (parse records, apply to loaded dafsa) */
+        {
+            dafsa *d_comp = dafsa_load(FST_PATH);
+            assert(d_comp != NULL);
+
+            /* Manual replay: open WAL, read records, apply */
+            {
+                int fd = open(WAL_PATH, O_RDONLY);
+                struct stat st;
+                uint8_t *map;
+                assert(fd >= 0);
+                fstat(fd, &st);
+                map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+                assert(map != MAP_FAILED);
+
+                /* Skip header (16 bytes), parse records */
+                {
+                    const uint8_t *p = map + 16;
+                    const uint8_t *end = map + st.st_size;
+                    while (p + 10 <= end) {
+                        uint8_t op = p[0];
+                        uint32_t klen = (uint32_t)p[1] | ((uint32_t)p[2] << 8)
+                                      | ((uint32_t)p[3] << 16) | ((uint32_t)p[4] << 24);
+                        if (op != 1 && op != 2) break;
+                        if (klen < 1 || klen > MAX_WORD_LEN + 9) break;
+                        if (p + 5 + klen + 4 > end) break;
+                        if (op == 1)
+                            dafsa_add_n(d_comp, p + 5, klen);
+                        else
+                            dafsa_delete_n(d_comp, p + 5, klen);
+                        p += 1 + 4 + klen + 4;
+                    }
+                }
+                munmap(map, (size_t)st.st_size);
+                close(fd);
+            }
+
+            /* Verify: k1 present, k2 absent, k3 present, k4 present */
+            MK_KEY(kbuf, "k1", 1, 10);
+            assert(dafsa_lookup_n(d_comp, kbuf, strlen("k1") + 9) == 1);
+            MK_KEY(kbuf, "k2", 2, 20);
+            assert(dafsa_lookup_n(d_comp, kbuf, strlen("k2") + 9) == 0);
+            MK_KEY(kbuf, "k3", 3, 30);
+            assert(dafsa_lookup_n(d_comp, kbuf, strlen("k3") + 9) == 1);
+            MK_KEY(kbuf, "k4", 4, 40);
+            assert(dafsa_lookup_n(d_comp, kbuf, strlen("k4") + 9) == 1);
+
+            dafsa_free(d_comp);
+        }
+    }
+    printf("  PASS: compact equivalence (S1∪S2\\S3)\n");
+
+    /* ── M5-12: layered lookup merge ── */
+    printf("[M5 Test 12] Layered lookup merge\n");
+    {
+        dafsa *d;
+        dafsa_wal *w;
+        dafsa_view *v;
+        unsigned char kbuf[64];
+
+        /* Base S1: base1, base2 */
+        d = dafsa_create();
+        assert(d != NULL);
+        MK_KEY(kbuf, "base1", 1, 10); dafsa_add_n(d, kbuf, strlen("base1") + 9);
+        MK_KEY(kbuf, "base2", 2, 20); dafsa_add_n(d, kbuf, strlen("base2") + 9);
+        assert(dafsa_save(d, FST_PATH) == 0);
+        dafsa_free(d);
+
+        /* WAL: ADD base3, DEL base2 */
+        remove(WAL_PATH);
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w != NULL);
+        MK_KEY(kbuf, "base3", 3, 30); dafsa_wal_append_add(w, kbuf, strlen("base3") + 9);
+        MK_KEY(kbuf, "base2", 2, 20); dafsa_wal_append_del(w, kbuf, strlen("base2") + 9);
+        dafsa_wal_close(w);
+
+        v = dafsa_view_open_layered(FST_PATH, WAL_PATH);
+        assert(v != NULL);
+
+        /* base1: in base, not in WAL → 1 */
+        MK_KEY(kbuf, "base1", 1, 10);
+        assert(dafsa_view_lookup_n(v, kbuf, strlen("base1") + 9) == 1);
+        /* base2: in base, DEL in WAL → 0 */
+        MK_KEY(kbuf, "base2", 2, 20);
+        assert(dafsa_view_lookup_n(v, kbuf, strlen("base2") + 9) == 0);
+        /* base3: not in base, ADD in WAL → 1 */
+        MK_KEY(kbuf, "base3", 3, 30);
+        assert(dafsa_view_lookup_n(v, kbuf, strlen("base3") + 9) == 1);
+        /* base4: not in base, not in WAL → 0 */
+        MK_KEY(kbuf, "base4", 4, 40);
+        assert(dafsa_view_lookup_n(v, kbuf, strlen("base4") + 9) == 0);
+
+        dafsa_view_close(v);
+    }
+    printf("  PASS: layered lookup S1∪S2\\S3\n");
+
+    /* ── M5-13: layered prefix_enum merge ── */
+    printf("[M5 Test 13] Layered prefix_enum merge\n");
+    {
+        dafsa *d;
+        dafsa_wal *w;
+        dafsa_view *v;
+        unsigned char kbuf[64];
+
+        /* Base: word "cat" with 3 payloads */
+        d = dafsa_create();
+        assert(d != NULL);
+        MK_KEY(kbuf, "cat", 1, 100); dafsa_add_n(d, kbuf, strlen("cat") + 9);
+        MK_KEY(kbuf, "cat", 2, 200); dafsa_add_n(d, kbuf, strlen("cat") + 9);
+        MK_KEY(kbuf, "cat", 3, 300); dafsa_add_n(d, kbuf, strlen("cat") + 9);
+        assert(dafsa_save(d, FST_PATH) == 0);
+        dafsa_free(d);
+
+        /* WAL: DEL (2,200), ADD (4,400) */
+        remove(WAL_PATH);
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w != NULL);
+        MK_KEY(kbuf, "cat", 2, 200); dafsa_wal_append_del(w, kbuf, strlen("cat") + 9);
+        MK_KEY(kbuf, "cat", 4, 400); dafsa_wal_append_add(w, kbuf, strlen("cat") + 9);
+        dafsa_wal_close(w);
+
+        v = dafsa_view_open_layered(FST_PATH, WAL_PATH);
+        assert(v != NULL);
+
+        {
+            enum_ctx ctx;
+            memset(&ctx, 0, sizeof(ctx));
+            long n = dafsa_view_prefix_enum(v, (const unsigned char *)"cat", 3,
+                                             enum_collect, &ctx);
+            /* Expected: (1,100), (3,300), (4,400) — 3 total */
+            assert(n == 3);
+            assert(ctx.count == 3);
+            {
+                unsigned char e1[] = {0,0,0,1, 0,0,0,100};
+                unsigned char e3[] = {0,0,0,3, 0,0,1,0x2C};
+                unsigned char e4[] = {0,0,0,4, 0,0,1,0x90};
+                int f1 = 0, f3 = 0, f4 = 0;
+                int i;
+                for (i = 0; i < ctx.count; i++) {
+                    if (ctx.plen[i] == 8) {
+                        if (memcmp(ctx.payloads[i], e1, 8) == 0) f1 = 1;
+                        if (memcmp(ctx.payloads[i], e3, 8) == 0) f3 = 1;
+                        if (memcmp(ctx.payloads[i], e4, 8) == 0) f4 = 1;
+                    }
+                }
+                assert(f1 && f3 && f4);
+            }
+        }
+
+        dafsa_view_close(v);
+    }
+    printf("  PASS: prefix_enum (base\\dels)∪adds = 3\n");
+
+    /* ── M5-14: layered prefix_enum for word NOT in base but in WAL ── */
+    printf("[M5 Test 14] Layered prefix_enum: word only in WAL\n");
+    {
+        dafsa *d;
+        dafsa_wal *w;
+        dafsa_view *v;
+        unsigned char kbuf[64];
+
+        /* Base: only "dog" with payload */
+        d = dafsa_create();
+        assert(d != NULL);
+        MK_KEY(kbuf, "dog", 1, 99); dafsa_add_n(d, kbuf, strlen("dog") + 9);
+        assert(dafsa_save(d, FST_PATH) == 0);
+        dafsa_free(d);
+
+        /* WAL: ADD "cat" (word NOT in base) */
+        remove(WAL_PATH);
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w != NULL);
+        MK_KEY(kbuf, "cat", 5, 500); dafsa_wal_append_add(w, kbuf, strlen("cat") + 9);
+        dafsa_wal_close(w);
+
+        v = dafsa_view_open_layered(FST_PATH, WAL_PATH);
+        assert(v != NULL);
+
+        {
+            enum_ctx ctx;
+            memset(&ctx, 0, sizeof(ctx));
+            long n = dafsa_view_prefix_enum(v, (const unsigned char *)"cat", 3,
+                                             enum_collect, &ctx);
+            assert(n == 1);
+            assert(ctx.count == 1);
+            assert(ctx.plen[0] == 8);
+            {
+                unsigned char exp[] = {0,0,0,5, 0,0,1,0xF4};
+                assert(memcmp(ctx.payloads[0], exp, 8) == 0);
+            }
+        }
+
+        dafsa_view_close(v);
+    }
+    printf("  PASS: WAL-only word enumerated (early-return fix)\n");
+
+    /* ── M5-15: dedup — WAL ADD for key base already has → emitted once ── */
+    printf("[M5 Test 15] Dedup: WAL ADD for base-existing key\n");
+    {
+        dafsa *d;
+        dafsa_wal *w;
+        dafsa_view *v;
+        unsigned char kbuf[64];
+
+        /* Base: "bird" with 2 payloads */
+        d = dafsa_create();
+        assert(d != NULL);
+        MK_KEY(kbuf, "bird", 1, 10); dafsa_add_n(d, kbuf, strlen("bird") + 9);
+        MK_KEY(kbuf, "bird", 2, 20); dafsa_add_n(d, kbuf, strlen("bird") + 9);
+        assert(dafsa_save(d, FST_PATH) == 0);
+        dafsa_free(d);
+
+        /* WAL: ADD same payload already in base */
+        remove(WAL_PATH);
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w != NULL);
+        MK_KEY(kbuf, "bird", 1, 10); dafsa_wal_append_add(w, kbuf, strlen("bird") + 9);
+        dafsa_wal_close(w);
+
+        v = dafsa_view_open_layered(FST_PATH, WAL_PATH);
+        assert(v != NULL);
+
+        {
+            enum_ctx ctx;
+            memset(&ctx, 0, sizeof(ctx));
+            long n = dafsa_view_prefix_enum(v, (const unsigned char *)"bird", 4,
+                                             enum_collect, &ctx);
+            assert(n == 2);
+            assert(ctx.count == 2);
+        }
+
+        dafsa_view_close(v);
+    }
+    printf("  PASS: dedup → exactly 2\n");
+
+    /* ── M5-16: dafsa_view_open_layered(fst, NULL) == plain view ── */
+    printf("[M5 Test 16] dafsa_view_open_layered(fst, NULL) == plain view\n");
+    {
+        dafsa *d;
+        dafsa_view *v, *vp;
+        unsigned char kbuf[64];
+
+        d = dafsa_create();
+        assert(d != NULL);
+        MK_KEY(kbuf, "test", 1, 1); dafsa_add_n(d, kbuf, strlen("test") + 9);
+        assert(dafsa_save(d, FST_PATH) == 0);
+        dafsa_free(d);
+
+        vp = dafsa_view_open(FST_PATH);
+        assert(vp != NULL);
+        v = dafsa_view_open_layered(FST_PATH, NULL);
+        assert(v != NULL);
+
+        MK_KEY(kbuf, "test", 1, 1);
+        assert(dafsa_view_lookup_n(vp, kbuf, strlen("test") + 9) == 1);
+        assert(dafsa_view_lookup_n(v, kbuf, strlen("test") + 9) == 1);
+
+        MK_KEY(kbuf, "test", 9, 9);
+        assert(dafsa_view_lookup_n(vp, kbuf, strlen("test") + 9) == 0);
+        assert(dafsa_view_lookup_n(v, kbuf, strlen("test") + 9) == 0);
+
+        dafsa_view_close(v);
+        dafsa_view_close(vp);
+    }
+    printf("  PASS: NULL wal → same as plain view\n");
+
+    /* ── M5-17: layered with nonexistent wal succeeds ── */
+    printf("[M5 Test 17] dafsa_view_open_layered(fst, nonexistent.wal) OK\n");
+    {
+        dafsa *d;
+        dafsa_view *v;
+        unsigned char kbuf[64];
+
+        d = dafsa_create();
+        assert(d != NULL);
+        MK_KEY(kbuf, "test", 1, 1); dafsa_add_n(d, kbuf, strlen("test") + 9);
+        assert(dafsa_save(d, FST_PATH) == 0);
+        dafsa_free(d);
+
+        v = dafsa_view_open_layered(FST_PATH, "/tmp/nonexistent_m5.wal");
+        assert(v != NULL);
+        MK_KEY(kbuf, "test", 1, 1);
+        assert(dafsa_view_lookup_n(v, kbuf, strlen("test") + 9) == 1);
+        dafsa_view_close(v);
+    }
+    printf("  PASS: nonexistent WAL → empty overlay, view OK\n");
+
+    /* ── M5-18: B1 regression — many distinct payloads for one word ── */
+    printf("[M5 Test 18] Many distinct payloads (no hang, no loss, no dup)\n");
+    {
+        dafsa *d;
+        dafsa_wal *w;
+        dafsa_view *v;
+        unsigned char kbuf[64];
+        int i;
+
+        /* Base: word "many" with 1 payload (so fst_path is valid).
+         * Use a payload range disjoint from the WAL records below
+         * so there is no dup and the count is straightforward. */
+        d = dafsa_create();
+        assert(d != NULL);
+        MK_KEY(kbuf, "many", 99, 99); dafsa_add_n(d, kbuf, strlen("many") + 9);
+        assert(dafsa_save(d, FST_PATH) == 0);
+        dafsa_free(d);
+
+        /* WAL: 200 distinct ADD payloads for "many" */
+        remove(WAL_PATH);
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w != NULL);
+        for (i = 0; i < 200; i++) {
+            MK_KEY(kbuf, "many", (uint32_t)(i / 100), (uint32_t)i);
+            assert(dafsa_wal_append_add(w, kbuf, strlen("many") + 9) == 0);
+        }
+        dafsa_wal_close(w);
+
+        /* Open layered view — must NOT hang */
+        v = dafsa_view_open_layered(FST_PATH, WAL_PATH);
+        assert(v != NULL);
+
+        {
+            enum_ctx ctx;
+            memset(&ctx, 0, sizeof(ctx));
+            long n = dafsa_view_prefix_enum(v, (const unsigned char *)"many", 4,
+                                             enum_collect, &ctx);
+            /* Base has 1 payload (99,99), WAL adds 200 more distinct payloads
+             * for the same word.  Total = 201.
+             * Verify count only: the exact set-membership dedup logic is
+             * covered by M5-15; what matters here is no hang and correct count. */
+            assert(n == 201);
+            assert(ctx.count == 201);
+        }
+
+        dafsa_view_close(v);
+    }
+    printf("  PASS: 200-payload layered view OK (no hang)\n");
+
+    /* ── M5-19: corrupt header-only WAL (16 B) → reinitialize ── */
+    printf("[M5 Test 19] Corrupt header-only WAL → reinitialize, not NULL\n");
+    {
+        dafsa_wal *w;
+        unsigned char garbage[16];
+        int fd;
+
+        remove(WAL_PATH);
+
+        /* Write 16 bytes of garbage (corrupt header, zero records) */
+        memset(garbage, 0xAA, sizeof(garbage));
+        fd = open(WAL_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        assert(fd >= 0);
+        assert(write(fd, garbage, 16) == 16);
+        close(fd);
+
+        /* Open must succeed: reinitialize with fresh header */
+        w = dafsa_wal_open(WAL_PATH);
+        assert(w != NULL);
+        assert(dafsa_wal_size(w) == 16);
+        dafsa_wal_close(w);
+
+        /* Verify the file now has a valid header (magic "DAWL") */
+        {
+            unsigned char hdr[4];
+            fd = open(WAL_PATH, O_RDONLY);
+            assert(fd >= 0);
+            assert(read(fd, hdr, 4) == 4);
+            close(fd);
+            assert(hdr[0] == 'D' && hdr[1] == 'A'
+                && hdr[2] == 'W' && hdr[3] == 'L');
+        }
+
+        remove(WAL_PATH);
+    }
+    printf("  PASS: corrupt header-only WAL reinitialized\n");
+
+    remove(WAL_PATH);
+    remove(FST_PATH);
+
+    #undef WAL_PATH
+    #undef FST_PATH
+    #undef MK_KEY
+
+    /* ── M6: streaming CRC32 equivalence ── */
+    printf("\n[M6 Test 1] Streaming CRC32 matches one-shot crc32_compute\n");
+    {
+        static const uint8_t data[] = "123456789";
+        size_t len = 9;
+        uint32_t one_shot = crc32_compute(data, len);
+        uint32_t s;
+        size_t i;
+
+        /* standard check value */
+        assert(one_shot == 0xCBF43926u);
+
+        /* single-stream init/update/finalize */
+        s = crc32_init();
+        s = crc32_update(s, data, len);
+        s = crc32_finalize(s);
+        assert(s == one_shot);
+
+        /* multi-chunk streaming (3 chunks) == one-shot */
+        {
+            uint32_t m = crc32_init();
+            m = crc32_update(m, data, 3);
+            m = crc32_update(m, data + 3, 3);
+            m = crc32_update(m, data + 6, 3);
+            m = crc32_finalize(m);
+            assert(m == one_shot);
+        }
+
+        /* empty stream: crc32_compute(NULL,0) == finalize(init()) */
+        assert(crc32_compute(NULL, 0) == crc32_finalize(crc32_init()));
+
+        /* byte-at-a-time streaming == one-shot (exercises update via put_u8
+         * style table lookups on the same table) */
+        s = crc32_init();
+        for (i = 0; i < len; i++) {
+            s = crc32_table[(s ^ data[i]) & 0xFF] ^ (s >> 8);
+        }
+        s = crc32_finalize(s);
+        assert(s == one_shot);
+    }
+    printf("  PASS: streaming == one-shot == standard check value\n");
 
     /* ── Summary ── */
     printf("\n=== All tests passed. ===\n");

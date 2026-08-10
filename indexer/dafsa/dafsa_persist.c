@@ -28,37 +28,39 @@
  *            to but excluding the CRC itself).
  */
 
-int put_u8(FILE *f, uint8_t v);
+int put_u8(FILE *f, uint8_t v, uint32_t *crc);
 
-int put_uvarint(FILE *f, uint32_t v)
+int put_uvarint(FILE *f, uint32_t v, uint32_t *crc)
 {
     /* LEB128 */
     do {
         uint8_t byte = (uint8_t)(v & 0x7F);
         v >>= 7;
         if (v != 0) byte |= 0x80;
-        if (put_u8(f, byte)) return -1;
+        if (put_u8(f, byte, crc)) return -1;
     } while (v != 0);
     return 0;
 }
 
-int put_u8(FILE *f, uint8_t v)
+int put_u8(FILE *f, uint8_t v, uint32_t *crc)
 {
+    if (crc)
+        *crc = crc32_table[(*crc ^ v) & 0xFF] ^ (*crc >> 8);
     return fputc(v, f) == EOF ? -1 : 0;
 }
 
-int put_u16_le(FILE *f, uint16_t v)
+int put_u16_le(FILE *f, uint16_t v, uint32_t *crc)
 {
-    if (put_u8(f, (uint8_t)(v & 0xFF)) != 0) return -1;
-    if (put_u8(f, (uint8_t)((v >> 8) & 0xFF)) != 0) return -1;
+    if (put_u8(f, (uint8_t)(v & 0xFF), crc) != 0) return -1;
+    if (put_u8(f, (uint8_t)((v >> 8) & 0xFF), crc) != 0) return -1;
     return 0;
 }
 
-int put_u32_le(FILE *f, uint32_t v)
+int put_u32_le(FILE *f, uint32_t v, uint32_t *crc)
 {
     int i;
     for (i = 0; i < 4; i++) {
-        if (put_u8(f, (uint8_t)(v & 0xFF)) != 0) return -1;
+        if (put_u8(f, (uint8_t)(v & 0xFF), crc) != 0) return -1;
         v >>= 8;
     }
     return 0;
@@ -114,7 +116,7 @@ int dafsa_save(const dafsa *d, const char *path)
     uint32_t n_reach = 0, n_trans = 0, n_final = 0;
     uint32_t head, tail, i, j;
     size_t path_len;
-    uint8_t *crc_buf = NULL;
+    uint32_t crc = crc32_init();
     int ok = -1;
 
     if (!d || !path) return -1;
@@ -156,20 +158,20 @@ int dafsa_save(const dafsa *d, const char *path)
     if (setvbuf(f, NULL, _IOFBF, 1u << 20) != 0) goto fail;
 
     /* header */
-    if (put_u8(f, 'P') || put_u8(f, 'D') || put_u8(f, 'W') || put_u8(f, 'G'))
+    if (put_u8(f, 'P', &crc) || put_u8(f, 'D', &crc) || put_u8(f, 'W', &crc) || put_u8(f, 'G', &crc))
         goto fail;
-    if (put_u32_le(f, DAFSA_PDWG_VERSION)) goto fail;   /* version */
-    if (put_u32_le(f, n_reach)) goto fail;      /* n_states */
-    if (put_u32_le(f, n_trans)) goto fail;      /* n_trans */
-    if (put_u32_le(f, 1)) goto fail;            /* initial_id */
-    if (put_u32_le(f, n_final)) goto fail;      /* n_final */
-    if (put_u32_le(f, 0)) goto fail;            /* reserved */
+    if (put_u32_le(f, DAFSA_PDWG_VERSION, &crc)) goto fail;   /* version */
+    if (put_u32_le(f, n_reach, &crc)) goto fail;      /* n_states */
+    if (put_u32_le(f, n_trans, &crc)) goto fail;      /* n_trans */
+    if (put_u32_le(f, 1, &crc)) goto fail;            /* initial_id */
+    if (put_u32_le(f, n_final, &crc)) goto fail;      /* n_final */
+    if (put_u32_le(f, 0, &crc)) goto fail;            /* reserved */
 
     /* state table: (n_states+1) x u16 LE ntrans (entry 0 = 0). Offsets implied. */
-    if (put_u16_le(f, 0)) goto fail;
+    if (put_u16_le(f, 0, &crc)) goto fail;
     for (i = 1; i <= n_reach; i++) {
         const State *s = &d->states[queue[i - 1]];
-        if (put_u16_le(f, (uint16_t)s->ntrans)) goto fail;
+        if (put_u16_le(f, (uint16_t)s->ntrans, &crc)) goto fail;
     }
 
     /* final bitmap: ceil((n_states+1)/8) bytes; bit 0 always 0 */
@@ -183,7 +185,7 @@ int dafsa_save(const dafsa *d, const char *path)
                     d->states[queue[idx - 1]].is_final)
                     byte |= (uint8_t)(1u << j);
             }
-            if (put_u8(f, byte)) goto fail;
+            if (put_u8(f, byte, &crc)) goto fail;
         }
     }
 
@@ -193,37 +195,21 @@ int dafsa_save(const dafsa *d, const char *path)
         {
         const Edge *e = trans_arr_c(s);
         for (j = 0; j < s->ntrans; j++) {
-            if (put_u8(f, e[j].sym)) goto fail;
-            if (put_uvarint(f, old_to_new[e[j].target])) goto fail;
+            if (put_u8(f, e[j].sym, &crc)) goto fail;
+            if (put_uvarint(f, old_to_new[e[j].target], &crc)) goto fail;
         }
     }
     }
 
     if (ferror(f)) goto fail;
 
-    /* v4: append a trailing CRC32 over every byte written so far (offset 0 up
-     * to but excluding the CRC field).  Flush so ftell reflects real size,
-     * rewind, read the whole stream back in one buffer, checksum it, then
-     * seek back to EOF and write the CRC LE. */
+    /* v4: append the trailing CRC32.  The streaming accumulator `crc` covers
+     * every byte written so far (offset 0 up to but excluding the CRC field);
+     * finalize it and write the CRC LE.  The CRC field itself is NOT included
+     * in the checksum. */
     {
-        uint32_t crc;
-        long size;
-        if (fflush(f) != 0) goto fail;
-        size = ftell(f);
-        if (size < 0) goto fail;
-        if (size > 0) {
-            crc_buf = (uint8_t *)malloc((size_t)size);
-            if (!crc_buf) goto fail;
-            if (fseek(f, 0, SEEK_SET) != 0) goto fail;
-            if (fread(crc_buf, 1, (size_t)size, f) != (size_t)size) goto fail;
-            crc = crc32_compute(crc_buf, (size_t)size);
-        } else {
-            crc = crc32_compute(NULL, 0);   /* empty stream: 0x00000000 */
-        }
-        free(crc_buf);
-        crc_buf = NULL;
-        if (fseek(f, 0, SEEK_END) != 0) goto fail;
-        if (put_u32_le(f, crc)) goto fail;
+        uint32_t final_crc = crc32_finalize(crc);
+        if (put_u32_le(f, final_crc, NULL)) goto fail;   /* CRC itself NOT checksummed */
     }
 
     /* atomic commit */
@@ -247,7 +233,6 @@ fail:
 
 out:
     free(tmp_path);
-    free(crc_buf);
     free(old_to_new);
     free(queue);
     free(visited);

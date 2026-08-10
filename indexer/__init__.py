@@ -10,6 +10,8 @@ Stored in the DAFSA; `prefix_enum(word)` returns the 8-byte payload
 (file_idx + entry_idx) for every entry containing that word.
 """
 
+import contextlib
+import fcntl
 import fnmatch
 import json
 import os
@@ -21,7 +23,7 @@ from pathlib import Path
 from jing_meta.log import get_logger
 from jing_meta.mcp_base import _atomic_write, _atomic_write_json
 
-from .dafsa import Dafsa
+from .dafsa import Dafsa, DafsaWal
 
 logger = get_logger(__name__)
 
@@ -282,6 +284,16 @@ def _manifest_files(output: Path) -> list[dict]:
         return []
 
 
+def _fsync_dir_of(path: Path) -> None:
+    """fsync the directory to make renames durable (best-effort)."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+        os.fsync(fd)
+        os.close(fd)
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
@@ -320,6 +332,7 @@ def build(dir: Path, pattern: str, extractor: str, output: Path) -> None:
         output.mkdir(parents=True, exist_ok=True)
         fst_path = output / "index.fst"
         d.save(str(fst_path))
+        (output / "index.wal").unlink(missing_ok=True)
 
     slots_dir = output / "slots"
     for file_idx, pairs in enumerate(file_pairs):
@@ -334,39 +347,68 @@ def build(dir: Path, pattern: str, extractor: str, output: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Mutual exclusion
+# ---------------------------------------------------------------------------
+@contextlib.contextmanager
+def _index_lock(output: Path):
+    """Acquire an exclusive flock on index.lock in *output*, held for the context."""
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    lock_path = output / "index.lock"
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+# ---------------------------------------------------------------------------
 # Incremental update
 # ---------------------------------------------------------------------------
 def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
-    """Incrementally update an existing index, or build it on first run.
+    """Incrementally update an existing index via the write-ahead log (WAL).
 
-    Returns a summary dict with unchanged/updated/added/removed counts.
+    Does NOT load/mutate/save the DAFSA.  Instead, pair-level diffs are appended
+    to an append-only ``index.wal``; the base ``index.fst`` is never touched.
+    Search uses a layered view that merges the WAL overlay on top of the base.
+
+    Returns a summary dict with unchanged/updated/added/removed counts plus an
+    ``index_fst_mtime_unchanged`` flag that proves the base FST was not rewritten.
     """
     fn = EXTRACTORS.get(extractor)
     if fn is None:
         raise ValueError(f"unknown extractor {extractor!r}; choices: {list(EXTRACTORS)}")
 
     output = Path(output)
-    fst_path = output / "index.fst"
-    manifest_path = output / "manifest.json"
-    slots_dir = output / "slots"
+    # The flock on index.lock gives mutual exclusion against concurrent
+    # update()/compact() calls. build() is intentionally NOT locked: the
+    # first-run path below calls build() internally, and build() trying to
+    # re-acquire the same flock would deadlock.
+    with _index_lock(output):
+        fst_path = output / "index.fst"
+        manifest_path = output / "manifest.json"
+        slots_dir = output / "slots"
 
-    # First run — no index yet.
-    if not fst_path.exists():
-        build(dir, pattern, extractor, output)
-        return {
-            "command": "update",
-            "index_dir": str(output),
-            "unchanged": 0,
-            "updated": 0,
-            "added": 0,
-            "removed": 0,
-            "total_slots": len(_manifest_files(output)),
-            "first_run": True,
-        }
+        # First run — no index yet.
+        if not fst_path.exists():
+            build(dir, pattern, extractor, output)
+            return {
+                "command": "update",
+                "index_dir": str(output),
+                "unchanged": 0,
+                "updated": 0,
+                "added": 0,
+                "removed": 0,
+                "total_slots": len(_manifest_files(output)),
+                "first_run": True,
+            }
 
-    d = None
-    try:
-        d = Dafsa.load(str(fst_path), readonly=False)
+        base_mtime_before = fst_path.stat().st_mtime_ns
 
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
         files = data.get("files", [])
@@ -380,6 +422,7 @@ def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
         disk_rel = {str(filepath.relative_to(dir)) for filepath in disk_files}
 
         unchanged = updated = added = removed = 0
+        wal_records: list[tuple[int, bytes]] = []   # (op, composite_key) — op 1=ADD, 2=DEL
         pending_sidecars: dict[int, list[tuple[int, bytes]]] = {}
         pending_tombstones: set[int] = set()
 
@@ -394,23 +437,28 @@ def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
                 if prev.get("mtime") == stat.st_mtime_ns and prev.get("size") == stat.st_size:
                     unchanged += 1
                     continue
-                # CHANGED: drop old keys, extract and re-add.
+                # CHANGED: diff at the (entry_idx, word) pair level.
                 try:
                     old_pairs = _read_sidecar(slots_dir, slot)
                 except SidecarCorruptError as e:
+                    # Corrupt sidecar: we can't compute the old key set, so treat
+                    # the file as brand-new (add-all). stale keys may persist
+                    # until a compact, but the file is fully searchable again.
                     logger.warning(
-                        "update: corrupt sidecar for slot %d (%s); skipping key deletion — stale keys may remain",
-                        slot,
-                        e,
+                        "update: corrupt sidecar for slot %d (%s); treating as new (stale keys may persist until compact)",
+                        slot, e,
                     )
-                    continue
-                for ei, w in old_pairs:
-                    if not d.delete(_composite_key(w, slot, ei)):
-                        logger.warning("update: missing key for %s (orphan), healing", rel)
+                    old_pairs = []
                 meta, extracted = fn(filepath, rel)
-                pairs = _dedup_pairs(extracted)
-                for ei, w in pairs:
-                    d.add(_composite_key(w, slot, ei))
+                new_pairs = _dedup_pairs(extracted)
+
+                old_set = set(old_pairs)
+                new_set = set(new_pairs)
+                for ei, w in old_set - new_set:
+                    wal_records.append((2, _composite_key(w, slot, ei)))
+                for ei, w in new_set - old_set:
+                    wal_records.append((1, _composite_key(w, slot, ei)))
+
                 files[slot] = {
                     "filename": rel,
                     "title": meta[1],
@@ -420,7 +468,7 @@ def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
                     "size": stat.st_size,
                     "tombstoned": False,
                 }
-                pending_sidecars[slot] = pairs
+                pending_sidecars[slot] = new_pairs
                 updated += 1
             else:
                 # NEW: append at len(files) — stable file_idx, never renumber.
@@ -428,7 +476,7 @@ def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
                 meta, extracted = fn(filepath, rel)
                 pairs = _dedup_pairs(extracted)
                 for ei, w in pairs:
-                    d.add(_composite_key(w, slot, ei))
+                    wal_records.append((1, _composite_key(w, slot, ei)))
                 files.append({
                     "filename": rel,
                     "title": meta[1],
@@ -444,18 +492,22 @@ def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
         # Tombstone pass: live slots whose file is gone from disk.
         for i, fe in enumerate(files):
             if not fe.get("tombstoned") and fe["filename"] not in disk_rel:
+                corrupt = False
                 try:
                     old_pairs = _read_sidecar(slots_dir, i)
                 except SidecarCorruptError as e:
+                    # Corrupt sidecar: we can't know which keys to delete, but we
+                    # MUST still tombstone the manifest entry so the file is
+                    # hidden from results. stale keys may persist until compact.
                     logger.warning(
-                        "update: corrupt sidecar for slot %d (%s); skipping key deletion — stale keys may remain",
-                        i,
-                        e,
+                        "update: corrupt sidecar for slot %d (%s); cannot delete keys — stale keys may persist until compact",
+                        i, e,
                     )
-                    continue
-                for ei, w in old_pairs:
-                    if not d.delete(_composite_key(w, i, ei)):
-                        logger.warning("update: missing key for slot %d (orphan), healing", i)
+                    old_pairs = []
+                    corrupt = True
+                if not corrupt:
+                    for ei, w in old_pairs:
+                        wal_records.append((2, _composite_key(w, i, ei)))
                 files[i] = {
                     "filename": "",
                     "title": "",
@@ -468,8 +520,32 @@ def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
                 pending_tombstones.add(i)
                 removed += 1
 
-        # Phase 2: commit — DAFSA first, then sidecars, then manifest.
-        d.save(str(fst_path))
+        # Option C fast-path: nothing changed at all — no writes, base untouched.
+        if not wal_records and not pending_sidecars and not pending_tombstones:
+            return {
+                "command": "update",
+                "index_dir": str(output),
+                "unchanged": unchanged,
+                "updated": updated,
+                "added": added,
+                "removed": removed,
+                "total_slots": len(files),
+                "index_fst_mtime_unchanged": True,
+            }
+
+        # Phase 2: commit in order — WAL fsync → sidecars → manifest.
+        if wal_records:
+            wal = DafsaWal.open(str(output / "index.wal"))
+            try:
+                for op, key in wal_records:
+                    if op == 1:
+                        wal.append_add(key)
+                    else:
+                        wal.append_del(key)
+                wal.sync()
+            finally:
+                wal.close()
+
         for slot, pairs in pending_sidecars.items():
             _write_sidecar(slots_dir, slot, pairs)
         for slot in pending_tombstones:
@@ -480,6 +556,14 @@ def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
                 pass
         _atomic_write_json(manifest_path, {"files": files})
 
+        # Compaction trigger: if WAL > 25 % of base, fold it into a fresh snapshot.
+        # We already hold the flock, so call the locked-compaction core directly
+        # (not compact(), which would try to re-acquire the same flock and deadlock).
+        wal_size = (output / "index.wal").stat().st_size if (output / "index.wal").exists() else 0
+        base_size = fst_path.stat().st_size
+        if wal_size > base_size * 0.25:
+            _compact_locked(output)
+
         return {
             "command": "update",
             "index_dir": str(output),
@@ -488,10 +572,46 @@ def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
             "added": added,
             "removed": removed,
             "total_slots": len(files),
+            "index_fst_mtime_unchanged": fst_path.stat().st_mtime_ns == base_mtime_before,
         }
-    finally:
-        if d is not None:
-            d.free()
+
+
+def compact(output: Path) -> None:
+    """Fold the WAL into a fresh base snapshot (occasional, heavy path).
+
+    Loads the base DAFSA mutably, replays all WAL records into it, saves a
+    fresh ``index.fst``, and removes the WAL file.
+
+    Replaying a WAL whose records are already folded into the base is a no-op
+    (idempotent), so a crash between dafsa_save and WAL unlink merely leaves
+    a redundant-but-correct WAL file.
+
+    Acquires the index.lock flock for mutual exclusion against concurrent
+    update()/compact() calls. The actual work lives in ``_compact_locked``;
+    ``update()`` calls that directly because it already holds the flock.
+    """
+    output = Path(output)
+    with _index_lock(output):
+        _compact_locked(output)
+
+
+def _compact_locked(output: Path) -> None:
+    """Compaction core — assumes the caller holds the index.lock flock."""
+    fst_path = output / "index.fst"
+    wal_path = output / "index.wal"
+    if not wal_path.exists():
+        return
+
+    with Dafsa.load(str(fst_path), readonly=False) as d:
+        wal = DafsaWal.open(str(wal_path))
+        try:
+            wal.replay_into(d)
+        finally:
+            wal.close()
+        d.save(str(fst_path))
+
+    wal_path.unlink(missing_ok=True)
+    _fsync_dir_of(output)
 
 
 # ---------------------------------------------------------------------------
@@ -516,7 +636,10 @@ class Index:
             raise FileNotFoundError(f"No manifest.json found in {self.index_dir}")
         self.manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         self.files = [FileEntry(**f) for f in self.manifest.get("files", [])]
-        self._view: Dafsa | None = Dafsa.load(str(self.fst_path), readonly=True)
+        self._view: Dafsa | None = Dafsa.load(
+            str(self.fst_path), readonly=True,
+            wal_path=str(self.index_dir / "index.wal"),
+        )
 
     def close(self) -> None:
         if hasattr(self, "_view") and self._view:

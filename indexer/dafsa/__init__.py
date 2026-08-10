@@ -2,15 +2,19 @@
 
 Loads the C DAFSA shared library (built from the sources in this directory) and
 exposes its API to Python: create/load/save, length-delimited add/lookup/delete,
-prefix enumeration (used for search), statistics, and ABI version checking.
+prefix enumeration (used for search), statistics, ABI version checking, a
+write-ahead log (WAL) for incremental persistence, and layered views that
+transparently merge a WAL overlay on top of a base FST.
 
 The library is lazy-loaded on first use so that ``import indexer`` does not fail
 when ``libdafsa.so`` is missing — only DAFSA operations do.
 
 Read-only paths (``Dafsa.load(path, readonly=True)``) use the zero-copy
 ``dafsa_view_open`` mmap view, which is much lighter than materializing the
-entire state table.  The view handle is search-only: mutation and persistence
-are not available on a view, and ``free()`` calls ``dafsa_view_close``.
+entire state table.  When a ``wal_path`` is given alongside ``readonly=True``,
+``dafsa_view_open_layered`` is used instead, merging the WAL overlay (adds
+and deletes) on top of the base read-only view at the C level — no Python-side
+merge needed.
 
 Build the shared lib once with:
     make  (see Makefile in this directory)
@@ -36,6 +40,11 @@ _ABI_VERSION = 1
 
 # Enumerate callback: return 0 to continue, non-zero to stop early.
 _ENUM_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t, ctypes.c_void_p)
+
+# WAL replay callback: op(ADD=1/DEL=2), key ptr, key_len, user data.
+_WAL_REPLAY_CB = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_uint8, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_uint32, ctypes.c_void_p,
+)
 
 
 class DafsaStatsOut(ctypes.Structure):
@@ -108,6 +117,24 @@ def _load() -> ctypes.CDLL:
     ]
     lib.dafsa_view_prefix_enum.restype = ctypes.c_long
 
+    # ── Write-ahead log (WAL) ──
+    lib.dafsa_wal_open.argtypes = [ctypes.c_char_p]
+    lib.dafsa_wal_open.restype = ctypes.c_void_p
+    lib.dafsa_wal_append_add.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
+    lib.dafsa_wal_append_add.restype = ctypes.c_int
+    lib.dafsa_wal_append_del.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
+    lib.dafsa_wal_append_del.restype = ctypes.c_int
+    lib.dafsa_wal_sync.argtypes = [ctypes.c_void_p]
+    lib.dafsa_wal_sync.restype = ctypes.c_int
+    lib.dafsa_wal_size.argtypes = [ctypes.c_void_p]
+    lib.dafsa_wal_size.restype = ctypes.c_uint64
+    lib.dafsa_wal_replay.argtypes = [ctypes.c_void_p, _WAL_REPLAY_CB, ctypes.c_void_p]
+    lib.dafsa_wal_replay.restype = ctypes.c_int
+    lib.dafsa_wal_close.argtypes = [ctypes.c_void_p]
+
+    lib.dafsa_view_open_layered.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    lib.dafsa_view_open_layered.restype = ctypes.c_void_p
+
     # ── Statistics ──
     lib.dafsa_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(DafsaStatsOut)]
     lib.dafsa_stats.restype = None
@@ -153,24 +180,43 @@ class Dafsa:
         return cls(h)
 
     @classmethod
-    def load(cls, path: str, readonly: bool = False) -> "Dafsa":
+    def load(cls, path: str, readonly: bool = False, wal_path: str | None = None) -> "Dafsa":
         """Load a DAFSA from *path*.
 
         When *readonly* is ``True`` (the default for ``Index``), opens a
         zero-copy mmap view via ``dafsa_view_open`` — search-only, much
         lighter than materializing the full state table.
+
+        When *wal_path* is given alongside ``readonly=True``, opens a layered
+        view via ``dafsa_view_open_layered``, merging the WAL overlay (adds
+        and deletes) on top of the base view at the C level.
         """
         lib = _get_lib()
         if readonly:
-            h = lib.dafsa_view_open(str(path).encode())
-            if not h:
-                raise FileNotFoundError(f"could not open DAFSA view from {path}")
-            return cls(h, is_view=True)
+            if wal_path:
+                h = lib.dafsa_view_open_layered(str(path).encode(), str(wal_path).encode())
+                if not h:
+                    raise FileNotFoundError(f"could not open layered DAFSA view from {path} + {wal_path}")
+            else:
+                h = lib.dafsa_view_open(str(path).encode())
+                if not h:
+                    raise FileNotFoundError(f"could not open DAFSA view from {path}")
+            try:
+                return cls(h, is_view=True)
+            except Exception:
+                # Constructor failed — don't leak the C view handle.
+                lib.dafsa_view_close(h)
+                raise
         else:
             h = lib.dafsa_load(str(path).encode())
             if not h:
                 raise FileNotFoundError(f"could not load DAFSA from {path}")
-            return cls(h)
+            try:
+                return cls(h)
+            except Exception:
+                # Constructor failed — don't leak the C handle.
+                lib.dafsa_free(h)
+                raise
 
     # ── Lifecycle ───────────────────────────────────────────────────────
 
@@ -239,9 +285,11 @@ class Dafsa:
         buf = ctypes.create_string_buffer(prefix)
         lib = _get_lib()
         if self._is_view:
-            lib.dafsa_view_prefix_enum(self._h, buf, len(prefix), cb_fn, None)
+            n = lib.dafsa_view_prefix_enum(self._h, buf, len(prefix), cb_fn, None)
         else:
-            lib.dafsa_prefix_enum(self._h, buf, len(prefix), cb_fn, None)
+            n = lib.dafsa_prefix_enum(self._h, buf, len(prefix), cb_fn, None)
+        if n < 0:
+            raise RuntimeError(f"prefix_enum failed (code {n})")
         return results
 
     # ── Statistics ──────────────────────────────────────────────────────
@@ -271,4 +319,73 @@ class Dafsa:
 
     def __exit__(self, *exc):
         self.free()
+        return False
+
+
+class DafsaWal:
+    """Thin wrapper around the C write-ahead log (WAL) handle.
+
+    Mirrors the style of ``Dafsa``: holds an opaque C pointer, provides
+    factory/close/context-manager, and delegates to the C API via ctypes.
+    """
+
+    def __init__(self, handle: int):
+        self._h = handle
+
+    @classmethod
+    def open(cls, path: str) -> "DafsaWal":
+        """Open or create the WAL at *path* (append-only log)."""
+        h = _get_lib().dafsa_wal_open(str(path).encode())
+        if not h:
+            raise OSError(f"dafsa_wal_open returned NULL for {path}")
+        return cls(h)
+
+    def append_add(self, key: bytes) -> bool:
+        """Append an ADD record. Returns True on success."""
+        buf = ctypes.create_string_buffer(key)
+        return _get_lib().dafsa_wal_append_add(self._h, buf, len(key)) == 0
+
+    def append_del(self, key: bytes) -> bool:
+        """Append a DEL record. Returns True on success."""
+        buf = ctypes.create_string_buffer(key)
+        return _get_lib().dafsa_wal_append_del(self._h, buf, len(key)) == 0
+
+    def sync(self) -> None:
+        """fflush + fsync the WAL file."""
+        if _get_lib().dafsa_wal_sync(self._h) != 0:
+            raise OSError("dafsa_wal_sync failed")
+
+    def size(self) -> int:
+        """Return the current WAL file size in bytes."""
+        return _get_lib().dafsa_wal_size(self._h)
+
+    def replay_into(self, dafsa: "Dafsa") -> int:
+        """Replay all WAL records into *dafsa* (must be mutable).
+
+        Returns the number of records replayed, or -1 on error.
+        """
+        lib = _get_lib()
+
+        @_WAL_REPLAY_CB
+        def cb(op: int, key_ptr, key_len: int, _user) -> int:
+            key = ctypes.string_at(key_ptr, key_len)
+            if op == 1:
+                dafsa.add(key)
+            elif op == 2:
+                dafsa.delete(key)
+            return 0  # continue
+
+        return lib.dafsa_wal_replay(self._h, cb, None)
+
+    def close(self) -> None:
+        """Close the WAL handle. NULL-safe."""
+        if self._h:
+            _get_lib().dafsa_wal_close(self._h)
+            self._h = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
         return False

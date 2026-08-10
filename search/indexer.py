@@ -6,12 +6,54 @@ with no external binary dependency. The on-disk format is identical.
 """
 
 import json
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from indexer import EXTRACTORS as DAFSA_EXTRACTORS
 
 from .config import DomainConfig
+
+if TYPE_CHECKING:
+    from indexer import Index
+
+# Cache of open Index objects keyed by (dir, fst_mtime_ns, wal_size). Unchanged
+# indexes are reused across search_fst calls; a changed index (update/rebuild/
+# compact) evicts the stale entry and opens a fresh one. Guarded by a lock so
+# concurrent searches can't race on eviction.
+_index_cache: dict[tuple, "Index"] = {}
+_index_cache_lock = threading.Lock()
+
+
+def _get_cached_index(idx_dir: Path) -> "Index":
+    """Return a cached Index for *idx_dir*, reopening it when the index changed.
+
+    The cache key is (dir, index.fst mtime_ns, index.wal size). Missing files
+    contribute 0, so a brand-new or not-yet-built index is handled uniformly.
+    """
+    from indexer import Index
+
+    fst = idx_dir / "index.fst"
+    wal = idx_dir / "index.wal"
+    fst_mtime = fst.stat().st_mtime_ns if fst.exists() else 0
+    wal_size = wal.stat().st_size if wal.exists() else 0
+    key = (str(idx_dir), fst_mtime, wal_size)
+
+    with _index_cache_lock:
+        cached = _index_cache.get(key)
+        if cached is not None:
+            return cached
+        # Evict and close stale entries for this dir (different key).
+        for k, idx in list(_index_cache.items()):
+            if k[0] == str(idx_dir) and k != key:
+                try:
+                    idx.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                del _index_cache[k]
+        idx = Index(idx_dir)
+        _index_cache[key] = idx
+        return idx
 
 
 def _iter_domain_files(cfg: DomainConfig) -> list[Path]:
@@ -129,8 +171,6 @@ def search_fst(
     Each result: {"file_idx", "entry_idx", "_domain", "date"}.
     Returns None on failure.
     """
-    from indexer import open_index as dafsa_open
-
     idx_dir = Path(index_dir).expanduser().resolve() if index_dir else cfg.effective_index_dir
     idx_file = idx_dir / "index.fst"
 
@@ -138,17 +178,17 @@ def search_fst(
         return None
 
     try:
-        with dafsa_open(idx_dir) as idx:
-            hits = idx.search(query, any_word=any_word)
-            results = []
-            for h in hits:
-                results.append({
-                    "file_idx": h.file_idx,
-                    "entry_idx": h.entry_idx,
-                    "_domain": cfg.name,
-                    "date": idx.files[h.file_idx].date if h.file_idx < len(idx.files) else "?",
-                })
-            return results
+        idx = _get_cached_index(idx_dir)
+        hits = idx.search(query, any_word=any_word)
+        results = []
+        for h in hits:
+            results.append({
+                "file_idx": h.file_idx,
+                "entry_idx": h.entry_idx,
+                "_domain": cfg.name,
+                "date": idx.files[h.file_idx].date if h.file_idx < len(idx.files) else "?",
+            })
+        return results
     except Exception:  # noqa: BLE001
         return None
 

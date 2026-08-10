@@ -636,6 +636,20 @@ def search(
                         # this fallback avoids crashing the search there.
                         # See jing_meta/mcp_base.py for the concurrency model.
                         _has_sigalrm = False
+                # Speaker filter (transcripts only): build the line->turn map
+                # ONCE per file, before the per-line loop, then look it up by
+                # line number inside the loop. Hoisting avoids re-parsing the
+                # transcript (an lru_cache'd parse) for every matching line.
+                turn_by_line = None
+                if speaker and d_name == "transcripts":
+                    parsed = parse_transcript_file(f)
+                    if parsed:
+                        turn_by_line = {}
+                        for t in parsed["turns"]:
+                            for ln in range(
+                                t.get("line_start", 0), t.get("line_end", 0) + 1
+                            ):
+                                turn_by_line[ln] = t
                 try:
                     for line_no, line in enumerate(lines, 1):
                         if not pattern.search(line):
@@ -653,20 +667,12 @@ def search(
 
                         # Speaker filter (transcripts only)
                         if speaker and d_name == "transcripts":
-                            parsed = parse_transcript_file(f)
-                            if parsed:
-                                turn_by_line = {}
-                                for t in parsed["turns"]:
-                                    for ln in range(
-                                        t.get("line_start", 0), t.get("line_end", 0) + 1
-                                    ):
-                                        turn_by_line[ln] = t
-                                turn = turn_by_line.get(line_no - 1)
-                                if (
-                                    not turn
-                                    or turn.get("speaker", "").lower() != speaker.lower()
-                                ):
-                                    continue
+                            turn = turn_by_line.get(line_no - 1) if turn_by_line else None
+                            if (
+                                not turn
+                                or turn.get("speaker", "").lower() != speaker.lower()
+                            ):
+                                continue
 
                         if len(file_matches) >= max_matches_per_file:
                             break

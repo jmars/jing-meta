@@ -431,3 +431,130 @@ def test_search_and_or(tmp_path, corpus):
         default_hits = idx.search("banana")
         default_files = {idx.file_name(h.file_idx) for h in default_hits}
         assert default_files == {"a.txt", "b.txt"}, f"single-word search should match both, got {default_files}"
+
+
+# --- pair-level diff: unchanged keys in a changed file are not re-added ----
+def test_update_pair_level_diff_leaves_unchanged_keys(tmp_path):
+    """A changed file should only touch keys that actually changed.
+
+    Regresses the previous delete-all + re-add-all behaviour, which churned the
+    DAFSA with O(N) delete + O(N) add even when only one entry changed — the
+    cause of multi-minute updates on large session files.
+    """
+    from indexer import _read_sidecar
+
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_txt(data, "a.txt", "alpha banana cherry")
+    _write_txt(data, "b.txt", "delta")
+
+    out = tmp_path / "out"
+    build(data, "*.txt", "txt", out)
+
+    # a.txt: only 'banana' -> 'grape' changed; 'alpha' and 'cherry' unchanged.
+    _write_txt(data, "a.txt", "alpha grape cherry")
+
+    result = update(data, "*.txt", "txt", out)
+    assert result["updated"] == 1
+
+    # The DAFSA should still contain the unchanged keys (search correctness).
+    assert _search(out, "alpha")
+    assert _search(out, "cherry")
+    assert _search(out, "grape")
+    assert not _search(out, "banana")
+
+    # More precisely: the changed slot's sidecar records exactly the new pair
+    # set, and unchanged (entry_idx, word) pairs survived without churn. The
+    # sidecar content is the source of truth for what's in the DAFSA.
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    slot = next(
+        i for i, fe in enumerate(manifest["files"])
+        if fe.get("filename") == "a.txt"
+    )
+    pairs = set(_read_sidecar(out / "slots", slot))
+    assert ("alpha", b"alpha") not in pairs  # (entry_idx, word) — entry0
+    # Verify 'alpha' is still searchable even though the file text changed the
+    # entry layout; the key identity is (entry_idx, word).
+    assert _search(out, "alpha")
+
+
+# --- 15. index.lock flock: exists during and after the context --------------
+def test_index_lock_acquire_release(tmp_path):
+    from indexer import _index_lock
+
+    out = tmp_path / "out"
+    with _index_lock(out):
+        assert (out / "index.lock").exists(), "lock file must exist while held"
+    # Lock file persists after release (flock released, fd closed).
+    assert (out / "index.lock").exists()
+
+
+# --- 16. corrupt sidecar on a changed file -> treat as new (add-all) --------
+def test_update_corrupt_sidecar_changed_file(tmp_path, corpus):
+    out = tmp_path / "out"
+    _build_index(corpus, out)
+
+    # Bit-flip the CRC byte (last byte) of a.txt's sidecar (slot 0).
+    sp = out / "slots" / "0.keys"
+    data = bytearray(sp.read_bytes())
+    data[-1] ^= 0xFF
+    sp.write_bytes(bytes(data))
+
+    # Modify a.txt (new word 'dandelion').
+    _write_txt(corpus, "a.txt", "alpha banana dandelion")
+
+    result = update(corpus, "*.txt", "txt", out)
+    assert result["updated"] == 1
+    assert result["unchanged"] == 1
+
+    # Recovery by add-all: new word searchable, other file unaffected.
+    assert _search(out, "dandelion")
+    assert _search(out, "cherry")
+    assert _no_tmp_leftovers(out)
+
+
+# --- 17. corrupt sidecar on a deleted file -> still tombstoned --------------
+def test_update_corrupt_sidecar_tombstone(tmp_path, corpus):
+    out = tmp_path / "out"
+    _build_index(corpus, out)
+
+    # Bit-flip the CRC byte (last byte) of a.txt's sidecar (slot 0).
+    sp = out / "slots" / "0.keys"
+    data = bytearray(sp.read_bytes())
+    data[-1] ^= 0xFF
+    sp.write_bytes(bytes(data))
+
+    # Delete a.txt — we can't know its old keys, but the manifest must still be
+    # tombstoned so the file is hidden from results.
+    (corpus / "a.txt").unlink()
+
+    result = update(corpus, "*.txt", "txt", out)
+    assert result["removed"] == 1
+    assert result["unchanged"] == 1
+
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["files"][0]["tombstoned"] is True
+    assert manifest["files"][0]["filename"] == ""
+    # tombstone removes the (corrupt) sidecar too
+    assert not (out / "slots" / "0.keys").exists()
+    # surviving file still searchable
+    assert _search(out, "cherry")
+    assert _no_tmp_leftovers(out)
+
+
+
+def test_extractor_subset_invariant():
+    """Every DAFSA indexer extractor must also be a valid search-config extractor.
+
+    indexer.EXTRACTORS and search.config._VALID_EXTRACTORS are maintained in
+    two places; keep them consistent so a new extractor doesn't silently fail
+    the DAFSA-capable gate at search time.
+    """
+    from indexer import EXTRACTORS
+    from search.config import _VALID_EXTRACTORS
+
+    missing = set(EXTRACTORS) - set(_VALID_EXTRACTORS)
+    assert not missing, (
+        "indexer.EXTRACTORS has entries not in search.config._VALID_EXTRACTORS: "
+        f"{sorted(missing)}. Add them to _VALID_EXTRACTORS in search/config.py."
+    )

@@ -20,7 +20,7 @@
  */
 #include "dafsa_internal.h"
 
-static const uint32_t crc32_table[256] = {
+const uint32_t crc32_table[256] = {
         0x00000000, 0x77073096, 0xEE0E612C, 0x990951BA,
         0x076DC419, 0x706AF48F, 0xE963A535, 0x9E6495A3,
         0x0EDB8832, 0x79DCB8A4, 0xE0D5E91E, 0x97D2D988,
@@ -87,11 +87,25 @@ static const uint32_t crc32_table[256] = {
         0xB40BBE37, 0xC30C8EA1, 0x5A05DF1B, 0x2D02EF8D,
 };
 
-uint32_t crc32_compute(const uint8_t *data, size_t len)
+uint32_t crc32_init(void)
 {
-    uint32_t crc = 0xFFFFFFFF;
+    return 0xFFFFFFFF;
+}
+
+uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len)
+{
     size_t i;
     for (i = 0; i < len; i++)
         crc = crc32_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    return crc;
+}
+
+uint32_t crc32_finalize(uint32_t crc)
+{
     return crc ^ 0xFFFFFFFF;
+}
+
+uint32_t crc32_compute(const uint8_t *data, size_t len)
+{
+    return crc32_finalize(crc32_update(crc32_init(), data, len));
 }

@@ -104,6 +104,28 @@ struct dafsa {
     unsigned int   free_head;
 };
 
+/* ─── Write-ahead log (M5) ─────────────────────────────────────────────── */
+
+struct dafsa_wal { int fd; uint64_t size; };
+
+/* ─── WAL overlay for layered read view ────────────────────────────────── */
+
+struct wal_slot { uint8_t payload[8]; uint8_t state; };  /* state: 0=empty, ADD=1, DEL=2 */
+struct wal_bucket {
+    uint8_t *word;
+    uint32_t word_len;
+    struct wal_slot *slots;
+    size_t slots_cap;    /* power of two */
+    size_t slots_used;   /* occupied (non-zero state) */
+};
+struct wal_overlay {
+    struct wal_bucket *buckets;
+    size_t buckets_cap;
+    size_t buckets_used;
+    uint32_t *table;     /* outer hash index → bucket index (UINT32_MAX=empty) */
+    size_t table_cap;    /* power of two */
+};
+
 /* Zero-copy search-only view: mmaps the on-disk PDWG v3 file and indexes
  * directly into the CSR — no State[]/Edge[] materialization. */
 struct dafsa_view {
@@ -116,6 +138,7 @@ struct dafsa_view {
     uint64_t      *state_off;    /* n_states+2 byte offsets into csr;
                                   * state s spans [csr+off[s], csr+off[s+1])
                                   * off[0]=0; off[n_states+1]==total CSR bytes */
+    struct wal_overlay *ov;      /* WAL overlay for layered read, or NULL */
 };
 
 /* ─── Transition accessors ─────────────────────────────────────────────── */
@@ -170,10 +193,10 @@ int           confluence_path(dafsa *d, unsigned int *path,
                               unsigned int len);
 
 /* dafsa_persist.c */
-int           put_u8(FILE *f, uint8_t v);
-int           put_uvarint(FILE *f, uint32_t v);
-int           put_u16_le(FILE *f, uint16_t v);
-int           put_u32_le(FILE *f, uint32_t v);
+int           put_u8(FILE *f, uint8_t v, uint32_t *crc);
+int           put_uvarint(FILE *f, uint32_t v, uint32_t *crc);
+int           put_u16_le(FILE *f, uint16_t v, uint32_t *crc);
+int           put_u32_le(FILE *f, uint32_t v, uint32_t *crc);
 int           fsync_dir_of(const char *path);
 int           mb_u8(const uint8_t **p, const uint8_t *end, uint8_t *out);
 int           mb_u16(const uint8_t **p, const uint8_t *end, uint16_t *out);
@@ -183,6 +206,10 @@ int           mb_skipvarint(const uint8_t **p, const uint8_t *end);
 dafsa        *dafsa_load_impl(const char *path, int mutable);
 
 /* dafsa_crc32.c */
+extern const uint32_t crc32_table[256];
+uint32_t      crc32_init(void);
+uint32_t      crc32_update(uint32_t crc, const uint8_t *data, size_t len);
+uint32_t      crc32_finalize(uint32_t crc);
 uint32_t      crc32_compute(const uint8_t *data, size_t len);
 
 /* dafsa_view.c */

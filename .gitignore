@@ -4,12 +4,18 @@ __pycache__/
 .venv/
 .py-site/
 
-# C DAFSA build artifact (build from indexer/dafsa/dafsa.c)
+# C DAFSA build artifacts (build from indexer/dafsa/dafsa.c)
 indexer/dafsa/libdafsa.so
 indexer/dafsa/_t
+indexer/dafsa/_t.*
 indexer/dafsa/_td
+indexer/dafsa/_td.*
+indexer/dafsa/_review_*
 indexer/dafsa/*.o
+indexer/dafsa/*.elf
+indexer/dafsa/*.com.dbg
 indexer/dafsa/dafsa.dot
+indexer/dafsa/.aarch64/
 
 # Data / state (never commit personal memory)
 *.db
