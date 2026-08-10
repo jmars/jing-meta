@@ -99,6 +99,32 @@ class TestBudget:
         assert obs_line == "Observation: tiny observation"
         assert "…" not in obs_line
 
+    def test_open_nodes_max_obs_chars_none_full_content(self, _db):
+        # Passing max_obs_chars=None returns the observation untruncated.
+        blocks = server.open_nodes(["long"], max_obs_chars=None)
+        rendered = self._long_obs(blocks)
+        assert rendered == "A" * 3000
+        assert "…" not in rendered
+
+    def test_truncated_obs_surfaces_length(self, _db):
+        # Truncated observations are preceded by a metadata block with the true
+        # length and a hint to fetch the full text.
+        blocks = server.open_nodes(["long"])
+        texts = [b.text for b in blocks]
+        type_idx = texts.index("Type: t")
+        meta = texts[type_idx + 1]
+        assert meta.startswith("[Observation: 3000 chars total, truncated to 2000")
+        assert "max_obs_chars=None" in meta
+        assert "…" in texts[type_idx + 2]
+
+    def test_short_obs_no_length_meta(self, _db):
+        # Observations under the limit are not prefixed by a length metadata block.
+        blocks = server.open_nodes(["short"])
+        texts = [b.text for b in blocks]
+        type_idx = texts.index("Type: t")
+        assert texts[type_idx + 1] == "Observation: tiny observation"
+        assert not texts[type_idx + 1].startswith("[Observation: ")
+
     def test_search_nodes_default_cap_unchanged(self, _db):
         # search_nodes still uses the default per-observation char cap (500).
         blocks = server.search_nodes("A", include_semantic=False)

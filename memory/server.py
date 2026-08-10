@@ -160,8 +160,17 @@ def _entity_blocks(
         TextContent(type="text", text=f"Type: {entity_type}"),
     ]
     for obs in observations:
-        text = obs if max_obs_chars is None else _truncate_obs(obs, max_obs_chars)
-        blocks.append(TextContent(type="text", text=f"Observation: {text}"))
+        if max_obs_chars is None or len(obs) <= max_obs_chars:
+            blocks.append(TextContent(type="text", text=f"Observation: {obs}"))
+        else:
+            # Surface the true length and how to fetch the full text before
+            # emitting the truncated content, so agents can decide whether to
+            # request the whole observation (max_obs_chars=None).
+            blocks.append(TextContent(type="text", text=(
+                f"[Observation: {len(obs)} chars total, truncated to {max_obs_chars}; "
+                f"pass max_obs_chars=None to the read tool for full text]"
+            )))
+            blocks.append(TextContent(type="text", text=f"Observation: {_truncate_obs(obs, max_obs_chars)}"))
     if created_at:
         blocks.append(TextContent(type="text", text=f"Created: {created_at}"))
     if updated_at:
@@ -652,17 +661,28 @@ def rebuild_semantic_index() -> list[TextContent]:
 
 
 @mcp.tool()
-def open_nodes(names: list[str], max_obs_per_entity: int = 20) -> list[TextContent]:
+def open_nodes(
+    names: list[str],
+    max_obs_per_entity: int = 20,
+    max_obs_chars: int | None = 2000,
+) -> list[TextContent]:
     """Open specific nodes in the knowledge graph by their names.
 
     Returns full entity details including observations and timestamps
     as discrete content blocks. Observations are truncated to
-    ``max_obs_per_entity`` per entity and each observation is bounded to 2000
-    characters, so a single call cannot blow out the context window.
+    ``max_obs_per_entity`` per entity and each observation is bounded to
+    ``max_obs_chars`` (default 2000) characters, so a single call cannot blow
+    out the context window.
+
+    When an observation is truncated, a metadata block precedes it with its
+    true length and how to fetch the full text. Pass ``max_obs_chars=None`` to
+    return observations untruncated.
 
     Args:
         names:              Names of entities to open.
         max_obs_per_entity: Max observations to render per entity (default 20).
+        max_obs_chars:      Max chars per observation before truncation
+                            (default 2000); ``None`` disables truncation.
     """
     conn = _get_conn()
     blocks: list[TextContent] = []
@@ -682,7 +702,7 @@ def open_nodes(names: list[str], max_obs_per_entity: int = 20) -> list[TextConte
                 _get_obs_by_entity_id(conn, row["id"])[:max_obs_per_entity],
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
-                max_obs_chars=2000,
+                max_obs_chars=max_obs_chars,
             )
         )
 
