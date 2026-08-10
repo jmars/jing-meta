@@ -125,6 +125,13 @@ def _get_obs_by_entity_id(conn: sqlite3.Connection, entity_id: int) -> list[str]
     return [r["content"] for r in rows]
 
 
+def _truncate_obs(obs: str, max_chars: int) -> str:
+    """Truncate *obs* to *max_chars*, appending '…' when shortened."""
+    if len(obs) > max_chars:
+        return obs[:max_chars] + "…"
+    return obs
+
+
 # ---------------------------------------------------------------------------
 # Content-block renderers
 #
@@ -146,14 +153,15 @@ def _entity_blocks(
     observations: list[str],
     created_at: str | None = None,
     updated_at: str | None = None,
+    max_obs_chars: int | None = 500,
 ) -> list[TextContent]:
     blocks = [
         TextContent(type="text", text=f"Name: {name}"),
         TextContent(type="text", text=f"Type: {entity_type}"),
     ]
-    blocks.extend(
-        TextContent(type="text", text=f"Observation: {obs}") for obs in observations
-    )
+    for obs in observations:
+        text = obs if max_obs_chars is None else _truncate_obs(obs, max_obs_chars)
+        blocks.append(TextContent(type="text", text=f"Observation: {text}"))
     if created_at:
         blocks.append(TextContent(type="text", text=f"Created: {created_at}"))
     if updated_at:
@@ -177,7 +185,7 @@ def _relation_blocks(relations: list[dict]) -> list[TextContent]:
     return blocks
 
 
-def _join_entities(entities: list[dict]) -> list[TextContent]:
+def _join_entities(entities: list[dict], max_obs_chars: int | None = 500) -> list[TextContent]:
     """Render a list of entity dicts, inserting a separator between entities.
 
     Each entity dict may carry optional created_at/updated_at keys (e.g. from
@@ -194,6 +202,7 @@ def _join_entities(entities: list[dict]) -> list[TextContent]:
                 e["observations"],
                 created_at=e.get("created_at"),
                 updated_at=e.get("updated_at"),
+                max_obs_chars=max_obs_chars,
             )
         )
     return blocks
@@ -643,11 +652,17 @@ def rebuild_semantic_index() -> list[TextContent]:
 
 
 @mcp.tool()
-def open_nodes(names: list[str]) -> list[TextContent]:
+def open_nodes(names: list[str], max_obs_per_entity: int = 20) -> list[TextContent]:
     """Open specific nodes in the knowledge graph by their names.
 
-    Returns full entity details including all observations and timestamps
-    as discrete content blocks.
+    Returns full entity details including observations and timestamps
+    as discrete content blocks. Observations are truncated to
+    ``max_obs_per_entity`` per entity and each observation is bounded to 2000
+    characters, so a single call cannot blow out the context window.
+
+    Args:
+        names:              Names of entities to open.
+        max_obs_per_entity: Max observations to render per entity (default 20).
     """
     conn = _get_conn()
     blocks: list[TextContent] = []
@@ -664,9 +679,10 @@ def open_nodes(names: list[str]) -> list[TextContent]:
             _entity_blocks(
                 row["name"],
                 row["entity_type"],
-                _get_obs_by_entity_id(conn, row["id"]),
+                _get_obs_by_entity_id(conn, row["id"])[:max_obs_per_entity],
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
+                max_obs_chars=2000,
             )
         )
 
@@ -713,12 +729,13 @@ def read_graph() -> list[TextContent]:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def traverse(start_node: str, depth: int = 1) -> list[TextContent]:
+def traverse(start_node: str, depth: int = 1, max_obs_per_entity: int = 5) -> list[TextContent]:
     """Traverse the graph from a starting node, returning all entities within N hops.
 
     Args:
-        start_node: Entity name to start from
-        depth:     Number of hops to traverse (default 1, max 3)
+        start_node:         Entity name to start from
+        depth:              Number of hops to traverse (default 1, max 3)
+        max_obs_per_entity: Max observations to render per entity (default 5).
     """
     conn = _get_conn()
 
@@ -787,7 +804,7 @@ def traverse(start_node: str, depth: int = 1) -> list[TextContent]:
         entities.append({
             "name": erow["name"],
             "entityType": erow["entity_type"],
-            "observations": _get_obs_by_entity_id(conn, erow["id"]),
+            "observations": _get_obs_by_entity_id(conn, erow["id"])[:max_obs_per_entity],
         })
 
     blocks: list[TextContent] = _join_entities(entities)

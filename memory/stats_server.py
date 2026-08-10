@@ -35,6 +35,10 @@ from jing_meta.mcp_base import JINGMCP, text_block, text_blocks
 
 logger = logging.getLogger("memory-stats")
 
+# Cap the number of entity/relation type detail lines rendered by graph_stats so
+# a huge type histogram cannot blow out the LLM context window.
+_MAX_TYPE_LINES = 20
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -143,14 +147,22 @@ def graph_stats() -> list[TextContent]:
         "",
         f"  Entity Types ({len(type_counts)}):",
     ]
-    for et, count in type_counts:
+    shown_types = type_counts[:_MAX_TYPE_LINES]
+    for et, count in shown_types:
         output.append(f"    {et}: {count}")
+    hidden_types = len(type_counts) - _MAX_TYPE_LINES
+    if hidden_types > 0:
+        output.append(f"    …and {hidden_types} more types")
 
     if rel_counts:
         output.append("")
         output.append(f"  Relation Types ({len(rel_counts)}):")
-        for rt, count in rel_counts:
+        shown_rels = rel_counts[:_MAX_TYPE_LINES]
+        for rt, count in shown_rels:
             output.append(f"    {rt}: {count}")
+        hidden_rels = len(rel_counts) - _MAX_TYPE_LINES
+        if hidden_rels > 0:
+            output.append(f"    …and {hidden_rels} more")
 
     if recent_rows:
         output.append("")
@@ -170,11 +182,18 @@ def graph_stats() -> list[TextContent]:
 
 
 @mcp.tool()
-def entity_summary(name: str) -> list[TextContent]:
+def entity_summary(name: str, max_obs: int = 50, max_rels: int = 50) -> list[TextContent]:
     """Get full details for a specific entity by name.
 
-    Returns entity type, all observations with timestamps, related entities
+    Returns entity type, observations with timestamps, related entities
     (inbound and outbound relations), and creation/update timestamps.
+    Observations and relations are capped (``max_obs``/``max_rels``) so a huge
+    entity cannot blow out the context window.
+
+    Args:
+        name:     Entity name to summarize.
+        max_obs:  Max observations to render (default 50).
+        max_rels: Max relations to render per direction (default 50).
     """
     if not _has_sqlite():
         return [text_block(f"Knowledge graph database not found at {DB_PATH}")]
@@ -185,10 +204,10 @@ def entity_summary(name: str) -> list[TextContent]:
     )
     if not rows:
         return [text_block(f"Entity not found: {name}")]
-    return _entity_summary_sqlite(rows[0])
+    return _entity_summary_sqlite(rows[0], max_obs=max_obs, max_rels=max_rels)
 
 
-def _entity_summary_sqlite(e) -> list[TextContent]:
+def _entity_summary_sqlite(e, max_obs: int = 50, max_rels: int = 50) -> list[TextContent]:
     entity_id = e["id"]
     obs_rows = _query_sqlite(
         "SELECT content, created_at FROM observations WHERE entity_id = ? ORDER BY id",
@@ -211,24 +230,33 @@ def _entity_summary_sqlite(e) -> list[TextContent]:
         "",
         f"  Observations ({len(obs_rows)}):",
     ]
-    for i, o in enumerate(obs_rows, 1):
+    for i, o in enumerate(obs_rows[:max_obs], 1):
         ts = o["created_at"] or "?"
         content = o["content"]
         if len(content) > 120:
             content = content[:117] + "..."
         output.append(f"    {i}. [{ts}] {content}")
+    hidden_obs = len(obs_rows) - max_obs
+    if hidden_obs > 0:
+        output.append(f"    …and {hidden_obs} more observations (truncated)")
 
     if out_rel:
         output.append("")
         output.append(f"  Outgoing relations ({len(out_rel)}):")
-        for r in out_rel:
+        for r in out_rel[:max_rels]:
             output.append(f"    → {r['to_entity']} ({r['relation_type']})")
+        hidden_out = len(out_rel) - max_rels
+        if hidden_out > 0:
+            output.append(f"    …and {hidden_out} more")
 
     if in_rel:
         output.append("")
         output.append(f"  Incoming relations ({len(in_rel)}):")
-        for r in in_rel:
+        for r in in_rel[:max_rels]:
             output.append(f"    {r['from_entity']} → ({r['relation_type']})")
+        hidden_in = len(in_rel) - max_rels
+        if hidden_in > 0:
+            output.append(f"    …and {hidden_in} more")
 
     return text_blocks(*output)
 

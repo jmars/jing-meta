@@ -135,3 +135,117 @@ class TestEntitySummary:
         )
         out = _text(stats_server.entity_summary("alpha"))
         assert "Knowledge graph database not found" in out
+
+
+class TestGraphStatsTypeCap:
+    """graph_stats caps the type histograms at _MAX_TYPE_LINES lines."""
+
+    @pytest.fixture
+    def _bigdb(self, monkeypatch, tmp_path):
+        db = tmp_path / "memory.db"
+        conn = sqlite3.connect(str(db))
+        conn.executescript(SCHEMA_DDL)
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for i in range(25):
+            conn.execute(
+                "INSERT INTO entities (name, entity_type, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (f"entity_{i}", f"type_{i}", now, now),
+            )
+            # One observation each so obs count > 0; relation per entity below.
+            eid = conn.execute(
+                "SELECT id FROM entities WHERE name = ?", (f"entity_{i}",)
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO observations (entity_id, content, created_at) "
+                "VALUES (?, ?, ?)",
+                (eid, f"obs {i}", now),
+            )
+            if i > 0:
+                conn.execute(
+                    "INSERT INTO relations (from_entity, to_entity, relation_type, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (f"entity_0", f"entity_{i}", f"rel_{i}", now),
+                )
+        conn.commit()
+        conn.close()
+        monkeypatch.setattr(stats_server, "DB_PATH", db)
+        return db
+
+    def test_entity_types_capped(self, _bigdb):
+        out = _text(stats_server.graph_stats())
+        # Real total in header, capped detail lines.
+        assert "Entity Types (25):" in out
+        assert out.count("    type_") == 20
+        assert "…and 5 more types" in out
+
+    def test_relation_types_capped(self, _bigdb):
+        out = _text(stats_server.graph_stats())
+        assert "Relation Types (24):" in out  # rel_1..rel_24
+        assert out.count("    rel_") == 20
+        assert "…and 4 more" in out
+
+
+class TestEntitySummaryCaps:
+    """entity_summary caps observations and relations."""
+
+    def _big_obs_db(self, monkeypatch, tmp_path, n_obs=60):
+        db = tmp_path / "memory.db"
+        conn = sqlite3.connect(str(db))
+        conn.executescript(SCHEMA_DDL)
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        conn.execute(
+            "INSERT INTO entities (name, entity_type, created_at, updated_at) "
+            "VALUES ('x', 'concept', ?, ?)",
+            (now, now),
+        )
+        eid = conn.execute("SELECT id FROM entities WHERE name = 'x'").fetchone()[0]
+        for i in range(n_obs):
+            conn.execute(
+                "INSERT INTO observations (entity_id, content, created_at) "
+                "VALUES (?, ?, ?)",
+                (eid, f"obs_{i}", now),
+            )
+        conn.commit()
+        conn.close()
+        monkeypatch.setattr(stats_server, "DB_PATH", db)
+        return db
+
+    def test_entity_summary_obs_cap(self, monkeypatch, tmp_path):
+        db = self._big_obs_db(monkeypatch, tmp_path, n_obs=60)
+        out = _text(stats_server.entity_summary("x", max_obs=10))
+        assert "Observations (60):" in out
+        # Header line + 10 rendered obs + 1 truncation note.
+        assert out.count("obs_") == 10
+        assert "…and 50 more observations (truncated)" in out
+
+    def test_entity_summary_rels_cap(self, monkeypatch, tmp_path):
+        db = tmp_path / "memory.db"
+        conn = sqlite3.connect(str(db))
+        conn.executescript(SCHEMA_DDL)
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        conn.execute(
+            "INSERT INTO entities (name, entity_type, created_at, updated_at) "
+            "VALUES ('x', 'concept', ?, ?)",
+            (now, now),
+        )
+        conn.execute(
+            "INSERT INTO entities (name, entity_type, created_at, updated_at) "
+            "VALUES ('y', 'concept', ?, ?)",
+            (now, now),
+        )
+        # 60 outgoing relations from x.
+        for i in range(60):
+            conn.execute(
+                "INSERT INTO relations (from_entity, to_entity, relation_type, created_at) "
+                "VALUES ('x', ?, ?, ?)",
+                (f"y_{i}", "relates_to", now),
+            )
+        conn.commit()
+        conn.close()
+        monkeypatch.setattr(stats_server, "DB_PATH", db)
+
+        out = _text(stats_server.entity_summary("x", max_rels=10))
+        assert "Outgoing relations (60):" in out
+        assert "→ y_" in out
+        assert "…and 50 more" in out
