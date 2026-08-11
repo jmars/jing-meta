@@ -5,8 +5,8 @@ Fully offline relation validation/naming for the gardening pipeline.
 Two tiers, cheapest first:
   1. DETERMINISTIC RULES: infer the relation type from entity type-patterns and
      confidence signals. Precise and free. Handles the easy ~70%.
-  2. LOCAL LLM (Ollama): name the remaining ambiguous pairs with a small Q4
-     model (qwen2.5:3b by default). Fast (~1s/pair), zero network, private.
+  2. LOCAL LLM (Ollama): name the remaining ambiguous pairs with a small Q4_K_M
+     model (qwen3.5:2b-q4_k_m by default). Fast (~1s/pair), zero network, private.
 
 The cloud LLM is NOT needed. Everything runs on the machine.
 """
@@ -131,12 +131,49 @@ def _local_llm_relation(a: str, b: str) -> Optional[str]:
             f"{OLLAMA_URL}/api/generate",
             json={
                 "model": LOCAL_MODEL, "prompt": prompt, "stream": False,
+                "think": False,  # qwen3.x is a thinking model — disable it.
                 "options": {"temperature": 0.1, "num_predict": 20},
             },
             timeout=60,
         )
         resp = (r.json().get("response") or "").strip()
         return _parse_relation_type(resp)
+    except Exception:
+        return None
+
+
+def _local_llm_batch(prompt: str) -> Optional[dict]:
+    """Batch-validate candidate relations via Ollama `/api/generate`, thinking off.
+
+    Qwen3.x is a *thinking* model: on the OpenAI-compatible
+    ``/v1/chat/completions`` endpoint it routes the whole answer into the
+    ``reasoning`` field and returns an empty ``content``, which breaks
+    ``llm.call``'s JSON parse (returns ``None``). Calling ``/api/generate``
+    with ``think: false`` puts the answer in ``response`` as expected.
+
+    Returns the parsed ``{"add_relations": [...]}`` dict, or ``None`` on any
+    failure (never raises — the caller falls back to single-pair naming).
+    """
+    import requests
+
+    from .llm import _extract_json
+
+    try:
+        r = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model": LOCAL_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "think": False,
+                "options": {"temperature": 0.1, "num_predict": 2000},
+            },
+            timeout=120,
+        )
+        resp = (r.json().get("response") or "").strip()
+        if not resp:
+            return None
+        return _extract_json(resp)
     except Exception:
         return None
 
@@ -219,15 +256,9 @@ def validate_and_name(
         if llm_callable is not None:
             llm_result = llm_callable(prompt)
         else:
-            from . import llm as _llm_lib
-            llm_result, _meta = _llm_lib.call(
-                system_prompt="You are a knowledge graph relation validator.",
-                user_prompt=prompt,
-                max_tokens=2000,
-                api_url=f"{OLLAMA_URL}/v1",
-                api_key="",
-                model=LOCAL_MODEL,
-            )
+            # Local Ollama: /api/generate with think:false (qwen3.x is a
+            # thinking model — /v1/chat/completions returns empty content).
+            llm_result = _local_llm_batch(prompt)
 
         if llm_result and isinstance(llm_result, dict):
             health["batch_calls_succeeded"] += 1

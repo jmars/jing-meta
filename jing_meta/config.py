@@ -45,7 +45,9 @@ def index_root() -> Path:
 EMBED_MODEL = os.environ.get("JING_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 
 # Local LLM for relation validation (Ollama). Override with JING_LOCAL_LLM.
-LOCAL_LLM_MODEL = os.environ.get("JING_LOCAL_LLM", "qwen2.5:1.5b")
+# qwen3.5:2b-q4_k_m (Qwen 3.5, Q4_K_M weights) + q4_0 KV cache (see the
+# ollama systemd drop-in) — offline, fast, private.
+LOCAL_LLM_MODEL = os.environ.get("JING_LOCAL_LLM", "qwen3.5:2b-q4_k_m")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 
 # External tools

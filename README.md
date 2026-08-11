@@ -78,7 +78,7 @@ jing-meta verify
 memory.db
   → Soufflé (lexical token-overlap, exact, sub-second)   → type renames + duplicates
   → semantic rerank (ONNX bge-small, offline)            → top-N conceptual candidates
-  → rules + local LLM (Ollama qwen2.5:1.5b)              → validate + name relations
+  → rules + local LLM (Ollama qwen3.5:2b-q4_k_m)            → validate + name relations
   → apply (backed up, additive-only)
 ```
 
