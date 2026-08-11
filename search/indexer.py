@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from indexer import EXTRACTORS as DAFSA_EXTRACTORS
+from indexer.dafsa import DafsaDaemonCrashed
 
 from .config import DomainConfig
 
@@ -248,6 +249,22 @@ def _get_cached_index(idx_dir: Path) -> "_CacheEntry":
     raise RuntimeError(f"index at {idx_dir} is changing too quickly to open a consistent view")
 
 
+def _evict_dir(idx_dir: Path) -> None:
+    """Retire and close every cached Index for *idx_dir*.
+
+    Used after the C daemon crashes: the daemon auto-restarts but previously
+    opened view handles become stale (the new daemon doesn't know them), so any
+    cached Index must be dropped and reopened. Caller does NOT hold the lock.
+    """
+    now = time.monotonic()
+    with _index_cache_lock:
+        for k, entry in list(_index_cache.items()):
+            if k[0] == str(idx_dir):
+                del _index_cache[k]
+                _retire(entry, now)
+        _sweep_retired()
+
+
 def _iter_domain_files(cfg: DomainConfig) -> list[Path]:
     """Return domain files/dirs, newest first."""
     root = cfg.dir
@@ -370,24 +387,47 @@ def search_fst(
         return None
 
     try:
-        entry = _get_cached_index(idx_dir)
-        try:
-            hits = entry.search(query, any_word=any_word)
-            results = []
-            for h in hits:
-                results.append(
-                    {
-                        "file_idx": h.file_idx,
-                        "entry_idx": h.entry_idx,
-                        "_domain": cfg.name,
-                        "date": entry.files[h.file_idx].date
-                        if h.file_idx < len(entry.files)
-                        else "?",
-                    }
-                )
-            return results
-        finally:
-            _release_entry(entry)
+        # The C daemon can crash and auto-restart; previously opened view handles
+        # become stale (EBADH). On DafsaDaemonCrashed, evict the stale cached index
+        # and retry once with a fresh view so a transient daemon crash doesn't fail
+        # the whole search.
+        for attempt in range(2):
+            try:
+                entry = _get_cached_index(idx_dir)
+                try:
+                    # Cap the FST union so a broad OR query doesn't hand tens of
+                    # thousands of hits to the formatter (which would mostly be
+                    # discarded by the per-file / max_results caps anyway).
+                    hits = entry.search(query, any_word=any_word, limit=max_results)
+                    results = []
+                    for h in hits:
+                        results.append(
+                            {
+                                "file_idx": h.file_idx,
+                                "entry_idx": h.entry_idx,
+                                "_domain": cfg.name,
+                                # Resolve the filename HERE, once, from the already-loaded
+                                # manifest (entry.files) instead of making the formatter
+                                # call resolve_file_idx per result — which re-reads +
+                                # re-parses the whole manifest.json on every hit. For a
+                                # 58MB sessions index this was ~24s of repeated manifest
+                                # I/O per search.
+                                "file_name": entry.files[h.file_idx].filename
+                                if h.file_idx < len(entry.files)
+                                else None,
+                                "date": entry.files[h.file_idx].date
+                                if h.file_idx < len(entry.files)
+                                else "?",
+                            }
+                        )
+                    return results
+                finally:
+                    _release_entry(entry)
+            except DafsaDaemonCrashed:
+                if attempt == 1:
+                    raise
+                # Drop the stale cached Index; the daemon has restarted.
+                _evict_dir(idx_dir)
     except Exception:  # noqa: BLE001
         return None
 

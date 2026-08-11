@@ -187,12 +187,20 @@ def _parse_transcript_cached(path_str: str, mtime_ns: int) -> dict:
     return parse_transcript(read_transcript_text(Path(path_str)))
 
 
-def parse_transcript_file(p: Path) -> dict:
-    """Parse a transcript file with caching."""
-    cached = _parse_transcript_cached(str(p), p.stat().st_mtime_ns)
+# The parsed structure is shared (read-only) by all callers. We deep-copy it
+# ONCE here, keyed on (path, mtime), so the per-call deep copy is avoided while
+# still returning a mutable-safe, independent copy. Callers must not mutate it.
+@lru_cache(maxsize=128)
+def _parse_transcript_copy(path_str: str, mtime_ns: int) -> dict:
+    cached = _parse_transcript_cached(path_str, mtime_ns)
     return {
         **cached,
         "participants": list(cached["participants"]),
         "turns": [dict(t) for t in cached["turns"]],
         "raw_lines": list(cached["raw_lines"]),
     }
+
+
+def parse_transcript_file(p: Path) -> dict:
+    """Parse a transcript file with caching."""
+    return _parse_transcript_copy(str(p), p.stat().st_mtime_ns)

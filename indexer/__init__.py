@@ -85,43 +85,18 @@ def extract_jsonl(path: Path, filename: str) -> tuple[tuple[str, str, str, str],
     return (filename, filename, date, "jsonl"), entries
 
 
-def extract_txt(path: Path, filename: str) -> tuple[tuple[str, str, str, str], list[str]]:
-    date = date_from_path(path)
-    try:
-        content = path.read_text(encoding="utf-8")
-    except (UnicodeDecodeError, OSError):
-        logger.warning("Skipping non-UTF-8 file %s: decode error", path)
-        return (filename, filename, date, "txt"), []
-    return (filename, filename, date, "txt"), [line for line in content.splitlines() if line.strip()]
-
-
-def extract_transcript(path: Path, filename: str) -> tuple[tuple[str, str, str, str], list[str]]:
-    date = date_from_path(path)
-    entries = []
-    try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            s = line.strip()
-            if not s:
-                continue
-            # Tactiq-style: "Speaker: text" — index the whole line (simplified)
-            entries.append(s)
-    except (UnicodeDecodeError, OSError):
-        logger.warning("Skipping non-UTF-8 file %s: decode error", path)
-        return (filename, filename, date, "transcript"), []
-    return (filename, filename, date, "transcript"), entries
-
-
 EXTRACTORS = {
     "jsonl": extract_jsonl,
-    "txt": extract_txt,
-    "transcript": extract_transcript,
 }
 
-# Canonical registry of DAFSA-capable extractors.  The search config's
-# _VALID_EXTRACTORS is a superset that additionally allows "notification"
-# for domains that don't use a DAFSA index (e.g. the notifications domain
-# read via server-side bespoke functions).  search/indexer.py gracefully
-# skips domains whose extractor is not in this set.
+# Canonical registry of DAFSA-capable extractors.  The C indexer daemon only
+# supports the JSONL extractor on ASCII corpora (see indexer/dafsa/dafsa_build.c),
+# so the Python extractor registry mirrors exactly that.  Any additional
+# extractor must be implemented (and parity-gated) in the C core first, then
+# added here.  The search config's _VALID_EXTRACTORS is a superset that
+# additionally allows "notification" for domains that don't use a DAFSA index
+# (read via server-side bespoke functions); search/indexer.py gracefully skips
+# domains whose extractor is not in this set.
 
 
 # ---------------------------------------------------------------------------
@@ -772,7 +747,7 @@ class Index:
             self._view.free()
             self._view = None
 
-    def search(self, query: str, any_word: bool = False) -> list[Hit]:
+    def search(self, query: str, any_word: bool = False, limit: int | None = None) -> list[Hit]:
         query_words = tokenize(query)
         if not query_words:
             return []
@@ -786,6 +761,8 @@ class Index:
                     fi = int.from_bytes(payload[0:4], "big")
                     ei = int.from_bytes(payload[4:8], "big")
                     hits.add((fi, ei))
+                if limit is not None and len(hits) >= limit:
+                    break
             if not hits and not any_word:
                 return []
             if hits:
@@ -796,11 +773,13 @@ class Index:
             all_hits: set[tuple[int, int]] = set()
             for ws in word_sets:
                 all_hits |= ws
-            return [Hit(f, e) for f, e in all_hits]
+                if limit is not None and len(all_hits) >= limit:
+                    break
+            return [Hit(f, e) for f, e in all_hits][:limit] if limit is not None else [Hit(f, e) for f, e in all_hits]
         inter: set[tuple[int, int]] = word_sets[0]
         for ws in word_sets[1:]:
             inter &= ws
-        return [Hit(f, e) for f, e in inter]
+        return [Hit(f, e) for f, e in inter][:limit] if limit is not None else [Hit(f, e) for f, e in inter]
 
     def file_name(self, file_idx: int) -> str:
         return self.files[file_idx].filename if 0 <= file_idx < len(self.files) else "?"

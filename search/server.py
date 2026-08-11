@@ -97,10 +97,32 @@ mcp = JINGMCP(
 # ---------------------------------------------------------------------------
 
 
+from functools import lru_cache
+
+
 def _load_json(path: Path) -> dict | None:
     try:
         return json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except (OSError, json.JSONDecodeError):
+        return None
+
+
+@lru_cache(maxsize=256)
+def _load_json_cached(path_str: str, mtime_ns: int) -> dict | None:
+    """Parse a JSON file once per (path, mtime) to avoid re-reading on every
+    request. Keyed on mtime so a writer updating the file invalidates the entry.
+    Returns an immutable-friendly dict; callers must not mutate it."""
+    try:
+        return json.loads(Path(path_str).read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _load_json_memo(path: Path) -> dict | None:
+    """Memoized JSON load keyed on (path, mtime)."""
+    try:
+        return _load_json_cached(str(path), path.stat().st_mtime_ns)
+    except OSError:
         return None
 
 
@@ -118,7 +140,7 @@ def _session_matches_cwd(session_dir: Path, cwd: str | None) -> bool:
         cwd = os.path.abspath(os.path.expanduser(cwd))
     except (TypeError, ValueError):
         return True
-    meta = _load_json(session_dir / "meta.json") or {}
+    meta = _load_json_memo(session_dir / "meta.json") or {}
     wd = (meta.get("environment") or {}).get("working_directory")
     if not wd:
         return True  # no wd recorded — don't hide it
@@ -156,7 +178,7 @@ def _msg_snippet(line: str) -> str:
 
 
 def _session_date_from_dir(d: Path) -> date | None:
-    meta = _load_json(d / "meta.json")
+    meta = _load_json_memo(d / "meta.json")
     if meta:
         st = meta.get("start_time")
         if st:
@@ -196,7 +218,7 @@ def _notify_date(p: Path) -> date | None:
 
 
 def _list_session_meta(d: Path) -> dict:
-    meta = _load_json(d / "meta.json") or {}
+    meta = _load_json_memo(d / "meta.json") or {}
     lines = []
     msg_path = d / "messages.jsonl"
     if msg_path.exists():
@@ -385,11 +407,11 @@ def _jsonl_search_lines(p: Path) -> list[str]:
 
 
 def _load_session_summary(d: Path) -> dict | None:
-    return _load_json(d / "summary.json")
+    return _load_json_memo(d / "summary.json")
 
 
 def _load_transcript_summary(p: Path) -> dict | None:
-    return _load_json(p.parent / (p.stem + ".summary.json"))
+    return _load_json_memo(p.parent / (p.stem + ".summary.json"))
 
 
 # ---------------------------------------------------------------------------
@@ -583,180 +605,38 @@ def search(
     ):
         return text_blocks(f"'speaker' filter not supported for domain '{domain}'")
 
-    # --- Fast path: try FST for each domain ---
-    all_fst_results: list[dict] = []
-    any_fst_attempted = False
-    for d_name in domains_to_search:
-        d_cfg = cfg.domains[d_name]
-        fst_results = _search_via_fst(d_cfg, query, max_results * 5, any_word)
-        if fst_results is not None:
-            any_fst_attempted = True
-            for r in fst_results:
-                r["_domain"] = d_name
-            all_fst_results.extend(fst_results)
-
-    if all_fst_results:
-        return text_blocks(_format_search_results(
-            all_fst_results,
-            domain,
-            query,
-            max_results,
-            date_from,
-            date_to,
-            context_lines,
-            max_matches_per_file,
-            regex,
-            case_sensitive,
-            role,
-            speaker,
-            cwd,
-        ))
-
-    # FST was available for at least one domain but found nothing — treat the
-    # FST index as authoritative and do NOT fall through to the slow scan.
-    # (Previously an AND query with no all-words match would fall through to the
-    # regex line scan, silently changing semantics.)
-    if any_fst_attempted:
-        return text_blocks("No results found.")
-
-    # --- Slow path: line-by-line scan ---
-    flags = 0 if case_sensitive else re.IGNORECASE
-    if regex:
-        # Reject patterns with known catastrophic backtracking constructs (shared
-        # ReDoS guard — see _regex_danger). Conservative by design: some safe
-        # regexes may be rejected, but the cost of a ReDoS hang is higher.
-        danger = _regex_danger(query)
-        if danger is not None:
-            return text_blocks(f"Potentially unsafe regex — {danger} detected.")
-        try:
-            pattern = re.compile(query, flags)
-        except re.error as e:
-            return text_blocks(f"Invalid regex: {e}")
-    else:
-        pattern = re.compile(re.escape(query), flags)
-
-    d_from = date.fromisoformat(date_from) if date_from else None
-    d_to = date.fromisoformat(date_to) if date_to else None
-
+    # --- Per-domain: use the FST fast path when an index exists, else slow scan ---
+    # Merge results into a unified match list. This is per-domain (rather than a
+    # global "any FST attempted" gate) so a domain lacking an FST index is still
+    # searched — previously an `all` query could return "No results found." and
+    # silently skip a non-indexed domain.
     all_matches: list[dict] = []
 
     for d_name in domains_to_search:
         d_cfg = cfg.domains[d_name]
-        files = _iter_domain_files(d_cfg)
-        handler = _get_domain_handler(d_name)
-        date_fn = handler.date_extract
-        search_fn = handler.search_lines
-
-        for f in files:
-            if not f.exists():
-                continue
-            if cwd and d_name == "sessions" and not _session_matches_cwd(f, cwd):
-                continue
-            fd = date_fn(f)
-            if d_from and fd and fd < d_from:
-                continue
-            if d_to and fd and fd > d_to:
-                continue
-
-            lines = search_fn(f)
-            if not lines:
-                continue
-
-            file_matches: list[dict] = []
-            try:
-                # Install a temporary SIGALRM handler for the slow-path regex
-                # scan so a pathological pattern cannot hang the server.  Save
-                # the previous handler and restore it in the finally block
-                # below — otherwise the _RegexTimeout-raising handler leaks into
-                # the whole process and any later signal.alarm() from a library
-                # would raise _RegexTimeout in an unguarded context.
-                _has_sigalrm = hasattr(signal, "SIGALRM")
-                _prev_alarm_handler = None
-                _alarm_installed = False
-                if _has_sigalrm:
-                    try:
-                        _prev_alarm_handler = signal.getsignal(signal.SIGALRM)
-                        signal.signal(signal.SIGALRM, _regex_alarm_handler)
-                        _alarm_installed = True
-                        signal.alarm(_SLOW_SCAN_TIMEOUT)
-                    except ValueError:
-                        # signal.signal() only works from the main thread.
-                        # Under mcp 1.23 (stdio) handlers run on the main
-                        # event-loop thread, so this path is never taken;
-                        # under mcp ≥2 handlers run in a thread pool and
-                        # this fallback avoids crashing the search there.
-                        # See jing_meta/mcp_base.py for the concurrency model.
-                        _alarm_installed = False
-                # Speaker filter (transcripts only): build the line->turn map
-                # ONCE per file, before the per-line loop, then look it up by
-                # line number inside the loop. Hoisting avoids re-parsing the
-                # transcript (an lru_cache'd parse) for every matching line.
-                turn_by_line = None
-                if speaker and d_name == "transcripts":
-                    parsed = parse_transcript_file(f)
-                    if parsed:
-                        turn_by_line = {}
-                        for t in parsed["turns"]:
-                            for ln in range(
-                                t.get("line_start", 0), t.get("line_end", 0) + 1
-                            ):
-                                turn_by_line[ln] = t
-                try:
-                    for line_no, line in enumerate(lines, 1):
-                        if not pattern.search(line):
-                            continue
-
-                        # Role filter (sessions only)
-                        if role and d_name == "sessions":
-                            try:
-                                msg = json.loads(line)
-                                if msg.get("role", "").lower() != role.lower():
-                                    continue
-                            except json.JSONDecodeError:
-                                if role.lower() != "user":
-                                    continue
-
-                        # Speaker filter (transcripts only)
-                        if speaker and d_name == "transcripts":
-                            turn = turn_by_line.get(line_no - 1) if turn_by_line else None
-                            if (
-                                not turn
-                                or turn.get("speaker", "").lower() != speaker.lower()
-                            ):
-                                continue
-
-                        if len(file_matches) >= max_matches_per_file:
-                            break
-
-                        ctx_before = lines[max(0, line_no - 1 - context_lines) : line_no - 1]
-                        ctx_after = lines[line_no : line_no + context_lines]
-                        display = _msg_snippet(line)
-
-                        file_matches.append(
-                            {
-                                "file_id": f.name,
-                                "source": d_name,
-                                "date": fd.isoformat() if fd else "?",
-                                "line": line_no,
-                                "match": display,
-                                "context_before": [line[:300] for line in ctx_before],
-                                "context_after": [line[:300] for line in ctx_after],
-                            }
-                        )
-                finally:
-                    # Always cancel the pending alarm AND restore the previous
-                    # SIGALRM handler so nothing leaks into the rest of the
-                    # process — including on the _RegexTimeout exception path
-                    # (raised inside the loop above) that this finally guards.
-                    if _alarm_installed:
-                        signal.alarm(0)
-                        signal.signal(signal.SIGALRM, _prev_alarm_handler)
-            except _RegexTimeout:
-                return text_blocks(
-                    f"Search timed out after {_SLOW_SCAN_TIMEOUT}s — "
-                    "the regex pattern may be too expensive."
-                )
-            all_matches.extend(file_matches)
+        try:
+            fst_results = _search_via_fst(d_cfg, query, max_results * 5, any_word)
+            if fst_results is not None:
+                for r in fst_results:
+                    r["_domain"] = d_name
+                all_matches.extend(_fst_results_to_matches(
+                    fst_results, d_name, query, max_results, date_from, date_to,
+                    context_lines, max_matches_per_file, regex, case_sensitive,
+                    role, speaker, cwd,
+                ))
+            else:
+                all_matches.extend(_slow_scan_domain(
+                    d_name, d_cfg, query, max_results, date_from, date_to,
+                    context_lines, max_matches_per_file, regex, case_sensitive,
+                    role, speaker, cwd,
+                ))
+        except _RegexTimeout:
+            return text_blocks(
+                f"Search timed out after {_SLOW_SCAN_TIMEOUT}s — "
+                "the regex pattern may be too expensive."
+            )
+        except ValueError as e:
+            return text_blocks(str(e))
 
     if not all_matches:
         return text_blocks(f"No matching entries found for '{query}' in {domain}.")
@@ -1140,7 +1020,7 @@ def _search_via_fst(cfg: DomainConfig, query: str, max_results: int,
     return search_fst(cfg, query, max_results, any_word=any_word)
 
 
-def _format_search_results(
+def _fst_results_to_matches(
     fst_results: list[dict],
     domain: str,
     query: str,
@@ -1154,8 +1034,14 @@ def _format_search_results(
     role: str | None,
     speaker: str | None,
     cwd: str | None = None,
-) -> str:
-    """Format FST search results with domain-specific post-filtering."""
+) -> list[dict]:
+    """Convert FST hit dicts into match dicts, applying per-file caps early.
+
+    Returns a list of match dicts (not a rendered string) so the caller can
+    merge results from multiple domains and render once. Per-file caps are
+    applied HERE, inside the loop, so we stop formatting a file once its cap is
+    reached instead of formatting every hit and discarding most afterward.
+    """
     cfg = _get_config()
     d_from = date.fromisoformat(date_from) if date_from else None
     d_to = date.fromisoformat(date_to) if date_to else None
@@ -1169,14 +1055,28 @@ def _format_search_results(
                 else re.compile(re.escape(query), flags)
             )
         except re.error as e:
-            return f"Invalid regex: {e}"
+            raise ValueError(f"Invalid regex: {e}") from e
     else:
         post_pat = None
 
     all_matches: list[dict] = []
 
-    # Group results by domain for file list resolution
+    # Cache resolved file paths, file contents, and cwd (meta.json) lookups per
+    # call. Without this, every FST hit would re-read + re-parse the manifest,
+    # re-read the full session file, and re-read meta.json for cwd filtering —
+    # measured ~24s for a broad sessions query.
+    _file_cache: dict[str, Optional[list[str]]] = {}
+    _cwd_cache: dict[str, bool] = {}
+
+    per_file: dict[str, int] = {}
+    # Generous overall bound: beyond max_results*max_matches_per_file the results
+    # would be discarded by the caller's sort/cap anyway, so stop early.
+    max_collect = max(max_results * 5, max_matches_per_file)
+
     for r in fst_results:
+        if len(all_matches) >= max_collect:
+            break
+
         r_domain = r.get("_domain", domain)
         d_cfg = cfg.domains.get(r_domain)
         if d_cfg is None:
@@ -1187,9 +1087,11 @@ def _format_search_results(
         if file_idx is None or entry_idx is None:
             continue
 
-        # Map file_idx to filename
+        # Map file_idx to filename. Prefer the name already resolved during the
+        # FST search (fast, uses the in-memory manifest); fall back to a per-call
+        # cached resolve_file_idx for results that predate that field.
         idx_dir = d_cfg.effective_index_dir
-        fname = resolve_file_idx(idx_dir, file_idx)
+        fname = r.get("file_name") or resolve_file_idx(idx_dir, file_idx)
         if not fname:
             continue
 
@@ -1215,14 +1117,24 @@ def _format_search_results(
             if not sess_id:  # old basename-only index; needs rebuild
                 continue
             sess_dir = d_cfg.dir / sess_id
-            if cwd and not _session_matches_cwd(sess_dir, cwd):
-                continue
+            if cwd:
+                ck = str(sess_dir)
+                if ck not in _cwd_cache:
+                    _cwd_cache[ck] = _session_matches_cwd(sess_dir, cwd)
+                if not _cwd_cache[ck]:
+                    continue
             file_path = d_cfg.dir / fname
         else:
             sess_id = None
             file_path = d_cfg.dir / fname
 
         if not file_path.exists():
+            continue
+
+        # Per-file cap — checked BEFORE doing the (potentially expensive) content
+        # read / parse for this hit, so a dense file is only formatted up to its cap.
+        fkey = sess_id if r_domain == "sessions" else fname
+        if per_file.get(fkey, 0) >= max_matches_per_file:
             continue
 
         # --- Resolve entry_idx to actual content ---
@@ -1251,10 +1163,16 @@ def _format_search_results(
             ctx_after = turn_lines[1:1 + context_lines] if len(turn_lines) > 1 else []
         else:
             lineno = entry_idx + 1  # Convert to 1-based line number
+            # Read each file's contents at most once per call and reuse across
+            # hits in that file. Broad queries hit the same file many times.
             try:
-                lines = file_path.read_text(
-                    encoding="utf-8", errors="replace"
-                ).splitlines()
+                lines = _file_cache.get(str(file_path))
+                if lines is None:
+                    raw = file_path.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                    lines = raw.splitlines() if raw else []
+                    _file_cache[str(file_path)] = lines
             except OSError:
                 continue
 
@@ -1280,6 +1198,7 @@ def _format_search_results(
             ctx_after = lines[lineno : lineno + context_lines]
             display = _msg_snippet(matched_line)
 
+        per_file[fkey] = per_file.get(fkey, 0) + 1
         all_matches.append(
             {
                 "file_id": sess_id if r_domain == "sessions" else fname,
@@ -1292,27 +1211,163 @@ def _format_search_results(
             }
         )
 
-    if not all_matches:
-        return f"No matching entries found for '{query}' in {domain}."
+    return all_matches
 
-    # Per-file cap
-    per_file: dict[str, int] = {}
-    capped: list[dict] = []
-    for m in all_matches:
-        key = m["file_id"]
-        n = per_file.get(key, 0)
-        if n >= max_matches_per_file:
+
+def _slow_scan_domain(
+    d_name: str,
+    d_cfg: DomainConfig,
+    query: str,
+    max_results: int,
+    date_from: str | None,
+    date_to: str | None,
+    context_lines: int,
+    max_matches_per_file: int,
+    regex: bool,
+    case_sensitive: bool,
+    role: str | None,
+    speaker: str | None,
+    cwd: str | None,
+) -> list[dict]:
+    """Line-by-line regex scan for a single domain that lacks an FST index.
+
+    Returns match dicts in the same shape as ``_fst_results_to_matches`` so the
+    caller can merge results from FST-backed and non-indexed domains uniformly.
+    """
+    flags = 0 if case_sensitive else re.IGNORECASE
+    if regex:
+        # Reject patterns with known catastrophic backtracking constructs (shared
+        # ReDoS guard — see _regex_danger). Conservative by design: some safe
+        # regexes may be rejected, but the cost of a ReDoS hang is higher.
+        danger = _regex_danger(query)
+        if danger is not None:
+            raise ValueError(f"Potentially unsafe regex — {danger} detected.")
+        try:
+            pattern = re.compile(query, flags)
+        except re.error as e:
+            raise ValueError(f"Invalid regex: {e}") from e
+    else:
+        pattern = re.compile(re.escape(query), flags)
+
+    d_from = date.fromisoformat(date_from) if date_from else None
+    d_to = date.fromisoformat(date_to) if date_to else None
+
+    files = _iter_domain_files(d_cfg)
+    handler = _get_domain_handler(d_name)
+    date_fn = handler.date_extract
+    search_fn = handler.search_lines
+
+    all_matches: list[dict] = []
+
+    for f in files:
+        if not f.exists():
             continue
-        per_file[key] = n + 1
-        capped.append(m)
+        if cwd and d_name == "sessions" and not _session_matches_cwd(f, cwd):
+            continue
+        fd = date_fn(f)
+        if d_from and fd and fd < d_from:
+            continue
+        if d_to and fd and fd > d_to:
+            continue
 
-    capped.sort(key=lambda m: (m["date"], m["line"]))
-    capped.sort(key=lambda m: m["date"], reverse=True)
-    capped = capped[:max_results]
+        lines = search_fn(f)
+        if not lines:
+            continue
 
-    return _render_matches(
-        capped, domain, query, date_from, date_to, regex, role, speaker
-    )
+        file_matches: list[dict] = []
+        try:
+            # Install a temporary SIGALRM handler for the slow-path regex
+            # scan so a pathological pattern cannot hang the server.  Save
+            # the previous handler and restore it in the finally block
+            # below — otherwise the _RegexTimeout-raising handler leaks into
+            # the whole process and any later signal.alarm() from a library
+            # would raise _RegexTimeout in an unguarded context.
+            _has_sigalrm = hasattr(signal, "SIGALRM")
+            _prev_alarm_handler = None
+            _alarm_installed = False
+            if _has_sigalrm:
+                try:
+                    _prev_alarm_handler = signal.getsignal(signal.SIGALRM)
+                    signal.signal(signal.SIGALRM, _regex_alarm_handler)
+                    _alarm_installed = True
+                    signal.alarm(_SLOW_SCAN_TIMEOUT)
+                except ValueError:
+                    # signal.signal() only works from the main thread.
+                    # Under mcp 1.23 (stdio) handlers run on the main
+                    # event-loop thread, so this path is never taken;
+                    # under mcp ≥2 handlers run in a thread pool and
+                    # this fallback avoids crashing the search there.
+                    # See jing_meta/mcp_base.py for the concurrency model.
+                    _alarm_installed = False
+            # Speaker filter (transcripts only): build the line->turn map
+            # ONCE per file, before the per-line loop, then look it up by
+            # line number inside the loop. Hoisting avoids re-parsing the
+            # transcript (an lru_cache'd parse) for every matching line.
+            turn_by_line = None
+            if speaker and d_name == "transcripts":
+                parsed = parse_transcript_file(f)
+                if parsed:
+                    turn_by_line = {}
+                    for t in parsed["turns"]:
+                        for ln in range(
+                            t.get("line_start", 0), t.get("line_end", 0) + 1
+                        ):
+                            turn_by_line[ln] = t
+            try:
+                for line_no, line in enumerate(lines, 1):
+                    if not pattern.search(line):
+                        continue
+
+                    # Role filter (sessions only)
+                    if role and d_name == "sessions":
+                        try:
+                            msg = json.loads(line)
+                            if msg.get("role", "").lower() != role.lower():
+                                continue
+                        except json.JSONDecodeError:
+                            if role.lower() != "user":
+                                continue
+
+                    # Speaker filter (transcripts only)
+                    if speaker and d_name == "transcripts":
+                        turn = turn_by_line.get(line_no - 1) if turn_by_line else None
+                        if (
+                            not turn
+                            or turn.get("speaker", "").lower() != speaker.lower()
+                        ):
+                            continue
+
+                    if len(file_matches) >= max_matches_per_file:
+                        break
+
+                    ctx_before = lines[max(0, line_no - 1 - context_lines) : line_no - 1]
+                    ctx_after = lines[line_no : line_no + context_lines]
+                    display = _msg_snippet(line)
+
+                    file_matches.append(
+                        {
+                            "file_id": f.name,
+                            "source": d_name,
+                            "date": fd.isoformat() if fd else "?",
+                            "line": line_no,
+                            "match": display,
+                            "context_before": [line[:300] for line in ctx_before],
+                            "context_after": [line[:300] for line in ctx_after],
+                        }
+                    )
+            finally:
+                # Always cancel the pending alarm AND restore the previous
+                # SIGALRM handler so nothing leaks into the rest of the
+                # process — including on the _RegexTimeout exception path
+                # (raised inside the loop above) that this finally guards.
+                if _alarm_installed:
+                    signal.alarm(0)
+                    signal.signal(signal.SIGALRM, _prev_alarm_handler)
+        except _RegexTimeout:
+            raise
+        all_matches.extend(file_matches)
+
+    return all_matches
 
 
 def _render_matches(
@@ -1354,7 +1409,7 @@ def _render_matches(
             if d_cfg and m_domain == "sessions":
                 file_path = d_cfg.dir / m["file_id"]
                 summary_data = _load_session_summary(file_path)
-                meta = _load_json(file_path / "meta.json") or {}
+                meta = _load_json_memo(file_path / "meta.json") or {}
                 title = (meta.get("title") or m["file_id"])[:80]
             elif d_cfg and m_domain == "transcripts":
                 file_path = d_cfg.dir / m["file_id"]
