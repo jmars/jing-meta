@@ -4,6 +4,7 @@ The indexer/dreamer/memory all use this so the ONNX model is loaded once and
 memory stays bounded (call `free()` to release before loading a local LLM).
 """
 
+import os
 import threading
 
 import numpy as np
@@ -17,12 +18,29 @@ _embedder = None
 _lock = threading.Lock()
 
 
+def _default_fastembed_cache():
+    """Persistent fastembed cache dir.
+
+    fastembed's default cache is ``tempfile.gettempdir()/fastembed_cache``
+    (``/tmp``), which is wiped on reboot and then empty, so fastembed tries to
+    download the ONNX model and hangs offline. Use a stable home-backed dir
+    instead. Respect an explicit FASTEMBED_CACHE_PATH override.
+    """
+    return config.JING_HOME / "cache" / "fastembed"
+
+
 def _get_embedder():
     """Lazily init and return the ONNX embedder singleton (downloads on first use)."""
     global _embedder
     with _lock:
         if _embedder is None:
             from fastembed import TextEmbedding
+
+            # fastembed's default cache is tempfile.gettempdir()/fastembed_cache
+            # = /tmp, which is wiped on reboot. After a reboot that dir is empty
+            # so fastembed tries to download the ONNX model and hangs offline.
+            # Default to a persistent cache dir (override with FASTEMBED_CACHE_PATH).
+            os.environ.setdefault("FASTEMBED_CACHE_PATH", str(_default_fastembed_cache()))
 
             _logger.info(
                 "Loading embedding model '%s' — first use may download ~100MB-1GB "
