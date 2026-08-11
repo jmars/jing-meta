@@ -45,14 +45,14 @@ def main(argv=None) -> int:
     b = sub.add_parser("build", help="build an index")
     b.add_argument("--dir", required=True)
     b.add_argument("--pattern", required=True)
-    b.add_argument("--extractor", choices=["jsonl", "txt", "transcript"], required=True)
+    b.add_argument("--extractor", choices=["jsonl"], required=True)
     b.add_argument("--output", required=True)
     b.set_defaults(fn=_build)
 
     u = sub.add_parser("update", help="incrementally update an index")
     u.add_argument("--dir", required=True)
     u.add_argument("--pattern", required=True)
-    u.add_argument("--extractor", choices=["jsonl", "txt", "transcript"], required=True)
+    u.add_argument("--extractor", choices=["jsonl"], required=True)
     u.add_argument("--index", required=True)
     u.set_defaults(fn=_update)
 

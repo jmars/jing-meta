@@ -6,6 +6,7 @@ Requires the C DAFSA core (libdafsa.so) and pytest. Run from the repo root:
 
 from pathlib import Path
 
+import json
 import pytest
 
 # Skip cleanly when the C shared library is not built (e.g. CI without a toolchain).
@@ -20,13 +21,13 @@ except (RuntimeError, AttributeError, OSError) as e:
 def data_dir(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
-    (data / "a.txt").write_text("alpha banana", encoding="utf-8")
+    (data / "a.jsonl").write_text("alpha banana", encoding="utf-8")
     return data
 
 
 def _build(data: Path, out: Path) -> None:
     from indexer import build
-    build(data, "*.txt", "txt", out)
+    build(data, "*.jsonl", "jsonl", out)
 
 
 def test_search_fst_cache_hit_and_miss(tmp_path, data_dir):
@@ -46,7 +47,7 @@ def test_search_fst_cache_hit_and_miss(tmp_path, data_dir):
     with _index_cache_lock:
         _index_cache.clear()
 
-    cfg = DomainConfig(name="test", dir=str(data_dir), fst_index_dir=str(out), extractor="txt")
+    cfg = DomainConfig(name="test", dir=str(data_dir), fst_index_dir=str(out), extractor="jsonl")
 
     r1 = search_fst(cfg, "alpha")
     assert r1, "indexed word should be searchable"
@@ -60,8 +61,8 @@ def test_search_fst_cache_hit_and_miss(tmp_path, data_dir):
         assert len(_index_cache) == 1
 
     # Modify the file and update -> WAL size changes -> cache miss, old evicted.
-    (data_dir / "a.txt").write_text("alpha grape", encoding="utf-8")
-    res = update(data_dir, "*.txt", "txt", out)
+    (data_dir / "a.jsonl").write_text("alpha grape", encoding="utf-8")
+    res = update(data_dir, "*.jsonl", "jsonl", out)
     assert res["updated"] == 1
 
     idx3 = _get_cached_index(out)

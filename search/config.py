@@ -19,7 +19,8 @@ _VALID_TYPES = frozenset({"files", "dirs"})
 # for domains that don't use a DAFSA index (e.g. the notifications domain, read
 # via server-side bespoke functions).  Domains with extractors not in
 # indexer.EXTRACTORS are gracefully skipped by rebuild/update with a log warning.
-_VALID_EXTRACTORS = frozenset({"jsonl", "txt", "transcript", "notification"})
+# The C indexer daemon only supports JSONL, so that is the only DAFSA extractor.
+_VALID_EXTRACTORS = frozenset({"jsonl", "notification"})
 # renderer uses the same set (effective_renderer falls back to extractor)
 
 
@@ -61,13 +62,13 @@ class DomainConfig:
         if self.extractor not in _VALID_EXTRACTORS:
             raise ConfigError(
                 f"domain {self.name!r}: invalid extractor {self.extractor!r}; "
-                f"expected 'jsonl', 'txt', 'transcript', or 'notification'"
+                f"expected 'jsonl' (or 'notification' for non-indexed domains)"
             )
         if self.renderer and self.renderer not in _VALID_EXTRACTORS:
             raise ConfigError(
                 f"domain {self.name!r}: invalid renderer {self.renderer!r}; "
-                f"expected 'jsonl', 'txt', 'transcript', 'notification', "
-                f"or '' (empty for extractor default)"
+                f"expected 'jsonl', or 'notification' "
+                f"(or '' for empty to use extractor default)"
             )
         if not self.pattern.strip():
             raise ConfigError(

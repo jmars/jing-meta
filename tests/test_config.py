@@ -14,9 +14,9 @@ def test_valid_defaults_pass():
 
 
 def test_valid_explicit():
-    dc = DomainConfig(name="d", dir=".", type="dirs", extractor="txt")
+    dc = DomainConfig(name="d", dir=".", type="dirs", extractor="jsonl")
     assert dc.type == "dirs"
-    assert dc.extractor == "txt"
+    assert dc.extractor == "jsonl"
 
 
 def test_invalid_type_raises():
@@ -36,14 +36,14 @@ def test_invalid_extractor_raises():
 
 
 def test_empty_renderer_valid_effective_equals_extractor():
-    dc = DomainConfig(name="d", dir=".", extractor="txt")
+    dc = DomainConfig(name="d", dir=".", extractor="jsonl")
     assert dc.renderer == ""
-    assert dc.effective_renderer == "txt"
+    assert dc.effective_renderer == "jsonl"
 
 
 def test_nonempty_renderer_txt_valid():
-    dc = DomainConfig(name="d", dir=".", extractor="jsonl", renderer="txt")
-    assert dc.effective_renderer == "txt"
+    dc = DomainConfig(name="d", dir=".", extractor="jsonl", renderer="notification")
+    assert dc.effective_renderer == "notification"
 
 
 def test_invalid_renderer_raises():
@@ -78,10 +78,10 @@ def test_whitespace_fst_pattern_raises():
 
 
 def test_effective_renderer_fallback():
-    dc = DomainConfig(name="d", dir=".", extractor="txt")
-    assert dc.effective_renderer == "txt"
-    dc2 = DomainConfig(name="d", dir=".", extractor="jsonl", renderer="transcript")
-    assert dc2.effective_renderer == "transcript"
+    dc = DomainConfig(name="d", dir=".", extractor="jsonl")
+    assert dc.effective_renderer == "jsonl"
+    dc2 = DomainConfig(name="d", dir=".", extractor="jsonl", renderer="notification")
+    assert dc2.effective_renderer == "notification"
 
 
 # --- load_config TOML-based ---
@@ -104,14 +104,14 @@ def test_valid_toml_loads_two_domains(tmp_path):
         "[domains.b]\n"
         "dir = '/tmp/y'\n"
         "type = 'dirs'\n"
-        "extractor = 'txt'\n"
+        "extractor = 'jsonl'\n"
     )
     cfg = load_config(p)
     assert set(cfg.domains) == {"a", "b"}
     assert cfg.domains["a"].type == "files"
     assert cfg.domains["a"].extractor == "jsonl"
     assert cfg.domains["b"].type == "dirs"
-    assert cfg.domains["b"].extractor == "txt"
+    assert cfg.domains["b"].extractor == "jsonl"
 
 
 def test_invalid_type_in_toml_raises(tmp_path):

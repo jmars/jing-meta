@@ -29,9 +29,9 @@ from indexer import (
 )
 
 
-def _write_txt(directory: Path, name: str, content: str) -> Path:
+def _write_jsonl(directory: Path, name: str, content: str) -> Path:
     p = directory / name
-    p.write_text(content, encoding="utf-8")
+    p.write_text(json.dumps({"content": content}) + "\n", encoding="utf-8")
     return p
 
 
@@ -56,13 +56,13 @@ def _no_tmp_leftovers(index_dir: Path) -> bool:
 def corpus(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
-    _write_txt(data, "a.txt", "alpha apple banana")
-    _write_txt(data, "b.txt", "bravo banana cherry")
+    _write_jsonl(data, "a.jsonl", "alpha apple banana")
+    _write_jsonl(data, "b.jsonl", "bravo banana cherry")
     return data
 
 
 def _build_index(corpus, output) -> None:
-    build(corpus, "*.txt", "txt", output)
+    build(corpus, "*.jsonl", "jsonl", output)
 
 
 # --- 1. update on fresh (no index) == build ---------------------------------
@@ -71,7 +71,7 @@ def test_update_first_run_equals_build(tmp_path, corpus):
     out_b = tmp_path / "out_update"
 
     _build_index(corpus, out_a)
-    result = update(corpus, "*.txt", "txt", out_b)
+    result = update(corpus, "*.jsonl", "jsonl", out_b)
 
     assert result["first_run"] is True
     assert result["added"] == 0
@@ -95,7 +95,7 @@ def test_update_no_changes(tmp_path, corpus):
         for p in (out / "slots").glob("*.keys")
     }
 
-    result = update(corpus, "*.txt", "txt", out)
+    result = update(corpus, "*.jsonl", "jsonl", out)
 
     assert result["unchanged"] == 2
     assert result["updated"] == 0
@@ -116,9 +116,9 @@ def test_update_modify(tmp_path, corpus):
     _build_index(corpus, out)
 
     # a.txt changes: apple removed, dandelion added
-    _write_txt(corpus, "a.txt", "alpha banana dandelion")
+    _write_jsonl(corpus, "a.jsonl", "alpha banana dandelion")
 
-    result = update(corpus, "*.txt", "txt", out)
+    result = update(corpus, "*.jsonl", "jsonl", out)
 
     assert result["updated"] == 1
     assert result["unchanged"] == 1
@@ -128,7 +128,7 @@ def test_update_modify(tmp_path, corpus):
 
     hits = _search(out, "dandelion")
     assert hits, "new word 'dandelion' should be present"
-    assert all(f == "a.txt" for _, _, f in hits)
+    assert all(f == "a.jsonl" for _, _, f in hits)
 
     # other file unaffected
     assert _search(out, "cherry"), "b.txt still has cherry"
@@ -140,9 +140,9 @@ def test_update_delete(tmp_path, corpus):
     out = tmp_path / "out"
     _build_index(corpus, out)
 
-    (corpus / "a.txt").unlink()
+    (corpus / "a.jsonl").unlink()
 
-    result = update(corpus, "*.txt", "txt", out)
+    result = update(corpus, "*.jsonl", "jsonl", out)
 
     assert result["removed"] == 1
     assert result["unchanged"] == 1
@@ -166,19 +166,19 @@ def test_update_add(tmp_path, corpus):
     out = tmp_path / "out"
     _build_index(corpus, out)
 
-    _write_txt(corpus, "c.txt", "cherimoya cranberry")
+    _write_jsonl(corpus, "c.jsonl", "cherimoya cranberry")
 
-    result = update(corpus, "*.txt", "txt", out)
+    result = update(corpus, "*.jsonl", "jsonl", out)
 
     assert result["added"] == 1
     assert result["unchanged"] == 2
 
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     assert len(manifest["files"]) == 3
-    assert manifest["files"][2]["filename"] == "c.txt"
+    assert manifest["files"][2]["filename"] == "c.jsonl"
     assert manifest["files"][2]["tombstoned"] is False
     # old slots unchanged
-    assert manifest["files"][0]["filename"] == "a.txt"
+    assert manifest["files"][0]["filename"] == "a.jsonl"
 
     assert _search(out, "cherimoya")
     assert _search(out, "banana"), "old content still searchable"
@@ -191,18 +191,18 @@ def test_tombstone_stability(tmp_path, corpus):
     _build_index(corpus, out)
 
     # delete a.txt (slot 0) then re-add same-named a.txt
-    (corpus / "a.txt").unlink()
-    update(corpus, "*.txt", "txt", out)
+    (corpus / "a.jsonl").unlink()
+    update(corpus, "*.jsonl", "jsonl", out)
 
-    _write_txt(corpus, "a.txt", "alpha again")
-    update(corpus, "*.txt", "txt", out)
+    _write_jsonl(corpus, "a.jsonl", "alpha again")
+    update(corpus, "*.jsonl", "jsonl", out)
 
     # re-added file goes to a NEW slot; old slot stays tombstoned
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["files"][0]["tombstoned"] is True
     new_slot = next(
         i for i, fe in enumerate(manifest["files"])
-        if fe["filename"] == "a.txt" and not fe["tombstoned"]
+        if fe["filename"] == "a.jsonl" and not fe["tombstoned"]
     )
     assert new_slot == 2, "re-added a.txt must land on a fresh slot (no renumber)"
     assert not (out / "slots" / "0.keys").exists()
@@ -305,7 +305,7 @@ def test_no_tmp_after_build(tmp_path, corpus):
     _build_index(corpus, out)
     assert _no_tmp_leftovers(out)
 
-    update(corpus, "*.txt", "txt", out)
+    update(corpus, "*.jsonl", "jsonl", out)
     assert _no_tmp_leftovers(out)
 
 
@@ -314,16 +314,16 @@ def test_nested_dir_idempotent_update(tmp_path):
     """build stores relative paths; idempotent update must not duplicate slots."""
     data = tmp_path / "data"
     (data / "sub").mkdir(parents=True)
-    (data / "sub" / "nested.txt").write_text("alpha beta", encoding="utf-8")
-    (data / "top.txt").write_text("gamma delta", encoding="utf-8")
+    (data / "sub" / "nested.jsonl").write_text("alpha beta", encoding="utf-8")
+    (data / "top.jsonl").write_text("gamma delta", encoding="utf-8")
     out = tmp_path / "out"
 
-    build(data, "*.txt", "txt", out)
+    build(data, "*.jsonl", "jsonl", out)
     man = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
-    assert sorted(f["filename"] for f in man["files"]) == ["sub/nested.txt", "top.txt"]
+    assert sorted(f["filename"] for f in man["files"]) == ["sub/nested.jsonl", "top.jsonl"]
     assert _search(out, "alpha")
 
-    res = update(data, "*.txt", "txt", out)
+    res = update(data, "*.jsonl", "jsonl", out)
     assert res["unchanged"] == 2
     assert res["added"] == 0 and res["updated"] == 0 and res["removed"] == 0, res
     man2 = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
@@ -362,13 +362,13 @@ def test_resolve_file_idx_tombstone(tmp_path):
     (out).mkdir(parents=True)
     (out / "manifest.json").write_text(json.dumps({
         "files": [
-            {"filename": "a.txt", "title": "a", "date": "?", "source": "txt"},
+            {"filename": "a.jsonl", "title": "a", "date": "?", "source": "jsonl"},
             {"filename": "", "title": "", "date": "", "source": "",
              "tombstoned": True},
         ]
     }), encoding="utf-8")
 
-    assert resolve_file_idx(out, 0) == "a.txt"
+    assert resolve_file_idx(out, 0) == "a.jsonl"
     assert resolve_file_idx(out, 1) is None  # tombstoned
     assert resolve_file_idx(out, 5) is None  # out of range
 
@@ -416,7 +416,7 @@ def test_search_and_or(tmp_path, corpus):
         # OR: "alpha cherry" — a.txt has alpha, b.txt has cherry → both files
         or_hits = idx.search("alpha cherry", any_word=True)
         or_files = {idx.file_name(h.file_idx) for h in or_hits}
-        assert or_files == {"a.txt", "b.txt"}, f"OR should match both files, got {or_files}"
+        assert or_files == {"a.jsonl", "b.jsonl"}, f"OR should match both files, got {or_files}"
 
         # AND: "alpha cherry" — no single file has both → empty
         and_hits = idx.search("alpha cherry", any_word=False)
@@ -425,12 +425,12 @@ def test_search_and_or(tmp_path, corpus):
         # AND: "alpha banana" — only a.txt has both
         and_hits2 = idx.search("alpha banana", any_word=False)
         and_files2 = {idx.file_name(h.file_idx) for h in and_hits2}
-        assert and_files2 == {"a.txt"}, f"AND should match only a.txt, got {and_files2}"
+        assert and_files2 == {"a.jsonl"}, f"AND should match only a.txt, got {and_files2}"
 
         # single-word search matches both files (defaults to AND, no difference for 1 word)
         default_hits = idx.search("banana")
         default_files = {idx.file_name(h.file_idx) for h in default_hits}
-        assert default_files == {"a.txt", "b.txt"}, f"single-word search should match both, got {default_files}"
+        assert default_files == {"a.jsonl", "b.jsonl"}, f"single-word search should match both, got {default_files}"
 
 
 # --- pair-level diff: unchanged keys in a changed file are not re-added ----
@@ -445,16 +445,16 @@ def test_update_pair_level_diff_leaves_unchanged_keys(tmp_path):
 
     data = tmp_path / "data"
     data.mkdir()
-    _write_txt(data, "a.txt", "alpha banana cherry")
-    _write_txt(data, "b.txt", "delta")
+    _write_jsonl(data, "a.jsonl", "alpha banana cherry")
+    _write_jsonl(data, "b.jsonl", "delta")
 
     out = tmp_path / "out"
-    build(data, "*.txt", "txt", out)
+    build(data, "*.jsonl", "jsonl", out)
 
     # a.txt: only 'banana' -> 'grape' changed; 'alpha' and 'cherry' unchanged.
-    _write_txt(data, "a.txt", "alpha grape cherry")
+    _write_jsonl(data, "a.jsonl", "alpha grape cherry")
 
-    result = update(data, "*.txt", "txt", out)
+    result = update(data, "*.jsonl", "jsonl", out)
     assert result["updated"] == 1
 
     # The DAFSA should still contain the unchanged keys (search correctness).
@@ -469,7 +469,7 @@ def test_update_pair_level_diff_leaves_unchanged_keys(tmp_path):
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     slot = next(
         i for i, fe in enumerate(manifest["files"])
-        if fe.get("filename") == "a.txt"
+        if fe.get("filename") == "a.jsonl"
     )
     pairs = set(_read_sidecar(out / "slots", slot))
     assert ("alpha", b"alpha") not in pairs  # (entry_idx, word) — entry0
@@ -501,9 +501,9 @@ def test_update_corrupt_sidecar_changed_file(tmp_path, corpus):
     sp.write_bytes(bytes(data))
 
     # Modify a.txt (new word 'dandelion').
-    _write_txt(corpus, "a.txt", "alpha banana dandelion")
+    _write_jsonl(corpus, "a.jsonl", "alpha banana dandelion")
 
-    result = update(corpus, "*.txt", "txt", out)
+    result = update(corpus, "*.jsonl", "jsonl", out)
     assert result["updated"] == 1
     assert result["unchanged"] == 1
 
@@ -526,9 +526,9 @@ def test_update_corrupt_sidecar_tombstone(tmp_path, corpus):
 
     # Delete a.txt — we can't know its old keys, but the manifest must still be
     # tombstoned so the file is hidden from results.
-    (corpus / "a.txt").unlink()
+    (corpus / "a.jsonl").unlink()
 
-    result = update(corpus, "*.txt", "txt", out)
+    result = update(corpus, "*.jsonl", "jsonl", out)
     assert result["removed"] == 1
     assert result["unchanged"] == 1
 
