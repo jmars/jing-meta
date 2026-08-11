@@ -42,6 +42,10 @@ def _run_archiver() -> dict:
         days=int(os.environ.get("MEMORY_ARCHIVE_DAYS", "90")),
         apply=not os.environ.get("MEMORY_ARCHIVE_DRY_RUN"),
         rebuild_index=True,
+        # A post_agent hook must keep stdout empty (or valid JSON) — the
+        # archive() progress messages would otherwise be rejected by Vibe as an
+        # "invalid response". Route them to the stderr logger instead.
+        quiet=True,
     )
 
 

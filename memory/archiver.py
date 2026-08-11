@@ -96,6 +96,20 @@ def _write_archive(archive_path: Path, obs: list[dict]) -> None:
     _atomic_write(archive_path, payload)
 
 
+def _report(msg: str, quiet: bool = False) -> None:
+    """Emit a progress message.
+
+    ``archive()`` is shared by the CLI (which wants stdout for human display)
+    and the Vibe post_agent hook (which must keep stdout empty/JSON so the hook
+    protocol doesn't reject it as an "invalid response"). When ``quiet`` is set
+    we route to the stderr logger instead of stdout.
+    """
+    if quiet:
+        logger.info("%s", msg)
+    else:
+        print(msg)
+
+
 def _delete_observations(conn: sqlite3.Connection, obs: list[dict]) -> int:
     """Delete the given observations by primary key (id).
 
@@ -140,6 +154,7 @@ def archive(
     days: int = 90,
     apply: bool = False,
     rebuild_index: bool = True,
+    quiet: bool = False,
 ) -> dict:
     """Archive observations older than `days` from the memory graph.
 
@@ -176,17 +191,17 @@ def archive(
     total_obs = count_conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
     count_conn.close()
 
-    print(f"Observations older than {days}d (before {cutoff}): {len(old)} of {total_obs}")
+    _report(f"Observations older than {days}d (before {cutoff}): {len(old)} of {total_obs}", quiet)
     if not old:
-        print("Nothing to archive.")
+        _report("Nothing to archive.", quiet)
         return {"archived": 0, "total_before": total_obs, "archive_path": "", "backup_path": "", "deleted": 0, "index_rebuilt": False}
 
     if not apply:
-        print("Dry run — no changes. Use --apply to archive.")
+        _report("Dry run — no changes. Use --apply to archive.", quiet)
         for o in old[:10]:
-            print(f"  [{o['entity']}] {o['content'][:80]}")
+            _report(f"  [{o['entity']}] {o['content'][:80]}", quiet)
         if len(old) > 10:
-            print(f"  ... and {len(old)-10} more")
+            _report(f"  ... and {len(old)-10} more", quiet)
         return {"archived": len(old), "total_before": total_obs, "archive_path": "", "backup_path": "", "deleted": 0, "index_rebuilt": False}
 
     # ---- Apply path ----
@@ -194,11 +209,11 @@ def archive(
 
     # 1. Write archive first (must succeed before any deletion)
     _write_archive(archive_path, old)
-    print(f"Archived {len(old)} observations to {archive_path}")
+    _report(f"Archived {len(old)} observations to {archive_path}", quiet)
 
     # 2. Backup the DB before deleting
     backup = _backup_db(memory_db)
-    print(f"Backup: {backup}")
+    _report(f"Backup: {backup}", quiet)
 
     # 3. Delete from graph (single transaction — all-or-nothing)
     conn = sqlite3.connect(str(memory_db))
@@ -217,7 +232,7 @@ def archive(
         raise
     finally:
         conn.close()
-    print(f"Removed {deleted} observations from the live graph.")
+    _report(f"Removed {deleted} observations from the live graph.", quiet)
 
     # 4. Rebuild search index (best effort)
     index_rebuilt = False
