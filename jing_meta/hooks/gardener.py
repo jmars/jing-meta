@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 import sys
 
 from jing_meta.hooks import common
@@ -190,17 +191,44 @@ def main() -> int:
     common.save_state(state_name, {**state, "last_run": now,
                                    "entities": counts[0], "obs": counts[1]})
 
-    code, out = _run_dreamer()
-    if code != 0:
-        logger.warning("dreamer exited with code %d", code)
+    # The maintenance work (Soufflé run + LLM validation + semantic-index
+    # rebuild) is slow (~167s) and LLM-heavy. Run it in a DETACHED background
+    # process so the hook returns immediately and never blocks the agent's
+    # turn. The throttle/growth state is already saved above, so the work is
+    # still cadence-gated (exactly one maintenance pass per interval).
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "jing_meta.hooks.gardener", "--run-maintenance-bg"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except Exception as exc:  # pragma: no cover — spawn failure must never break the turn
+        logger.warning("failed to spawn background gardener: %s", exc)
+    return 0
 
-    first_lines = "\n".join(out.splitlines()[:8])
-    logger.info("maintenance run:\n%s", first_lines)
 
-    _record_digest(out)
-    _rebuild_semantic_index()
+def _run_maintenance_bg() -> int:
+    """Background entry point: runs the slow maintenance work detached from the
+    hook. Called by the detached subprocess (``--run-maintenance-bg``). Fail-open
+    end-to-end — never propagates a failure to the (already-returned) hook."""
+    try:
+        setup_logging()
+        code, out = _run_dreamer()
+        if code != 0:
+            logger.warning("dreamer exited with code %d", code)
+        first_lines = "\n".join(out.splitlines()[:8])
+        logger.info("maintenance run:\n%s", first_lines)
+        _record_digest(out)
+        _rebuild_semantic_index()
+    except Exception as exc:  # pragma: no cover — background job must fail open
+        logger.warning("background gardener failed: %s", exc)
     return 0
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--run-maintenance-bg":
+        sys.exit(_run_maintenance_bg())
     sys.exit(main())
