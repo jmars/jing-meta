@@ -11,7 +11,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from jing_meta.hooks import common, context, enforce
+from jing_meta.hooks import common, context, enforce, report
 
 
 def _write_transcript(tmp_path: Path, messages: list[dict]) -> tuple[Path, Path]:
@@ -380,4 +380,104 @@ def test_enforce_passes_when_memory_written(tmp_path):
         _user("fix the bug"), _assistant("bash"), _assistant("memory_add_observations"),
     ])
     out = _run(enforce.main, _payload(msg))
+    assert out.strip() == ""
+
+
+# ---------------------------------------------------------------------------
+# enforce-report
+# ---------------------------------------------------------------------------
+
+
+def _task_spawn(agent: str = "coder") -> dict:
+    return _assistant("task", args=json.dumps({"agent": agent, "task": "implement X"}))
+
+
+def _report_write(entity: str = "handoff-x-result") -> dict:
+    args = json.dumps({
+        "observations": [
+            {"entityName": entity,
+             "contents": [
+                 "stage=report: Task summary: implement X.",
+                 "stage=report: Subagents used: coder (implementer).",
+                 "stage=report: Outcome: done, tests pass.",
+                 "stage=report: Escalations: none.",
+                 "stage=report: Failures: none.",
+             ]}
+        ]
+    })
+    return _assistant("memory_add_observations", args=args)
+
+
+def test_report_denies_task_spawn_without_report(tmp_path):
+    # Top-level turn spawned a subagent but wrote no stage=report: -> deny.
+    msg, _ = _write_transcript(tmp_path, [
+        _user("do it"), _task_spawn("coder"), _assistant("bash"),
+    ])
+    out = _run(report.main, _payload(msg))
+    decision = json.loads(out) if out.strip() else None
+    assert decision is not None and decision["decision"] == "deny"
+    assert "stage=report:" in decision["reason"]
+
+
+def test_report_passes_when_report_written(tmp_path):
+    # Spawned a subagent AND appended a stage=report: observation -> pass.
+    msg, _ = _write_transcript(tmp_path, [
+        _user("do it"), _task_spawn("coder"), _report_write(),
+    ])
+    out = _run(report.main, _payload(msg))
+    assert out.strip() == ""
+
+
+def test_report_passes_no_subagent_spawn(tmp_path):
+    # Did work directly with no task tool -> no handoff, no report required.
+    msg, _ = _write_transcript(tmp_path, [
+        _user("do it"), _assistant("bash"), _assistant("memory_add_observations"),
+    ])
+    out = _run(report.main, _payload(msg))
+    assert out.strip() == ""
+
+
+def test_report_denies_task_with_non_report_memory_write(tmp_path):
+    # Spawned a subagent and wrote SOME memory, but not a stage=report: -> deny.
+    msg, _ = _write_transcript(tmp_path, [
+        _user("do it"), _task_spawn("coder"),
+        _assistant("memory_add_observations",
+                   args=json.dumps({"observations": [
+                       {"entityName": "handoff-x-result",
+                        "contents": ["stage=implement: changed files"]}]})),
+    ])
+    out = _run(report.main, _payload(msg))
+    decision = json.loads(out) if out.strip() else None
+    assert decision is not None and decision["decision"] == "deny"
+
+
+def test_report_passes_report_via_create_entities(tmp_path):
+    # A stage=report: observation may come via memory_create_entities too.
+    args = json.dumps({
+        "entities": [
+            {"name": "handoff-x-report", "entityType": "report",
+             "observations": ["stage=report: Summary", "stage=report: Outcome"]}
+        ]
+    })
+    msg, _ = _write_transcript(tmp_path, [
+        _user("do it"), _task_spawn("advisor"),
+        _assistant("memory_create_entities", args=args),
+    ])
+    out = _run(report.main, _payload(msg))
+    assert out.strip() == ""
+
+
+def test_report_skips_subagent_transcript(tmp_path):
+    # Subagent transcripts are not top-level; the report gate does not apply.
+    agents_dir = tmp_path / "agents" / "coder_20260810_120000_abcd"
+    agents_dir.mkdir(parents=True)
+    msg_path = agents_dir / "messages.jsonl"
+    msg_path.write_text(
+        "\n".join(json.dumps(m, ensure_ascii=False) for m in [
+            _user("implement X"), _assistant("bash"),
+        ]) + "\n",
+        encoding="utf-8")
+    (agents_dir / "meta.json").write_text(
+        json.dumps({"agent_profile": {"name": "coder"}}), encoding="utf-8")
+    out = _run(report.main, _payload(msg_path))
     assert out.strip() == ""
