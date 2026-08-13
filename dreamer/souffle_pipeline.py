@@ -21,13 +21,11 @@ from typing import Any
 from jing_meta import config as _config
 from jing_meta.text import STOPWORDS
 
-from .dreamer import build_validation_prompt
-
 SOUFFLE = os.environ.get("SOUFFLE", _config.SOUFFLE)
 GARDEN_DL = Path(__file__).parent / "souffle" / "garden.dl"
 
 # Cap on candidate relations sent to the LLM for validation (highest shared-token first).
-MAX_LLM_CANDIDATES = int(os.environ.get("SOUFFLE_MAX_CANDIDATES", "40"))
+MAX_LLM_CANDIDATES = int(os.environ.get("SOUFFLE_MAX_CANDIDATES", "80"))
 MIN_SHARED = int(os.environ.get("SOUFFLE_MIN_SHARED", "2"))
 STALE_CUTOFF = os.environ.get("SOUFFLE_STALE_CUTOFF", "2026-05-10T00:00:00Z")
 
@@ -260,8 +258,6 @@ def run_pipeline(
     """
     from pathlib import Path
 
-    from . import llm
-
     # Helpers are called directly (not wrapped via stage functions) to preserve
     # the test-seam monkeypatch paths at the original module level.
 
@@ -327,17 +323,14 @@ def run_pipeline(
             if health:
                 plan["_validator_health"] = dict(health)
         elif validator == "cloud" and validate_relations:
-            prompt = build_validation_prompt(llm_candidates)
-            llm_result, _meta = llm.call(
-                system_prompt="You are a knowledge graph relation validator.",
-                user_prompt=prompt,
-                max_tokens=2000,
-                api_url=api_url, api_key=api_key, model=model,
+            from .dreamer import validate_cloud
+
+            plan["mutations"]["add_relations"] = validate_cloud(
+                llm_candidates,
+                api_url=api_url,
+                api_key=api_key,
+                model=model,
             )
-            if llm_result and isinstance(llm_result, dict):
-                added = llm_result.get("add_relations", [])
-                if isinstance(added, list):
-                    plan["mutations"]["add_relations"] = added
 
     plan["_stats"] = {
         "candidates_found": len(results["candidates"]),

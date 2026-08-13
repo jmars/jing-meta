@@ -50,6 +50,30 @@ EMBED_MODEL = os.environ.get("JING_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 LOCAL_LLM_MODEL = os.environ.get("JING_LOCAL_LLM", "qwen3.5:2b-q4_k_m")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 
+# Cloud LLM (OpenAI-compatible) used by the dreamer's "cloud" validator path and
+# any GRAPH_GARDENER_API_URL-less `llm.call`. Override with JING_CLOUD_LLM_URL /
+# JING_CLOUD_LLM_MODEL, or at call-time via GRAPH_GARDENER_API_URL /
+# GRAPH_GARDENER_MODEL. Defaults to the local DeepInfra cache proxy
+# (http://127.0.0.1:8322) so dreamer cloud calls are logged to
+# deepinfra-usage.jsonl and share the proxy's prompt cache. The proxy forwards
+# the request body verbatim (including service_tier) to api.deepinfra.com and
+# injects DEEPINFRA_API_KEY, so no key is needed from the caller. Serving
+# Mistral-Small-24B — a cheap, JSON-reliable relation-naming model.
+CLOUD_LLM_URL = os.environ.get(
+    "JING_CLOUD_LLM_URL", "http://127.0.0.1:8322/v1/openai"
+)
+CLOUD_LLM_MODEL = os.environ.get(
+    "JING_CLOUD_LLM_MODEL", "mistralai/Mistral-Small-24B-Instruct-2501"
+)
+
+# DeepInfra service tier for cloud LLM calls. Flex (0.8x base) is for
+# non-production / asynchronous work — slower responses and occasional
+# unavailability, in exchange for ~20% lower cost. Defaults to "flex" because
+# the primary consumer (the detached background graph-gardener) is exactly that
+# workload. Override with JING_CLOUD_SERVICE_TIER ("" for Standard, "priority"
+# for 1.5x). Only models that advertise the tier honor it.
+CLOUD_SERVICE_TIER = os.environ.get("JING_CLOUD_SERVICE_TIER", "flex").strip()
+
 # External tools
 SOUFFLE = os.environ.get("JING_SOUFFLE", "/usr/local/bin/souffle")
 

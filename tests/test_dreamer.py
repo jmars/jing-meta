@@ -255,3 +255,60 @@ class TestParseRelationType:
         from dreamer.local_validator import _parse_relation_type
         assert _parse_relation_type("the cat sat on the mat") is None
         assert _parse_relation_type("relation: unknown_type") is None
+
+
+class TestValidateCloudChunking:
+    """validate_cloud splits candidates into chunks and merges results."""
+
+    def test_empty_returns_empty(self):
+        from dreamer.dreamer import validate_cloud
+        assert validate_cloud([], api_url=None, api_key=None, model=None) == []
+
+    def test_chunks_and_merges(self, monkeypatch):
+        from dreamer import llm as llm_mod
+        from dreamer.dreamer import validate_cloud
+
+        calls = {"n": 0, "cand_counts": []}
+
+        def fake_call(system_prompt, user_prompt, max_tokens, api_url, api_key, model):
+            calls["n"] += 1
+            # Count candidates from the numbered lines in the prompt.
+            count = sum(1 for line in user_prompt.splitlines()
+                        if len(line) > 4 and line.lstrip()[0].isdigit() and ". \"" in line)
+            calls["cand_counts"].append(count)
+            relations = [
+                {"from": f"A{j}", "to": f"B{j}", "relationType": "related_to"}
+                for j in range(count)
+            ]
+            return {"add_relations": relations}, {"model": "m"}
+
+        monkeypatch.setattr(llm_mod, "call", fake_call)
+
+        cands = [{"from": f"E{i}", "to": f"F{i}", "shared": 2} for i in range(45)]
+        result = validate_cloud(cands, api_url=None, api_key=None, model=None, chunk_size=20)
+
+        # 45 candidates / 20 per chunk = 3 chunks (20, 20, 5).
+        assert calls["n"] == 3
+        assert calls["cand_counts"] == [20, 20, 5]
+        assert len(result) == 45
+
+    def test_failed_chunk_skipped_rest_contribute(self, monkeypatch):
+        from dreamer import llm as llm_mod
+        from dreamer.dreamer import validate_cloud
+
+        calls = {"n": 0}
+
+        def fake_call(system_prompt, user_prompt, max_tokens, api_url, api_key, model):
+            calls["n"] += 1
+            if calls["n"] == 2:  # fail the middle chunk
+                return None, None
+            return {"add_relations": [{"from": "x", "to": "y", "relationType": "r"}]}, {}
+
+        monkeypatch.setattr(llm_mod, "call", fake_call)
+
+        cands = [{"from": "a", "to": "b", "shared": 1}] * 30
+        result = validate_cloud(cands, api_url=None, api_key=None, model=None, chunk_size=10)
+
+        # 3 chunks of 10; middle (chunk 2) fails -> skipped; chunks 1 & 3 contribute.
+        assert calls["n"] == 3
+        assert len(result) == 2  # one relation from each of the 2 successful chunks

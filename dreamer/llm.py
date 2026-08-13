@@ -5,9 +5,9 @@ OpenAI, DeepSeek, Groq, Together, Ollama, LM Studio, Anthropic (via proxy), etc.
 
 Configure via environment variables::
 
-    GRAPH_GARDENER_API_URL  — base URL (default: https://api.deepseek.com/v1)
+    GRAPH_GARDENER_API_URL  — base URL (default: DeepInfra OpenAI endpoint, see config.CLOUD_LLM_URL)
     GRAPH_GARDENER_API_KEY  — bearer token (required)
-    GRAPH_GARDENER_MODEL    — model name (default: deepseek-chat)
+    GRAPH_GARDENER_MODEL    — model name (default: mistralai/Mistral-Small-24B-Instruct-2501)
 
 Or pass parameters directly to ``call()``::
 
@@ -24,12 +24,14 @@ Or pass parameters directly to ``call()``::
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 from ipaddress import ip_address
 from urllib.parse import urlparse
 
 import requests
 
+from jing_meta import config as _config
 from jing_meta.log import get_logger
 
 logger = get_logger(__name__)
@@ -136,7 +138,9 @@ def call(
     api_url: str | None = None,
     api_key: str | None = None,
     model: str | None = None,
+    service_tier: str | None = None,
     retries: int = 2,
+    http_retries: int = 2,
 ) -> tuple[dict | None, dict | None]:
     """Call the configured LLM and return ``(result, metadata)``.
 
@@ -145,11 +149,19 @@ def call(
         user_prompt: User message (the main content to summarise).
         max_tokens: Maximum tokens in the response (default 4000).
         api_url: Base URL for the API. Defaults to ``GRAPH_GARDENER_API_URL``
-            env var, then ``https://api.deepseek.com/v1``.
+            env var, then ``config.CLOUD_LLM_URL`` (DeepInfra OpenAI endpoint).
         api_key: Bearer token. Defaults to ``GRAPH_GARDENER_API_KEY`` env var.
         model: Model name. Defaults to ``GRAPH_GARDENER_MODEL`` env var,
-            then ``deepseek-chat``.
+            then ``config.CLOUD_LLM_MODEL``.
+        service_tier: Optional ``service_tier`` body field (e.g. ``"flex"`` for
+            DeepInfra's 0.8x discount, ``"priority"`` for 1.5x). Defaults to
+            ``JING_CLOUD_SERVICE_TIER`` env, else ``config.CLOUD_SERVICE_TIER``.
+            Empty string / None sends no field (Standard tier).
         retries: Number of extra attempts after a JSON-parse failure.
+        http_retries: Number of extra attempts after a transient HTTP error
+            (network / 5xx / timeout), with a short backoff. Helps Flex-tier
+            "occasional unavailability" recover instead of silently dropping a
+            maintenance pass.
 
     Returns:
         A tuple ``(result, metadata)`` where *result* is the parsed JSON dict
@@ -159,16 +171,25 @@ def call(
     The LLM is expected to return a single JSON object (possibly wrapped in
     code fences, which are stripped). On a parse failure the request is retried
     with a repair instruction (up to ``retries`` extra attempts), so transient
-    truncation/malformed output does not abort the whole run.
+    truncation/malformed output does not abort the whole run. Transient HTTP
+    failures are retried up to ``http_retries`` extra attempts.
     """
     if api_url is None:
         api_url = os.environ.get(
-            "GRAPH_GARDENER_API_URL", "https://api.deepseek.com/v1"
+            "GRAPH_GARDENER_API_URL",
+            _config.CLOUD_LLM_URL,
         )
     if api_key is None:
         api_key = os.environ.get("GRAPH_GARDENER_API_KEY", "")
     if model is None:
-        model = os.environ.get("GRAPH_GARDENER_MODEL", "deepseek-chat")
+        model = os.environ.get(
+            "GRAPH_GARDENER_MODEL",
+            _config.CLOUD_LLM_MODEL,
+        )
+    if service_tier is None:
+        service_tier = os.environ.get(
+            "JING_CLOUD_SERVICE_TIER", _config.CLOUD_SERVICE_TIER
+        ).strip()
 
     if not api_key and not _is_loopback_host(api_url):
         logger.error("GRAPH_GARDENER_API_KEY is not set or is empty")
@@ -180,8 +201,22 @@ def call(
         logger.error("%s", e)
         return None, None
 
-    # Try the initial request plus `retries` repair attempts.
-    for attempt in range(retries + 1):
+    def _payload(repair: str) -> dict:
+        body: dict = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt + repair},
+            ],
+            "temperature": 0.2,
+            "max_tokens": max_tokens,
+        }
+        if service_tier:
+            body["service_tier"] = service_tier
+        return body
+
+    # Try the initial request plus retry attempts (JSON repair + HTTP backoff).
+    for attempt in range(max(retries, http_retries) + 1):
         repair = ""
         if attempt > 0:
             repair = (
@@ -197,15 +232,7 @@ def call(
             resp = requests.post(
                 _chat_url(api_url),
                 headers=headers,
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt + repair},
-                    ],
-                    "temperature": 0.2,
-                    "max_tokens": max_tokens,
-                },
+                json=_payload(repair),
                 timeout=120,
             )
             resp.raise_for_status()
@@ -231,11 +258,16 @@ def call(
             # Parse failure — retry with a repair instruction
             safe = _redact(str(e), [api_key, f"Bearer {api_key}", api_url])
             logger.warning("LLM returned malformed JSON (attempt %d): %s", attempt + 1, safe)
-            continue
+            if attempt < retries:
+                continue
+            break
 
         except (requests.RequestException, KeyError, IndexError) as e:
             safe = _redact(str(e), [api_key, f"Bearer {api_key}", api_url])
-            logger.error("LLM call failed: %s", safe)
+            logger.warning("LLM call failed (attempt %d): %s", attempt + 1, safe)
+            if attempt < http_retries:
+                time.sleep(min(2 ** attempt, 4))
+                continue
             return None, None
 
     logger.error("LLM kept returning malformed JSON after retries.")

@@ -356,6 +356,55 @@ def build_validation_prompt(candidates: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def validate_cloud(
+    candidates: list[dict],
+    *,
+    api_url: str | None,
+    api_key: str | None,
+    model: str | None,
+    chunk_size: int = 20,
+    max_tokens: int = 4000,
+) -> list[dict]:
+    """Validate/name candidate relations via the cloud LLM, in bounded chunks.
+
+    Splits *candidates* into chunks of at most *chunk_size* and sends one
+    ``llm.call`` per chunk, merging the ``add_relations`` results. Chunking
+    keeps each prompt small (no truncation risk from a huge shortlist) and
+    bounds the blast radius of a single failed/Flex-delayed call — one bad
+    chunk is skipped while the rest still contribute. Each chunk call also
+    benefits from ``llm.call``'s internal HTTP retry/backoff.
+
+    Returns the merged list of ``{"from", "to", "relationType"}`` dicts. Callers
+    pass the candidates with ``from``/``to`` keys (plus optional ``shared`` /
+    ``similarity`` signals used by ``build_validation_prompt``).
+    """
+    from . import llm
+
+    if not candidates:
+        return []
+
+    added_relations: list[dict] = []
+    for start in range(0, len(candidates), chunk_size):
+        chunk = candidates[start:start + chunk_size]
+        prompt = build_validation_prompt(chunk)
+        llm_result, _meta = llm.call(
+            system_prompt="You are a knowledge graph relation validator.",
+            user_prompt=prompt,
+            max_tokens=max_tokens,
+            api_url=api_url, api_key=api_key, model=model,
+        )
+        if llm_result and isinstance(llm_result, dict):
+            added = llm_result.get("add_relations", [])
+            if isinstance(added, list):
+                added_relations.extend(added)
+        else:
+            logger.warning(
+                "cloud validation failed for chunk %d-%d — skipping %d candidate(s)",
+                start + 1, min(start + chunk_size, len(candidates)), len(chunk),
+            )
+    return added_relations
+
+
 # ---------------------------------------------------------------------------
 # Candidate relation generation
 # ---------------------------------------------------------------------------

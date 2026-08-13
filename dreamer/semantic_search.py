@@ -19,7 +19,7 @@ from jing_meta import embed as _embed
 # dense, high-similarity vectors for true relations; use a high bar since these
 # feed the LLM and we want precision over recall.
 SIM_THRESHOLD = float(os.environ.get("SEMANTIC_SIM_THRESHOLD", "0.55"))
-MAX_PAIRS = int(os.environ.get("SEMANTIC_MAX_PAIRS", "40"))
+MAX_PAIRS = int(os.environ.get("SEMANTIC_MAX_PAIRS", "80"))
 
 
 def embed_entities(graph: dict) -> list[tuple[dict, list[float]]]:

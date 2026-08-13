@@ -343,8 +343,7 @@ def validate(ctx: RunContext, prior: StageResult | None = None) -> StageResult |
         ))
 
     else:  # Mode.SOUFFLE
-        from . import llm
-        from .dreamer import build_validation_prompt, load_graph_sqlite
+        from .dreamer import load_graph_sqlite
 
         graph = load_graph_sqlite(ctx.snapshot_db)
         ranked = prior.payload.get("candidates", [])
@@ -374,17 +373,14 @@ def validate(ctx: RunContext, prior: StageResult | None = None) -> StageResult |
                     for r in added
                 ]
             elif validator == "cloud":
-                prompt = build_validation_prompt(cand_dicts)
-                llm_result, _meta = llm.call(
-                    system_prompt="You are a knowledge graph relation validator.",
-                    user_prompt=prompt,
-                    max_tokens=2000,
-                    api_url=ctx.api_url, api_key=ctx.api_key, model=ctx.model,
+                from .dreamer import validate_cloud
+
+                added_relations = validate_cloud(
+                    cand_dicts,
+                    api_url=ctx.api_url,
+                    api_key=ctx.api_key,
+                    model=ctx.model,
                 )
-                if llm_result and isinstance(llm_result, dict):
-                    added = llm_result.get("add_relations", [])
-                    if isinstance(added, list):
-                        added_relations = added
 
         plan = MutationPlan(
             rename_types=certain.get("rename_types", []),

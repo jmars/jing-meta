@@ -72,3 +72,82 @@ def test_memory_db_and_archive_dir_respect_env(tmp_path, monkeypatch):
     monkeypatch.setenv("MEMORY_ARCHIVE_DIR", str(tmp_path / "archives"))
     assert common.memory_db() == tmp_path / "custom.db"
     assert common.archive_dir() == tmp_path / "archives"
+
+
+# ---------------------------------------------------------------------------
+# Gardener hook run-id persistence
+# ---------------------------------------------------------------------------
+
+
+def test_new_run_id_is_runstore_style(tmp_path, monkeypatch):
+    """_new_run_id returns a collision-safe id in the RunStore format."""
+    monkeypatch.setenv("VIBE_HOME", str(tmp_path))
+    from jing_meta.hooks import gardener
+
+    rid = gardener._new_run_id()
+    # YYYYMMDDTHHMMSSZ (RunStore.new_run_id), possibly with a -N suffix.
+    import re
+    assert re.fullmatch(r"\d{8}T\d{6}Z(-\d+)?", rid)
+
+
+def test_record_digest_includes_run_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIBE_HOME", str(tmp_path))
+    from jing_meta.hooks import gardener
+
+    gardener._record_digest("TOTAL mutations: 4\n  add_relations: 2", run_id="20260813T000000Z")
+    recs = common.digest_read()
+    assert recs[0]["system"] == "graph-gardener"
+    assert "run_id=20260813T000000Z" in recs[0]["detail"]
+    assert "4 mutations" in recs[0]["detail"]
+
+
+def test_maintenance_bg_forwards_run_id(monkeypatch):
+    """_run_maintenance_bg passes run_id through to _run_dreamer."""
+    from jing_meta.hooks import gardener
+
+    captured = {}
+    def fake_run_dreamer(run_id=None):
+        captured["run_id"] = run_id
+        return 0, "TOTAL mutations: 0\n"
+    monkeypatch.setattr(gardener, "_run_dreamer", fake_run_dreamer)
+    monkeypatch.setattr(gardener, "_record_digest", lambda out, run_id=None: None)
+    monkeypatch.setattr(gardener, "_rebuild_semantic_index", lambda: None)
+
+    gardener._run_maintenance_bg(run_id="20260813T000000Z")
+    assert captured["run_id"] == "20260813T000000Z"
+    # Without a run_id, it forwards None (in-memory only).
+    gardener._run_maintenance_bg()
+    assert captured["run_id"] is None
+
+
+def test_cloud_config_defaults_to_deepinfra_cloud(monkeypatch):
+    """The gardener defaults to the DeepInfra cloud validator + Flex tier."""
+    from jing_meta import config as _config
+    from jing_meta.hooks import gardener
+
+    for var in ("GRAPH_GARDENER_VALIDATOR", "GRAPH_GARDENER_API_URL",
+                "GRAPH_GARDENER_API_KEY", "GRAPH_GARDENER_MODEL", "DEEPINFRA_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("DEEPINFRA_API_KEY", "di-key")
+
+    validator, api_url, api_key, model = gardener._cloud_config()
+    assert validator == "cloud"
+    assert api_url == _config.CLOUD_LLM_URL
+    assert api_key == "di-key"
+    assert model == _config.CLOUD_LLM_MODEL
+
+
+def test_cloud_config_env_overrides(monkeypatch):
+    """Explicit GRAPH_GARDENER_* env vars override the cloud defaults."""
+    from jing_meta.hooks import gardener
+
+    monkeypatch.setenv("GRAPH_GARDENER_VALIDATOR", "local")
+    monkeypatch.setenv("GRAPH_GARDENER_API_URL", "http://localhost:11434/v1")
+    monkeypatch.setenv("GRAPH_GARDENER_API_KEY", "k")
+    monkeypatch.setenv("GRAPH_GARDENER_MODEL", "qwen3.5:2b")
+
+    validator, api_url, api_key, model = gardener._cloud_config()
+    assert validator == "local"
+    assert api_url == "http://localhost:11434/v1"
+    assert api_key == "k"
+    assert model == "qwen3.5:2b"
