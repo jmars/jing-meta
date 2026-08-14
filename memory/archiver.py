@@ -37,6 +37,7 @@ from pathlib import Path
 from jing_meta import config as _config
 from jing_meta.fsutil import _atomic_write
 from jing_meta.log import get_logger, setup_logging
+from jing_meta.schema import ensure_schema
 
 logger = get_logger(__name__)
 
@@ -60,8 +61,8 @@ def _select_old_observations(conn: sqlite3.Connection, cutoff: str) -> list[dict
     """Return old observations as list of {id, entity, content, created_at}."""
     rows = conn.execute(
         """
-        SELECT o.id AS id, e.name AS entity, o.content AS content,
-               o.created_at AS created_at
+        SELECT o.id AS id, o.entity_id AS entity_id, e.name AS entity,
+               o.content AS content, o.created_at AS created_at
         FROM observations o
         JOIN entities e ON e.id = o.entity_id
         WHERE datetime(o.created_at) < datetime(?)
@@ -72,6 +73,7 @@ def _select_old_observations(conn: sqlite3.Connection, cutoff: str) -> list[dict
     return [
         {
             "id": r["id"],
+            "entity_id": r["entity_id"],
             "entity": r["entity"],
             "content": r["content"],
             "created_at": r["created_at"],
@@ -114,10 +116,22 @@ def _delete_observations(conn: sqlite3.Connection, obs: list[dict]) -> int:
     """Delete the given observations by primary key (id).
 
     Deleting by ``id`` (rather than an (entity, content) match) guarantees we
-    only ever remove exactly the rows that were selected and archived — a newer
-    duplicate observation with identical content is never wrongly deleted.
+    only ever remove exactly the rows that were selected and archived. The
+    ``idx_obs_unique`` UNIQUE(entity_id, content) constraint means duplicate
+    content can no longer exist, so delete-by-id is belt-and-suspenders — but it
+    remains the safest form, since it can never remove a *different* row that
+    happens to share content.
+
+    After deleting, bumps the ``revision`` of each distinct affected entity so a
+    concurrent writer holding a stale snapshot of that entity sees a conflict
+    instead of silently clobbering the post-archive state.
     """
     cur = conn.executemany("DELETE FROM observations WHERE id = ?", [(o["id"],) for o in obs])
+    for entity_id in {o["entity_id"] for o in obs}:
+        conn.execute(
+            "UPDATE entities SET revision = revision + 1 WHERE id = ?",
+            (entity_id,),
+        )
     return cur.rowcount
 
 
@@ -223,6 +237,9 @@ def archive(
     # process; wait for a competing writer instead of failing with
     # "database is locked".
     conn.execute("PRAGMA busy_timeout=5000")
+    # Ensure the DB is on the current schema (adds `revision` on older DBs)
+    # before we bump revisions on the affected entities.
+    ensure_schema(conn)
     try:
         conn.execute("BEGIN IMMEDIATE")
         deleted = _delete_observations(conn, old)

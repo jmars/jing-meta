@@ -22,7 +22,7 @@ from mcp.types import TextContent
 
 from jing_meta import config as _jing_config
 from jing_meta.mcp_base import JINGMCP
-from jing_meta.schema import SCHEMA_DDL
+from jing_meta.schema import ensure_schema
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -71,12 +71,12 @@ def _get_conn() -> sqlite3.Connection:
 
 
 def _init_schema(conn: sqlite3.Connection) -> None:
-    """Create tables if they don't exist.
+    """Create tables if they don't exist, then migrate to the current schema.
 
     Takes the connection explicitly so it never re-enters ``_get_conn``
     (which would otherwise recurse through the same ``_conn_lock``).
     """
-    conn.executescript(SCHEMA_DDL)
+    ensure_schema(conn)
 
 
 def _now() -> str:
@@ -153,6 +153,7 @@ def _entity_blocks(
     observations: list[str],
     created_at: str | None = None,
     updated_at: str | None = None,
+    revision: int | None = None,
     max_obs_chars: int | None = 500,
 ) -> list[TextContent]:
     blocks = [
@@ -175,6 +176,8 @@ def _entity_blocks(
         blocks.append(TextContent(type="text", text=f"Created: {created_at}"))
     if updated_at:
         blocks.append(TextContent(type="text", text=f"Updated: {updated_at}"))
+    if revision is not None:
+        blocks.append(TextContent(type="text", text=f"Revision: {revision}"))
     return blocks
 
 
@@ -211,6 +214,7 @@ def _join_entities(entities: list[dict], max_obs_chars: int | None = 500) -> lis
                 e["observations"],
                 created_at=e.get("created_at"),
                 updated_at=e.get("updated_at"),
+                revision=e.get("revision"),
                 max_obs_chars=max_obs_chars,
             )
         )
@@ -250,7 +254,7 @@ def create_entities(entities: list[dict]) -> str:
             for obs in observations:
                 if isinstance(obs, str):
                     conn.execute(
-                        "INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)",
+                        "INSERT OR IGNORE INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)",
                         (entity_id, obs, now),
                     )
             created += 1
@@ -308,6 +312,16 @@ def add_observations(observations: list[dict]) -> str:
     """Add new observations to existing entities in the knowledge graph.
 
     Each item must have: entityName (str), contents (list[str]).
+    An optional per-item ``expectedRev`` (int) turns the write into a
+    compare-and-swap: the observation is only added if the entity's revision is
+    still ``expectedRev``. If the revision has moved, that item is skipped with a
+    CONFLICT message (including the current revision) while other items in the
+    batch still apply. Absent ``expectedRev`` => unconditional write (bumps the
+    revision as usual).
+
+    Idempotent: content already present on the entity is not inserted again,
+    and the revision is bumped only when at least one new observation is
+    actually added (a pure re-add leaves revision and updated_at untouched).
     """
     conn = _get_conn()
     added = 0
@@ -317,6 +331,7 @@ def add_observations(observations: list[dict]) -> str:
     for item in observations:
         entity_name = item.get("entityName")
         contents = item.get("contents", [])
+        expected_rev = item.get("expectedRev")
 
         if not entity_name:
             errors.append("Missing 'entityName'")
@@ -327,15 +342,48 @@ def add_observations(observations: list[dict]) -> str:
             errors.append(f"Entity not found: {entity_name}")
             continue
 
-        for content in contents:
-            if isinstance(content, str):
-                conn.execute(
-                    "INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)",
-                    (entity_id, content, now),
-                )
-                added += 1
+        # Dedupe: only insert string content not already present on the entity.
+        # A pure re-add (or empty/all-non-string contents) is a no-op — no
+        # revision bump, no CONFLICT — so idempotent re-adds are a valid CAS pass.
+        existing = set(_get_obs_by_entity_id(conn, entity_id))
+        new_contents = [
+            c for c in contents if isinstance(c, str) and c not in existing
+        ]
+        if not new_contents:
+            continue
 
-        conn.execute("UPDATE entities SET updated_at = ? WHERE id = ?", (now, entity_id))
+        if expected_rev is not None:
+            # Compare-and-swap: bump + check in a single conditional statement.
+            # SQLite serializes writers, so this is atomic even in autocommit mode.
+            cur = conn.execute(
+                "UPDATE entities SET revision = revision + 1, updated_at = ? "
+                "WHERE id = ? AND revision = ?",
+                (now, entity_id, expected_rev),
+            )
+            if cur.rowcount == 0:
+                current = conn.execute(
+                    "SELECT revision FROM entities WHERE id = ?", (entity_id,)
+                ).fetchone()
+                current_rev = current["revision"] if current else "?"
+                errors.append(
+                    f"CONFLICT: entity '{entity_name}' revision changed "
+                    f"(expected {expected_rev}, current {current_rev}); re-read and retry."
+                )
+                continue
+        else:
+            # No expectedRev: bump the revision unconditionally so any reader's
+            # snapshot of this entity goes stale (backward-compatible path).
+            conn.execute(
+                "UPDATE entities SET revision = revision + 1, updated_at = ? WHERE id = ?",
+                (now, entity_id),
+            )
+
+        for content in new_contents:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)",
+                (entity_id, content, now),
+            )
+            added += cur.rowcount
 
     conn.commit()
 
@@ -346,19 +394,58 @@ def add_observations(observations: list[dict]) -> str:
 
 
 @mcp.tool()
-def delete_entities(entityNames: list[str]) -> str:
-    """Delete multiple entities and their associated relations from the knowledge graph."""
+def delete_entities(entityNames: list[str], expectedRevs: dict[str, int] | None = None) -> str:
+    """Delete multiple entities and their associated relations from the knowledge graph.
+
+    ``expectedRevs`` (optional) maps entity name -> expected revision, enabling
+    per-name compare-and-swap: a name is only deleted if its revision still
+    matches. On a mismatch the name is skipped with a CONFLICT message (including
+    the current revision); names without an entry are deleted unconditionally.
+    """
     conn = _get_conn()
     deleted = 0
+    errors: list[str] = []
 
     for name in entityNames:
-        # Clean up dangling relations first (relations use soft FKs by name)
-        conn.execute("DELETE FROM relations WHERE from_entity = ? OR to_entity = ?", (name, name))
-        cursor = conn.execute("DELETE FROM entities WHERE name = ?", (name,))
-        deleted += cursor.rowcount
+        expected_rev = None
+        if expectedRevs is not None and name in expectedRevs:
+            expected_rev = expectedRevs[name]
+
+        if expected_rev is not None:
+            # CAS: conditional delete; rowcount 0 means either gone or stale.
+            cursor = conn.execute(
+                "DELETE FROM entities WHERE name = ? AND revision = ?",
+                (name, expected_rev),
+            )
+            if cursor.rowcount == 0:
+                # Disambiguate not-found vs conflict by fetching the current rev.
+                row = conn.execute(
+                    "SELECT revision FROM entities WHERE name = ?", (name,)
+                ).fetchone()
+                if row is not None:
+                    errors.append(
+                        f"CONFLICT: entity '{name}' revision changed "
+                        f"(expected {expected_rev}, current {row['revision']}); re-read and retry."
+                    )
+                # Not found: silently skip (matches unconditional-delete behavior).
+                continue
+            # Entity deleted — clean up its dangling relations (soft FKs by name).
+            conn.execute(
+                "DELETE FROM relations WHERE from_entity = ? OR to_entity = ?",
+                (name, name),
+            )
+            deleted += 1
+        else:
+            # Clean up dangling relations first (relations use soft FKs by name)
+            conn.execute("DELETE FROM relations WHERE from_entity = ? OR to_entity = ?", (name, name))
+            cursor = conn.execute("DELETE FROM entities WHERE name = ?", (name,))
+            deleted += cursor.rowcount
 
     conn.commit()
-    return f"Deleted {deleted} entities."
+    msg = f"Deleted {deleted} entities."
+    if errors:
+        msg += f" Errors: {'; '.join(errors)}"
+    return msg
 
 
 @mcp.tool()
@@ -366,6 +453,10 @@ def delete_observations(deletions: list[dict]) -> str:
     """Delete specific observations from entities in the knowledge graph.
 
     Each item must have: entityName (str), observations (list[str] — exact content match).
+    An optional per-item ``expectedRev`` (int) turns the write into a
+    compare-and-swap: the deletion is only applied if the entity's revision is
+    still ``expectedRev``. On a mismatch that item is skipped with a CONFLICT
+    message (including the current revision); other items still apply.
     """
     conn = _get_conn()
     deleted = 0
@@ -374,6 +465,7 @@ def delete_observations(deletions: list[dict]) -> str:
     for item in deletions:
         entity_name = item.get("entityName")
         obs_to_delete = item.get("observations", [])
+        expected_rev = item.get("expectedRev")
 
         if not entity_name:
             errors.append("Missing 'entityName'")
@@ -383,6 +475,29 @@ def delete_observations(deletions: list[dict]) -> str:
         if entity_id is None:
             errors.append(f"Entity not found: {entity_name}")
             continue
+
+        if expected_rev is not None:
+            # CAS: bump + check in a single conditional statement.
+            cur = conn.execute(
+                "UPDATE entities SET revision = revision + 1 "
+                "WHERE id = ? AND revision = ?",
+                (entity_id, expected_rev),
+            )
+            if cur.rowcount == 0:
+                current = conn.execute(
+                    "SELECT revision FROM entities WHERE id = ?", (entity_id,)
+                ).fetchone()
+                current_rev = current["revision"] if current else "?"
+                errors.append(
+                    f"CONFLICT: entity '{entity_name}' revision changed "
+                    f"(expected {expected_rev}, current {current_rev}); re-read and retry."
+                )
+                continue
+        else:
+            conn.execute(
+                "UPDATE entities SET revision = revision + 1 WHERE id = ?",
+                (entity_id,),
+            )
 
         for obs_content in obs_to_delete:
             cursor = conn.execute(
@@ -689,7 +804,7 @@ def open_nodes(
 
     for name in names:
         row = conn.execute(
-            "SELECT id, name, entity_type, created_at, updated_at FROM entities WHERE name = ?",
+            "SELECT id, name, entity_type, created_at, updated_at, revision FROM entities WHERE name = ?",
             (name,),
         ).fetchone()
         if not row:
@@ -702,6 +817,7 @@ def open_nodes(
                 _get_obs_by_entity_id(conn, row["id"])[:max_obs_per_entity],
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
+                revision=row["revision"],
                 max_obs_chars=max_obs_chars,
             )
         )
@@ -866,7 +982,7 @@ def recent(
     # Use SQLite datetime() for format-agnostic comparison
     entities = []
     rows = conn.execute(
-        "SELECT id, name, entity_type, created_at, updated_at FROM entities "
+        "SELECT id, name, entity_type, created_at, updated_at, revision FROM entities "
         "WHERE datetime(updated_at) >= datetime(?) ORDER BY updated_at DESC LIMIT ?",
         (cutoff_iso, limit),
     ).fetchall()
@@ -892,6 +1008,7 @@ def recent(
             "observations": recent_obs_by_entity.get(row["id"], [])[:max_obs_per_entity],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "revision": row["revision"],
         })
 
     relations = []

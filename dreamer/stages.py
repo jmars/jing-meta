@@ -8,6 +8,7 @@ uses to keep its no-disk contract.
 
 from __future__ import annotations
 
+import copy
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -437,8 +438,11 @@ def apply(ctx: RunContext, prior: StageResult | None = None) -> StageResult:
         shutil.copyfile(ctx.source_db, backup_path)
         print(f"Backup saved to: {backup_path}")
 
+        # Snapshot the pre-mutation graph so save_graph_sqlite can guard against
+        # clobbering state (types/observations/relations) that changed since load.
+        observed = copy.deepcopy(graph)
         graph = apply_mutations(graph, plan.to_legacy_dict(), run_date=ctx.run_date)
-        save_graph_sqlite(graph, ctx.source_db)
+        save_graph_sqlite(graph, ctx.source_db, observed=observed)
 
     n_entities_after = len(graph["entities"])
     n_relations_after = len(graph["relations"])

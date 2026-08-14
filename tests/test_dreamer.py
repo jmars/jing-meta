@@ -2,6 +2,7 @@ import sqlite3
 from pathlib import Path
 
 from dreamer.dreamer import load_graph_sqlite, save_graph_sqlite
+from jing_meta.schema import SCHEMA_DDL
 from jing_meta.text import STOPWORDS
 
 # ---------------------------------------------------------------------------
@@ -312,3 +313,274 @@ class TestValidateCloudChunking:
         # 3 chunks of 10; middle (chunk 2) fails -> skipped; chunks 1 & 3 contribute.
         assert calls["n"] == 3
         assert len(result) == 2  # one relation from each of the 2 successful chunks
+
+
+class TestRevisionBumps:
+    """save_graph_sqlite bumps the per-entity ``revision`` on mutations."""
+
+    def _make_db(self, path: Path) -> None:
+        conn = sqlite3.connect(str(path))
+        conn.executescript(SCHEMA_DDL)
+        conn.execute(
+            "INSERT INTO entities (name, entity_type, created_at, updated_at) "
+            "VALUES ('Alpha', 'plan', '2025-01-01', '2025-01-02')"
+        )
+        conn.execute(
+            "INSERT INTO observations (entity_id, content, created_at) "
+            "VALUES (1, 'obs 1', '2025-01-01')"
+        )
+        conn.commit()
+        conn.close()
+
+    def _rev(self, path: Path, name: str) -> int:
+        conn = sqlite3.connect(str(path))
+        try:
+            return conn.execute(
+                "SELECT revision FROM entities WHERE name = ?", (name,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_no_change_does_not_bump(self, tmp_path):
+        db = tmp_path / "db.sqlite"
+        self._make_db(db)
+        graph = load_graph_sqlite(db)
+        save_graph_sqlite(graph, db)  # identical graph -> no revision change
+        assert self._rev(db, "Alpha") == 0
+
+    def test_type_change_bumps_revision(self, tmp_path):
+        db = tmp_path / "db.sqlite"
+        self._make_db(db)
+        graph = load_graph_sqlite(db)
+        graph["entities"][0]["entityType"] = "implementation"
+        save_graph_sqlite(graph, db)
+        assert self._rev(db, "Alpha") == 1
+
+    def test_obs_add_bumps_revision(self, tmp_path):
+        db = tmp_path / "db.sqlite"
+        self._make_db(db)
+        graph = load_graph_sqlite(db)
+        graph["entities"][0]["observations"].append("obs 2")
+        save_graph_sqlite(graph, db)
+        assert self._rev(db, "Alpha") == 1
+
+    def test_obs_delete_bumps_revision(self, tmp_path):
+        db = tmp_path / "db.sqlite"
+        self._make_db(db)
+        graph = load_graph_sqlite(db)
+        graph["entities"][0]["observations"] = []  # drop "obs 1"
+        save_graph_sqlite(graph, db)
+        assert self._rev(db, "Alpha") == 1
+
+
+class TestSaveGraphCAS:
+    """``save_graph_sqlite(observed=...)`` only deletes/overwrites state it observed."""
+
+    def _make_db(self, path: Path) -> None:
+        conn = sqlite3.connect(str(path))
+        conn.executescript(SCHEMA_DDL)
+        conn.commit()
+        conn.close()
+
+    def _insert_entity(self, path, name, etype="plan", obs=(), rev=0):
+        conn = sqlite3.connect(str(path))
+        conn.execute(
+            "INSERT INTO entities (name, entity_type, created_at, updated_at, revision) "
+            "VALUES (?, ?, '2025-01-01', '2025-01-01', ?)",
+            (name, etype, rev),
+        )
+        eid = conn.execute(
+            "SELECT id FROM entities WHERE name = ?", (name,)
+        ).fetchone()[0]
+        for content in obs:
+            conn.execute(
+                "INSERT INTO observations (entity_id, content, created_at) "
+                "VALUES (?, ?, '2025-01-01')",
+                (eid, content),
+            )
+        conn.commit()
+        conn.close()
+        return eid
+
+    def _insert_relation(self, path, from_e, to_e, rtype="references"):
+        conn = sqlite3.connect(str(path))
+        conn.execute(
+            "INSERT INTO relations (from_entity, to_entity, relation_type, created_at) "
+            "VALUES (?, ?, ?, '2025-01-01')",
+            (from_e, to_e, rtype),
+        )
+        conn.commit()
+        conn.close()
+
+    def _rev(self, path, name):
+        conn = sqlite3.connect(str(path))
+        try:
+            return conn.execute(
+                "SELECT revision FROM entities WHERE name = ?", (name,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def _type(self, path, name):
+        conn = sqlite3.connect(str(path))
+        try:
+            return conn.execute(
+                "SELECT entity_type FROM entities WHERE name = ?", (name,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def _obs(self, path, name):
+        conn = sqlite3.connect(str(path))
+        try:
+            return [r[0] for r in conn.execute(
+                "SELECT content FROM observations WHERE entity_id = "
+                "(SELECT id FROM entities WHERE name = ?) ORDER BY id",
+                (name,),
+            ).fetchall()]
+        finally:
+            conn.close()
+
+    def _rels(self, path):
+        conn = sqlite3.connect(str(path))
+        try:
+            return set(conn.execute(
+                "SELECT from_entity, to_entity, relation_type FROM relations"
+            ).fetchall())
+        finally:
+            conn.close()
+
+    def test_observed_does_not_delete_concurrent_observation(self, tmp_path):
+        db = tmp_path / "db.sqlite"
+        self._make_db(db)
+        self._insert_entity(db, "Alpha", "plan", obs=["fact-A"])
+        observed = load_graph_sqlite(db)
+
+        # A concurrent writer adds fact-B after the dreamer loaded its snapshot.
+        conn = sqlite3.connect(str(db))
+        conn.execute(
+            "INSERT INTO observations (entity_id, content, created_at) VALUES "
+            "((SELECT id FROM entities WHERE name = 'Alpha'), 'fact-B', '2025-01-02')"
+        )
+        conn.commit()
+        conn.close()
+
+        desired = {
+            "entities": [{"name": "Alpha", "entityType": "plan", "observations": ["fact-A"]}],
+            "relations": [],
+            "other": [],
+        }
+        save_graph_sqlite(desired, db, observed=observed)
+
+        assert set(self._obs(db, "Alpha")) == {"fact-A", "fact-B"}
+
+    def test_observed_does_not_overwrite_concurrent_type_change(self, tmp_path):
+        db = tmp_path / "db.sqlite"
+        self._make_db(db)
+        self._insert_entity(db, "Alpha", "plan")
+        observed = load_graph_sqlite(db)
+
+        conn = sqlite3.connect(str(db))
+        conn.execute("UPDATE entities SET entity_type = 'implementation' WHERE name = 'Alpha'")
+        conn.commit()
+        conn.close()
+
+        desired = {
+            "entities": [{"name": "Alpha", "entityType": "plan", "observations": []}],
+            "relations": [],
+            "other": [],
+        }
+        save_graph_sqlite(desired, db, observed=observed)
+
+        assert self._type(db, "Alpha") == "implementation"
+        assert self._rev(db, "Alpha") == 0
+
+    def test_observed_still_overwrites_type_when_unchanged(self, tmp_path):
+        db = tmp_path / "db.sqlite"
+        self._make_db(db)
+        self._insert_entity(db, "Alpha", "plan")
+        observed = load_graph_sqlite(db)
+
+        desired = {
+            "entities": [{"name": "Alpha", "entityType": "implementation", "observations": []}],
+            "relations": [],
+            "other": [],
+        }
+        save_graph_sqlite(desired, db, observed=observed)
+
+        assert self._type(db, "Alpha") == "implementation"
+        assert self._rev(db, "Alpha") == 1
+
+    def test_observed_still_deletes_observed_unwanted_obs(self, tmp_path):
+        db = tmp_path / "db.sqlite"
+        self._make_db(db)
+        self._insert_entity(db, "Alpha", "plan", obs=["a", "b"])
+        observed = load_graph_sqlite(db)
+
+        desired = {
+            "entities": [{"name": "Alpha", "entityType": "plan", "observations": ["a"]}],
+            "relations": [],
+            "other": [],
+        }
+        save_graph_sqlite(desired, db, observed=observed)
+
+        assert self._obs(db, "Alpha") == ["a"]
+        assert self._rev(db, "Alpha") == 1
+
+    def test_observed_preserves_concurrent_relation(self, tmp_path):
+        db = tmp_path / "db.sqlite"
+        self._make_db(db)
+        self._insert_entity(db, "Alpha", "plan")
+        self._insert_entity(db, "Beta", "implementation")
+        self._insert_relation(db, "Alpha", "Beta", "implements")
+        observed = load_graph_sqlite(db)
+
+        # A concurrent writer adds a second relation.
+        self._insert_relation(db, "Alpha", "Beta", "uses")
+
+        desired = {
+            "entities": observed["entities"],
+            "relations": [{"from": "Alpha", "to": "Beta", "relationType": "implements"}],
+            "other": [],
+        }
+        save_graph_sqlite(desired, db, observed=observed)
+
+        rels = self._rels(db)
+        assert ("Alpha", "Beta", "implements") in rels
+        assert ("Alpha", "Beta", "uses") in rels
+
+
+class TestSaveGraphObservationUniqueness:
+    """``save_graph_sqlite`` must not error when the DB already holds an observation."""
+
+    def test_no_error_when_observation_already_present(self, tmp_path):
+        db = tmp_path / "db.sqlite"
+        conn = sqlite3.connect(str(db))
+        conn.executescript(SCHEMA_DDL)
+        conn.execute(
+            "INSERT INTO entities (name, entity_type, created_at, updated_at) "
+            "VALUES ('Alpha', 'plan', '2025-01-01', '2025-01-02')"
+        )
+        conn.execute(
+            "INSERT INTO observations (entity_id, content, created_at) "
+            "VALUES (1, 'obs 1', '2025-01-01')"
+        )
+        conn.commit()
+        conn.close()
+
+        graph = {
+            "entities": [
+                {"name": "Alpha", "entityType": "plan", "observations": ["obs 1"]}
+            ],
+            "relations": [],
+            "other": [],
+        }
+        # Must not raise IntegrityError even though the unique index is present.
+        save_graph_sqlite(graph, db)
+
+        conn = sqlite3.connect(str(db))
+        n = conn.execute(
+            "SELECT COUNT(*) FROM observations WHERE entity_id = 1 AND content = 'obs 1'"
+        ).fetchone()[0]
+        conn.close()
+        assert n == 1

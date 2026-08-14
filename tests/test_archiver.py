@@ -96,6 +96,31 @@ class TestArchive:
         assert result["deleted"] == 5
         assert _count_observations(db) == 3  # only new remain
 
+    def test_apply_bumps_revision(self, tmp_path):
+        """Deleting an observation bumps the affected entity's revision."""
+        db = tmp_path / "memory.db"
+        arc = tmp_path / "archives"
+        _make_test_db(db, n_old=2, n_new=0)
+        conn = sqlite3.connect(str(db))
+        try:
+            rev_before = conn.execute(
+                "SELECT revision FROM entities WHERE name = 'old-entity-0'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert rev_before == 0
+
+        archiver.archive(memory_db=db, archive_dir=arc, days=90, apply=True)
+
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            rev_after = conn.execute(
+                "SELECT revision FROM entities WHERE name = 'old-entity-0'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert rev_after == 1
+
     def test_backup_created_on_apply(self, tmp_path):
         db = tmp_path / "memory.db"
         arc = tmp_path / "archives"
@@ -157,10 +182,15 @@ class TestArchive:
         assert result["archived"] == 4
         assert _count_observations(db) == 0
 
-    def test_duplicate_content_only_old_deleted(self, tmp_path):
-        """A newer duplicate observation with identical content must survive."""
+    def test_duplicate_content_rejected_by_unique_index(self, tmp_path):
+        """Same-content duplicates are now impossible at the schema level.
+
+        The unique ``(entity_id, content)`` index means a second observation with
+        identical content for the same entity is rejected, so the archiver no
+        longer needs the old "a newer duplicate observation must survive" logic —
+        there is only ever one row per (entity, content).
+        """
         db = tmp_path / "memory.db"
-        arc = tmp_path / "archives"
         _make_test_db(db, n_old=0, n_new=0)
         conn = sqlite3.connect(str(db))
         now = datetime.now(timezone.utc)
@@ -170,24 +200,14 @@ class TestArchive:
             "INSERT INTO entities (name, entity_type, created_at, updated_at) "
             "VALUES ('dup-entity', 't', ?, ?)", (old, old))
         eid = conn.execute("SELECT id FROM entities WHERE name='dup-entity'").fetchone()[0]
-        # Same content, two different timestamps -> two rows, different ids.
-        conn.execute("INSERT INTO observations (entity_id, content, created_at) VALUES (?,?,?)",
-                     (eid, "shared content", old))
-        conn.execute("INSERT INTO observations (entity_id, content, created_at) VALUES (?,?,?)",
-                     (eid, "shared content", new))
-        conn.commit()
+        conn.execute(
+            "INSERT INTO observations (entity_id, content, created_at) VALUES (?,?,?)",
+            (eid, "shared content", old))
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO observations (entity_id, content, created_at) VALUES (?,?,?)",
+                (eid, "shared content", new))
         conn.close()
-        archiver.archive(memory_db=db, archive_dir=arc, days=90, apply=True)
-        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-        try:
-            remaining = conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
-            kept_created = conn.execute(
-                "SELECT created_at FROM observations WHERE content='shared content'"
-            ).fetchone()[0]
-        finally:
-            conn.close()
-        assert remaining == 1  # only the old duplicate was archived+deleted
-        assert kept_created == new
 
     def test_archive_write_failure_deletes_nothing(self, tmp_path, monkeypatch):
         """If the archive write fails, no observations are deleted."""

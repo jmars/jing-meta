@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from jing_meta.log import get_logger
 from jing_meta.schema import (
     SCHEMA_DDL,  # noqa: F401 -- documents the shared schema contract
+    ensure_schema,
 )
 from jing_meta.text import STOPWORDS
 
@@ -85,7 +86,9 @@ def load_graph_sqlite(db_path: Path) -> dict:
     return {"entities": entities, "relations": relations, "other": []}
 
 
-def save_graph_sqlite(graph: dict, db_path: Path) -> None:
+def save_graph_sqlite(
+    graph: dict, db_path: Path, observed: dict | None = None
+) -> None:
     """Write the graph back to the memory-mcp SQLite store, preserving history.
 
     Incremental reconcile — unlike the old full-replace version, this does NOT
@@ -93,6 +96,14 @@ def save_graph_sqlite(graph: dict, db_path: Path) -> None:
     observations, and relations; only ``updated_at`` is bumped for entities
     whose type actually changed, and only observations/relations no longer
     present are removed. Wrapped in a transaction.
+
+    ``observed`` (optional) is the pre-mutation snapshot the caller loaded via
+    ``load_graph_sqlite`` (same shape as ``graph``). When supplied, the three
+    destructive paths — entity-type overwrite, observation delete, relation
+    delete — are guarded so the dreamer only deletes/overwrites state it
+    actually *observed* in that snapshot, never additions/renames made
+    concurrently after load. When ``None`` (default), the legacy
+    full-desired-state reconcile semantics apply unchanged.
     """
     import sqlite3
 
@@ -103,6 +114,9 @@ def save_graph_sqlite(graph: dict, db_path: Path) -> None:
     conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
     try:
+        # Ensure the DB is on the current schema (adds `revision` on older DBs).
+        # Inside the try so a failure here still closes the connection below.
+        ensure_schema(conn)
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("BEGIN IMMEDIATE")
         cur = conn.cursor()
@@ -132,6 +146,25 @@ def save_graph_sqlite(graph: dict, db_path: Path) -> None:
         ):
             existing_rels[(from_e, to_e, rtype)] = created_at
 
+        # --- Pre-mutation snapshot lookups (guards destructive reconcile) ---
+        if observed is not None:
+            observed_entities = {
+                e["name"]: e.get("entityType", "summary")
+                for e in observed.get("entities", [])
+            }
+            observed_obs = {
+                e["name"]: set(e.get("observations", []))
+                for e in observed.get("entities", [])
+            }
+            observed_rels = {
+                (r["from"], r["to"], r.get("relationType", "references"))
+                for r in observed.get("relations", [])
+            }
+        else:
+            observed_entities = None
+            observed_obs = None
+            observed_rels = None
+
         # --- Entities: upsert preserving created_at ---
         for e in graph["entities"]:
             name = e["name"]
@@ -140,10 +173,21 @@ def save_graph_sqlite(graph: dict, db_path: Path) -> None:
                 info = existing[name]
                 eid = info["id"]
                 if info["entity_type"] != etype:
-                    cur.execute(
-                        "UPDATE entities SET entity_type=?, updated_at=? WHERE id=?",
-                        (etype, now, eid),
+                    # Only overwrite the type if we observed this entity's type
+                    # unchanged in our snapshot — a concurrent rename/add must
+                    # not be silently clobbered (CAS on the type value).
+                    do_update = (
+                        observed is None
+                        or (
+                            name in observed_entities
+                            and info["entity_type"] == observed_entities[name]
+                        )
                     )
+                    if do_update:
+                        cur.execute(
+                            "UPDATE entities SET entity_type=?, updated_at=?, revision=revision+1 WHERE id=?",
+                            (etype, now, eid),
+                        )
             else:
                 cur.execute(
                     "INSERT INTO entities (name, entity_type, created_at, updated_at) "
@@ -161,20 +205,37 @@ def save_graph_sqlite(graph: dict, db_path: Path) -> None:
             # --- Observations: keep existing content's created_at, add only new ---
             info = existing[name]
             wanted = set(e.get("observations", []))
+            obs_changed = False
             for content in wanted:
                 if content not in info["obs"]:
                     cur.execute(
-                        "INSERT INTO observations (entity_id, content, created_at) "
+                        "INSERT OR IGNORE INTO observations (entity_id, content, created_at) "
                         "VALUES (?,?,?)",
                         (info["id"], content, now),
                     )
-            # Remove observations that are no longer present (e.g. removed by merge)
-            for content in list(info["obs"]):
+                    obs_changed = True
+            # Remove observations that are no longer present (e.g. removed by merge).
+            # With `observed`, only delete content the dreamer actually saw in its
+            # pre-mutation snapshot (never concurrent additions).
+            deletable = (
+                set(info["obs"])
+                if observed is None
+                else observed_obs.get(name, set()) & set(info["obs"])
+            )
+            for content in deletable:
                 if content not in wanted:
                     cur.execute(
                         "DELETE FROM observations WHERE entity_id=? AND content=?",
                         (info["id"], content),
                     )
+                    obs_changed = True
+            if obs_changed:
+                # Bump the entity's revision so concurrent readers' snapshots of
+                # this entity go stale. Obs-only changes do NOT touch updated_at.
+                cur.execute(
+                    "UPDATE entities SET revision = revision + 1 WHERE id = ?",
+                    (info["id"],),
+                )
 
         # --- Relations: preserve existing triples' created_at, add new ---
         wanted_rels = set()
@@ -187,8 +248,12 @@ def save_graph_sqlite(graph: dict, db_path: Path) -> None:
                     "(from_entity, to_entity, relation_type, created_at) VALUES (?,?,?,?)",
                     triple + (now,),
                 )
-        # Remove relations no longer present
-        for triple in existing_rels:
+        # Remove relations no longer present. With `observed`, only delete
+        # triples the dreamer actually saw in its snapshot (never concurrent
+        # additions) — the INSERT path above is additive and already dedupes
+        # via the UNIQUE triple constraint.
+        deletable_rels = existing_rels if observed is None else observed_rels
+        for triple in deletable_rels:
             if triple not in wanted_rels:
                 cur.execute(
                     "DELETE FROM relations WHERE from_entity=? AND to_entity=? "

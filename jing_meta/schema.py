@@ -25,7 +25,8 @@ SCHEMA_DDL = """\
         name TEXT NOT NULL UNIQUE,
         entity_type TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS observations (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,7 +43,45 @@ SCHEMA_DDL = """\
         UNIQUE(from_entity, to_entity, relation_type)
     );
     CREATE INDEX IF NOT EXISTS idx_obs_entity ON observations(entity_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_obs_unique ON observations(entity_id, content);
     CREATE INDEX IF NOT EXISTS idx_rel_from ON relations(from_entity);
     CREATE INDEX IF NOT EXISTS idx_rel_to ON relations(to_entity);
     CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);
 """
+
+
+def ensure_schema(conn) -> None:
+    """Create tables if missing and migrate pre-revision / pre-unique databases in place.
+
+    ``CREATE TABLE IF NOT EXISTS`` will NOT alter an existing table, so two
+    migrations run explicitly on pre-existing DBs:
+      1. observation dedup — an older DB may hold duplicate (entity_id, content)
+         rows from before the unique constraint existed.  Those would make the
+         unique index below fail, so delete the later duplicates first, keeping
+         the earliest (lowest id) row per group.
+      2. ``revision`` column backfill (unchanged).
+
+    Idempotent: the dedup no-ops once clean, ``CREATE UNIQUE INDEX IF NOT
+    EXISTS`` no-ops once present, and the revision ALTER no-ops once the column
+    exists.  Safe to call from every writer (memory/server.py, dreamer/dreamer.py,
+    memory/archiver.py) that may open a DB written by an older build.
+    """
+    # Dedup BEFORE the unique index is created (executescript below).  Only
+    # meaningful if the observations table already exists (pre-existing DB).
+    has_obs = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='observations'"
+    ).fetchone() is not None
+    if has_obs:
+        conn.execute(
+            "DELETE FROM observations WHERE id NOT IN "
+            "(SELECT MIN(id) FROM observations GROUP BY entity_id, content)"
+        )
+        conn.commit()
+
+    conn.executescript(SCHEMA_DDL)
+
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(entities)")}
+    if "revision" not in cols:
+        conn.execute(
+            "ALTER TABLE entities ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+        )

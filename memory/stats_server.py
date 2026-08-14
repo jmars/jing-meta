@@ -198,16 +198,22 @@ def entity_summary(name: str, max_obs: int = 50, max_rels: int = 50) -> list[Tex
     if not _has_sqlite():
         return [text_block(f"Knowledge graph database not found at {DB_PATH}")]
 
-    rows = _query_sqlite(
-        "SELECT id, name, entity_type, created_at, updated_at FROM entities WHERE name = ?",
-        (name,),
+    # The stats server is a distinct read-only process that may read before the
+    # memory server migrates, so guard on the revision column's presence.
+    cols = _query_sqlite("PRAGMA table_info(entities)")
+    has_revision = any(r["name"] == "revision" for r in cols)
+    select = (
+        "SELECT id, name, entity_type, created_at, updated_at, revision FROM entities WHERE name = ?"
+        if has_revision
+        else "SELECT id, name, entity_type, created_at, updated_at FROM entities WHERE name = ?"
     )
+    rows = _query_sqlite(select, (name,))
     if not rows:
         return [text_block(f"Entity not found: {name}")]
-    return _entity_summary_sqlite(rows[0], max_obs=max_obs, max_rels=max_rels)
+    return _entity_summary_sqlite(rows[0], max_obs=max_obs, max_rels=max_rels, has_revision=has_revision)
 
 
-def _entity_summary_sqlite(e, max_obs: int = 50, max_rels: int = 50) -> list[TextContent]:
+def _entity_summary_sqlite(e, max_obs: int = 50, max_rels: int = 50, has_revision: bool = True) -> list[TextContent]:
     entity_id = e["id"]
     obs_rows = _query_sqlite(
         "SELECT content, created_at FROM observations WHERE entity_id = ? ORDER BY id",
@@ -227,6 +233,10 @@ def _entity_summary_sqlite(e, max_obs: int = 50, max_rels: int = 50) -> list[Tex
         f"  Type: {e['entity_type']}",
         f"  Created: {e['created_at']}",
         f"  Updated: {e['updated_at']}",
+    ]
+    if has_revision:
+        output.append(f"  Revision: {e['revision']}")
+    output += [
         "",
         f"  Observations ({len(obs_rows)}):",
     ]
