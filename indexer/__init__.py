@@ -461,7 +461,8 @@ def _index_lock(output: Path):
 # ---------------------------------------------------------------------------
 # Incremental update
 # ---------------------------------------------------------------------------
-def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
+def update(dir: Path, pattern: str, extractor: str, output: Path,
+           defer_compact: bool = False) -> dict:
     """Incrementally update an existing index via the write-ahead log (WAL).
 
     Does NOT load/mutate/save the DAFSA.  Instead, pair-level diffs are appended
@@ -469,7 +470,15 @@ def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
     Search uses a layered view that merges the WAL overlay on top of the base.
 
     Returns a summary dict with unchanged/updated/added/removed counts plus an
-    ``index_fst_mtime_unchanged`` flag that proves the base FST was not rewritten.
+    ``index_fst_mtime_unchanged`` flag that proves the base FST was not rewritten
+    and a ``needs_compact`` flag set when the WAL has crossed the compaction
+    threshold.
+
+    ``defer_compact``: when True, the WAL compaction is NOT performed inline
+    (the fold can take ~a minute on large indices).  Instead the result sets
+    ``needs_compact=True`` so the caller can run ``compact()`` later (e.g. in a
+    detached background process) without blocking.  When False (default), the
+    compaction runs here under the already-held flock.
     """
     fn = EXTRACTORS.get(extractor)
     if fn is None:
@@ -652,7 +661,8 @@ def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
         # (not compact(), which would try to re-acquire the same flock and deadlock).
         wal_size = (output / "index.wal").stat().st_size if (output / "index.wal").exists() else 0
         base_size = fst_path.stat().st_size
-        if wal_size > base_size * 0.25:
+        needs_compact = wal_size > base_size * 0.25
+        if needs_compact and not defer_compact:
             _compact_locked(output)
 
         return {
@@ -664,6 +674,7 @@ def update(dir: Path, pattern: str, extractor: str, output: Path) -> dict:
             "removed": removed,
             "total_slots": len(files),
             "index_fst_mtime_unchanged": fst_path.stat().st_mtime_ns == base_mtime_before,
+            "needs_compact": needs_compact,
         }
 
 

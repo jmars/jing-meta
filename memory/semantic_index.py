@@ -59,12 +59,18 @@ def build_index(conn, db_path: str) -> tuple[Path, Path]:
         ).fetchall()
         e["observations"] = [o["content"] for o in obs]
 
-    vecs = np.array(
-        [np.array(v, dtype="float32") for v in _embed._get_embedder().embed(
-            [_embed._entity_text(e) for e in entities], batch_size=64
-        )],
-        dtype="float32",
-    )
+    try:
+        vecs = np.array(
+            [np.array(v, dtype="float32") for v in _embed._get_embedder().embed(
+                [_embed._entity_text(e) for e in entities], batch_size=64
+            )],
+            dtype="float32",
+        )
+    finally:
+        # Release the ONNX embedder after the batch — it costs ~240MB resident
+        # and this is a maintenance path, not the hot query path. Reload is
+        # cheap (model cached on disk) on the next semantic op.
+        _embed.free()
     vpath, npath = _index_paths(db_path)
     np.save(vpath, vecs)
     npath.write_text(
@@ -104,6 +110,12 @@ def semantic_search(query: str, db_path: str, top_n: int = _TOP_N) -> list[dict]
         )
     except Exception:
         return []
+    finally:
+        # Release the ONNX embedder after the single query embed — it costs
+        # ~240MB resident and is only needed for this one pass. Holding it for
+        # the server's lifetime inflated every jing-memory process that ever ran
+        # a semantic search to ~300MB. Reload on next semantic op is cached+cheap.
+        _embed.free()
 
     # cosine similarity against all cached vectors (normalized dot product)
     qnorm = np.linalg.norm(qvec)

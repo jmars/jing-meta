@@ -336,8 +336,14 @@ def build_index(cfg: DomainConfig, index_dir: Optional[str] = None) -> tuple[boo
         return False, f"Index build error for '{cfg.name}': {e}"
 
 
-def update_index(cfg: DomainConfig, index_dir: Optional[str] = None) -> tuple[bool, str]:
-    """Incrementally update a DAFSA index for a domain (in-process, Python)."""
+def update_index(cfg: DomainConfig, index_dir: Optional[str] = None,
+                 defer_compact: bool = False) -> tuple[bool, str]:
+    """Incrementally update a DAFSA index for a domain (in-process, Python).
+
+    When *defer_compact* is True the WAL fold is skipped and deferred to a later
+    ``compact()`` call (see ``needs_compact``), so this stays fast on large
+    indices. The result message notes when a compaction is now pending.
+    """
     if cfg.extractor not in DAFSA_EXTRACTORS:
         from jing_meta.log import get_logger
         logger = get_logger(__name__)
@@ -356,16 +362,38 @@ def update_index(cfg: DomainConfig, index_dir: Optional[str] = None) -> tuple[bo
     fst_pattern = cfg.fst_pattern or cfg.pattern
 
     try:
-        result = dafsa_update(cfg.dir.resolve(), fst_pattern, cfg.extractor, out_dir)
+        result = dafsa_update(cfg.dir.resolve(), fst_pattern, cfg.extractor, out_dir,
+                              defer_compact=defer_compact)
         msg = (
             f"Index updated for '{cfg.name}': "
             f"unchanged={result['unchanged']}, updated={result['updated']}, "
             f"added={result['added']}, removed={result['removed']} "
             f"at {out_dir}"
         )
+        if result.get("needs_compact"):
+            msg += " (compaction deferred)"
         return True, msg
     except Exception as e:  # noqa: BLE001
         return False, f"Index update error for '{cfg.name}': {e}"
+
+
+def needs_compact(cfg: DomainConfig, index_dir: Optional[str] = None) -> bool:
+    """Return True if *cfg*'s WAL has crossed the compaction threshold.
+
+    Mirrors indexer.update()'s rule (WAL > 25% of base FST) without loading the
+    index, so a caller can decide whether to run ``compact()`` in the background.
+    """
+    out_dir = Path(index_dir).expanduser().resolve() if index_dir else cfg.effective_index_dir
+    wal_path = out_dir / "index.wal"
+    fst_path = out_dir / "index.fst"
+    if not wal_path.exists() or not fst_path.exists():
+        return False
+    try:
+        wal_size = wal_path.stat().st_size
+        base_size = fst_path.stat().st_size
+    except OSError:
+        return False
+    return wal_size > base_size * 0.25
 
 
 def search_fst(
