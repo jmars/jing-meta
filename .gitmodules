@@ -1,0 +1,3 @@
+[submodule "indexer/dafsa/vendor/dafsa"]
+	path = indexer/dafsa/vendor/dafsa
+	url = https://github.com/fixpoint-linux/dafsa.git

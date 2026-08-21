@@ -15,10 +15,11 @@ test: c-test
 
 c-test:
 	@$(MAKE) -C indexer/dafsa _t 2>/dev/null || \
-		gcc -O2 -Wall -Wextra -Werror -I. -o indexer/dafsa/_t \
-		indexer/dafsa/dafsa_test.c indexer/dafsa/dafsa.c \
-		indexer/dafsa/dafsa_state.c indexer/dafsa/dafsa_core.c \
-		indexer/dafsa/dafsa_persist.c indexer/dafsa/dafsa_view.c 2>/dev/null || true
+		gcc -O2 -Wall -Wextra -Werror -I. -Iindexer/dafsa/vendor/dafsa -o indexer/dafsa/_t \
+		indexer/dafsa/dafsa_test.c indexer/dafsa/dafsa_build.c \
+		indexer/dafsa/vendor/dafsa/dafsa.c indexer/dafsa/vendor/dafsa/dafsa_state.c \
+		indexer/dafsa/vendor/dafsa/dafsa_core.c indexer/dafsa/vendor/dafsa/dafsa_persist.c \
+		indexer/dafsa/vendor/dafsa/dafsa_view.c 2>/dev/null || true
 	@if [ -x indexer/dafsa/_t ]; then \
 		cd indexer/dafsa && ./_t; \
 	else \
